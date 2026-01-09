@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class EnvConfig:
     """Environment configuration parameters"""
-    influence_radius_meters: float = 500.0
+    influence_radius_meters: float = 100.0
     slot_duration_range: Tuple[int, int] = (1, 5)
     new_ads_per_step_range: Tuple[int, int] = (1, 5)
     tardiness_cost: float = 50.0
@@ -507,6 +507,11 @@ class OptimizedBillboardEnv(gym.Env):
         self.ads_completed_this_step: List[int] = []
         self.ads_failed_this_step: List[int] = []  # Track new failures
 
+        # ADVERTISER TRACKING: Track used advertiser IDs within current episode
+        # This set acts as a "discard pile" - once an advertiser is used, they
+        # cannot be used again until reset() is called (new episode/game)
+        self.used_advertiser_ids: set = set()
+
         # Clear cache
         self.influence_cache.clear()
 
@@ -875,21 +880,41 @@ class OptimizedBillboardEnv(gym.Env):
                                     break
     
     def _spawn_ads(self):
-        """Spawn new ads based on configuration."""
+        """Spawn new ads based on configuration.
+
+        Uses "deck of cards" logic:
+        - Each advertiser can only be used ONCE per episode
+        - Available pool = All advertisers - (Currently active ∪ Previously used)
+        - Once used, advertiser goes to "discard pile" (used_advertiser_ids)
+        - Discard pile is only cleared when reset() is called (new episode)
+        """
         # Remove completed/tardy ads
         self.ads = [ad for ad in self.ads if ad.state == 0]
-        
+
         # Spawn new ads
         n_spawn = random.randint(*self.config.new_ads_per_step_range)
+
+        # Get currently active advertiser IDs
         current_ad_ids = {ad.aid for ad in self.ads}
-        available_templates = [a for a in self.ads_db if a.aid not in current_ad_ids]
-        
+
+        # CRITICAL FIX: Exclude both active AND previously used advertiser IDs
+        # This ensures each advertiser is used only once per episode (like drawing from a deck)
+        excluded_ids = current_ad_ids | self.used_advertiser_ids  # Union of both sets
+        available_templates = [a for a in self.ads_db if a.aid not in excluded_ids]
+
+        # Handle edge case: Empty pool (all advertisers have been used)
+        if len(available_templates) == 0:
+            if self.config.debug:
+                logger.debug(f"Advertiser pool exhausted: {len(self.used_advertiser_ids)} used, "
+                           f"{len(current_ad_ids)} active, {len(self.ads_db)} total")
+            return  # Cannot spawn new ads - deck is empty
+
         spawn_count = min(
             self.config.max_active_ads - len(self.ads),
             n_spawn,
             len(available_templates)
         )
-        
+
         if spawn_count > 0:
             selected_templates = random.sample(available_templates, spawn_count)
             for template in selected_templates:
@@ -899,10 +924,17 @@ class OptimizedBillboardEnv(gym.Env):
                 )
                 new_ad.spawn_step = self.current_step
                 self.ads.append(new_ad)
+
+                # CRITICAL: Add to "discard pile" - this advertiser cannot be used again
+                # until reset() is called (new episode starts)
+                self.used_advertiser_ids.add(template.aid)
+
                 self.performance_metrics['total_ads_processed'] += 1
-            
+
             if self.config.debug:
-                logger.debug(f"Spawned {spawn_count} new ads")
+                logger.debug(f"Spawned {spawn_count} new ads. Pool status: "
+                           f"{len(available_templates)-spawn_count} remaining, "
+                           f"{len(self.used_advertiser_ids)} used")
     
     def _execute_action(self, action):
         """Execute the selected action with validation."""
@@ -1049,7 +1081,12 @@ class OptimizedBillboardEnv(gym.Env):
     # --- Gym required methods ---
 
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
-        """Reset environment to initial state (Gym-style)."""
+        """Reset environment to initial state (Gym-style).
+
+        This is called at the start of each NEW EPISODE (new game).
+        The "discard pile" of used advertisers is shuffled back into the deck,
+        making all advertisers available again.
+        """
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
@@ -1077,6 +1114,10 @@ class OptimizedBillboardEnv(gym.Env):
         # CANONICAL REWARD: Clear event tracking
         self.ads_completed_this_step.clear()
         self.ads_failed_this_step.clear()
+
+        # ADVERTISER TRACKING: Shuffle deck - all advertisers become available again
+        # This is the "new game" reset - the discard pile is cleared
+        self.used_advertiser_ids.clear()
 
         # Clear cache
         self.influence_cache.clear()
