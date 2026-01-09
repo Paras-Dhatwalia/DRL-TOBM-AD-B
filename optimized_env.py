@@ -1,0 +1,1219 @@
+# OPTIMIZED DYNABILLBOARD ENVIRONMENT
+from __future__ import annotations
+import math
+import random
+import logging
+import time
+from functools import wraps
+from dataclasses import dataclass, field
+from typing import List, Tuple, Dict, Any, Optional, Set
+import numpy as np
+import pandas as pd
+import gymnasium as gym
+from gymnasium import spaces
+import torch
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+#  CONFIGURATION 
+@dataclass
+class EnvConfig:
+    """Environment configuration parameters"""
+    influence_radius_meters: float = 500.0
+    slot_duration_range: Tuple[int, int] = (1, 5)
+    new_ads_per_step_range: Tuple[int, int] = (1, 5)
+    tardiness_cost: float = 50.0
+    max_events: int = 1000
+    max_active_ads: int = 20
+    ad_ttl: int = 600  # Ad time-to-live in timesteps (default: 600 = 10 hours)
+    graph_connection_distance: float = 5000.0
+    cache_ttl: int = 1  # Cache TTL in steps
+    enable_profiling: bool = False
+    debug: bool = False
+
+#  PERFORMANCE MONITORING 
+class PerformanceMonitor:
+    """Track performance metrics and timing"""
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        self.step_times = []
+        self.influence_calc_times = []
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.step_count = 0
+    
+    def time_function(self, category='general'):
+        """Decorator to time function execution"""
+        def decorator(func):
+            @wraps(func)
+            def wrapper(*args, **kwargs):
+                start = time.perf_counter()
+                result = func(*args, **kwargs)
+                elapsed = (time.perf_counter() - start) * 1000  # ms
+                
+                if category == 'step':
+                    self.step_times.append(elapsed)
+                elif category == 'influence':
+                    self.influence_calc_times.append(elapsed)
+                
+                if self.step_count % 100 == 0 and self.step_count > 0:
+                    self.print_stats()
+                    
+                return result
+            return wrapper
+        return decorator
+    
+    def record_cache_hit(self):
+        self.cache_hits += 1
+    
+    def record_cache_miss(self):
+        self.cache_misses += 1
+    
+    def print_stats(self):
+        """Print performance statistics"""
+        if self.step_times:
+            avg_step = np.mean(self.step_times)
+            logger.info(f"Avg step time: {avg_step:.2f}ms")
+        
+        if self.influence_calc_times:
+            avg_influence = np.mean(self.influence_calc_times)
+            logger.info(f"Avg influence calc time: {avg_influence:.2f}ms")
+        
+        if self.cache_hits + self.cache_misses > 0:
+            hit_rate = self.cache_hits / (self.cache_hits + self.cache_misses)
+            logger.info(f"Cache hit rate: {hit_rate:.2%}")
+
+#  HELPER FUNCTIONS 
+def time_str_to_minutes(v: Any) -> int:
+    """Convert time string to minutes since midnight."""
+    if isinstance(v, str) and ":" in v:
+        try:
+            hh, mm = v.split(":")[:2]
+            return int(hh) * 60 + int(mm)
+        except Exception as e:
+            logger.warning(f"Could not parse time string {v}: {e}")
+            return 0
+    try:
+        return int(v)
+    except Exception:
+        return 0
+
+def haversine_distance_vectorized(lat1: np.ndarray, lon1: np.ndarray, 
+                                  lat2: np.ndarray, lon2: np.ndarray) -> np.ndarray:
+    """Vectorized haversine distance calculation between points in meters."""
+    R = 6371000.0  # Earth radius in meters
+    
+    # Convert to radians
+    lat1_rad = np.radians(lat1)
+    lat2_rad = np.radians(lat2)
+    dlat = np.radians(lat2 - lat1)
+    dlon = np.radians(lon2 - lon1)
+    
+    # Haversine formula
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2) ** 2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    
+    return R * c
+
+def validate_csv(df: pd.DataFrame, required_columns: List[str], csv_name: str):
+    """Validate that CSV has required columns"""
+    missing = [col for col in required_columns if col not in df.columns]
+    if missing:
+        raise ValueError(f"{csv_name} missing required columns: {missing}")
+
+#  DATA CLASSES 
+class Ad:
+    """Represents an advertisement with demand and payment attributes."""
+
+    def __init__(self, aid: int, demand: float, payment: float,
+                 payment_demand_ratio: float, ttl: int = 15):
+        self.aid = aid
+        self.demand = float(demand)
+        self.payment = float(payment)  # Total budget available
+        self.remaining_budget = float(payment)  # BUDGET TRACKING: Money left to spend
+        self.total_cost_spent = 0.0  # BUDGET TRACKING: Total spent on billboards
+        self.payment_demand_ratio = float(payment_demand_ratio)
+        self.ttl = ttl
+        self.original_ttl = ttl
+        self.state = 0  # 0: ongoing, 1: finished, 2: tardy/expired, 3: budget exhausted
+        self.assigned_billboards: Set[int] = set()  # Use set for O(1) operations
+        self.time_active = 0
+        self.cumulative_influence = 0.0
+        self.spawn_step: Optional[int] = None
+        self._cached_influence: Optional[float] = None
+        self._cache_step: Optional[int] = None
+
+    def step_time(self):
+        """Tick TTL and mark tardy if TTL expires while still ongoing."""
+        if self.state == 0:
+            self.time_active += 1
+            self.ttl -= 1
+            if self.ttl <= 0:
+                self.state = 2  # tardy / failed
+
+    def assign_billboard(self, b_id: int, billboard_cost: float) -> bool:
+        """
+        Assign a billboard to this ad if budget allows.
+
+        Returns:
+            True if assignment successful, False if can't afford
+        """
+        if self.remaining_budget >= billboard_cost:
+            self.assigned_billboards.add(b_id)
+            self.remaining_budget -= billboard_cost  # BUDGET TRACKING: Deduct cost
+            self.total_cost_spent += billboard_cost  # BUDGET TRACKING: Track spending
+            self._cached_influence = None  # Invalidate cache
+            return True
+        else:
+            return False  # Can't afford this billboard
+
+    def release_billboard(self, b_id: int):
+        """Release a billboard from this ad."""
+        self.assigned_billboards.discard(b_id)
+        self._cached_influence = None  # Invalidate cache
+
+    def norm_payment_ratio(self) -> float:
+        """Normalized payment ratio using sigmoid function."""
+        return 1.0 / (1.0 + math.exp(-(self.payment_demand_ratio - 1.0)))
+
+    def get_feature_vector(self) -> np.ndarray:
+        """Get feature vector for this ad (12 features with budget tracking)."""
+        return np.array([
+            self.demand,
+            self.payment,
+            self.payment_demand_ratio,
+            self.norm_payment_ratio(),
+            self.ttl / max(1, self.original_ttl),
+            self.cumulative_influence,
+            len(self.assigned_billboards),
+            1.0 if self.state == 0 else 0.0,
+            # NEW FEATURES for better budget management:
+            self.remaining_budget / max(self.payment, 1e-6),  # Budget remaining [0,1]
+            self.total_cost_spent / max(self.payment, 1e-6),  # Budget used [0,1]
+            (self.demand - self.cumulative_influence) / max(self.demand, 1e-6),  # Unfulfilled [0,1]
+            self.spawn_step / 1000.0 if self.spawn_step is not None else 0.0,  # Temporal context [0,1]
+        ], dtype=np.float32)
+
+
+class Billboard:
+    """Represents a billboard with location and properties."""
+    
+    def __init__(self, b_id: int, lat: float, lon: float, tags: str, 
+                 b_size: float, b_cost: float, influence: float):
+        self.b_id = b_id
+        self.latitude = float(lat)
+        self.longitude = float(lon)
+        self.tags = tags if pd.notna(tags) else ""
+        self.b_size = float(b_size)
+        self.b_cost = float(b_cost)
+        self.influence = float(influence)
+        self.occupied_until = 0
+        self.current_ad: Optional[int] = None
+        self.p_size = 0.0  # normalized size
+        self.total_usage = 0
+        self.revenue_generated = 0.0
+
+    def is_free(self) -> bool:
+        """Check if billboard is available."""
+        return self.occupied_until <= 0
+
+    def assign(self, ad_id: int, duration: int):
+        """Assign an ad to this billboard for a duration."""
+        self.current_ad = ad_id
+        self.occupied_until = max(1, int(duration))
+        self.total_usage += 1
+
+    def release(self) -> Optional[int]:
+        """Release current ad from billboard."""
+        ad_id = self.current_ad
+        self.current_ad = None
+        self.occupied_until = 0
+        return ad_id
+
+    def get_feature_vector(self) -> np.ndarray:
+        """Get feature vector for this billboard."""
+        return np.array([
+            1.0,  # node type (billboard)
+            0.0 if self.is_free() else 1.0,  # is_occupied
+            self.b_cost,
+            self.b_size,
+            self.influence,
+            self.p_size,
+            self.occupied_until,
+            self.total_usage,
+            (self.latitude + 90.0) / 180.0,  # normalized latitude [-90,90] -> [0,1]
+            (self.longitude + 180.0) / 360.0,  # normalized longitude [-180,180] -> [0,1]
+        ], dtype=np.float32)
+
+
+#  OPTIMIZED ENVIRONMENT 
+class OptimizedBillboardEnv(gym.Env):
+    """
+    FIXED: Changed from AECEnv to gym.Env (single-agent, synchronous).
+
+    Optimized Dynamic Billboard Allocation Environment with vectorized operations.
+
+    Key optimizations:
+    - Vectorized influence calculations using NumPy broadcasting
+    - Cached per-minute billboard probabilities
+    - Precomputed billboard size ratios
+    - Efficient trajectory storage as NumPy arrays
+    - Performance monitoring and profiling
+    """
+
+    metadata = {"render_modes": ["human"], "name": "optimized_billboard_env"}
+    
+    def __init__(self, billboard_csv: str, advertiser_csv: str, trajectory_csv: str,
+                 action_mode: str = "na", config: Optional[EnvConfig] = None,
+                 start_time_min: Optional[int] = None, seed: Optional[int] = None):
+        
+        super().__init__()
+        
+        # Use provided config or default
+        self.config = config or EnvConfig()
+        
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+        
+        self.action_mode = action_mode.lower()
+        
+        if self.action_mode not in ['na', 'ea', 'mh']:
+            raise ValueError(f"Unsupported action_mode: {action_mode}. Use 'na', 'ea', or 'mh'")
+        
+        logger.info(f"Initializing OptimizedBillboardEnv with action_mode={self.action_mode}")
+        
+        # Performance monitoring
+        self.perf_monitor = PerformanceMonitor() if self.config.enable_profiling else None
+
+        # Load and process data
+        self._load_data(billboard_csv, advertiser_csv, trajectory_csv, start_time_min)
+        
+        # Precompute billboard properties
+        self._precompute_billboard_properties()
+        
+        # Create graph structure
+        self.edge_index = self._create_billboard_graph()
+        logger.info(f"Created graph with {self.edge_index.shape[1]} edges")
+
+        # Gym-style action/observation spaces
+        self._setup_action_observation_spaces()
+
+        # Cache for influence calculations (must be before _initialize_state)
+        self.influence_cache: Dict[Tuple[int, frozenset], Tuple[float, int]] = {}
+
+        # Runtime state
+        self._initialize_state()
+    
+    def _load_data(self, billboard_csv: str, advertiser_csv: str, 
+                   trajectory_csv: str, start_time_min: Optional[int]):
+        """Load and preprocess all data files with validation."""
+        
+        # Load and validate billboard data
+        bb_df = pd.read_csv(billboard_csv)
+        validate_csv(bb_df, ['B_id', 'Latitude', 'Longitude', 'B_Size', 'B_Cost', 'Influence'], 
+                    "Billboard CSV")
+        logger.info(f"Loaded {len(bb_df)} billboard entries")
+        
+        # Get unique billboards
+        uniq_df = bb_df.drop_duplicates(subset=['B_id'], keep='first')
+        logger.info(f"Found {len(uniq_df)} unique billboards")
+        
+        # Create billboard objects
+        self.billboards: List[Billboard] = []
+        for _, r in uniq_df.iterrows():
+            self.billboards.append(Billboard(
+                int(r['B_id']), float(r['Latitude']), float(r['Longitude']),
+                r.get('Tags', ''), float(r['B_Size']), float(r['B_Cost']),
+                float(r['Influence'])
+            ))
+        
+        self.n_nodes = len(self.billboards)
+        self.billboard_map = {b.b_id: b for b in self.billboards}
+        self.billboard_id_to_node_idx = {b.b_id: i for i, b in enumerate(self.billboards)}
+        
+        # Load and validate advertiser data
+        adv_df = pd.read_csv(advertiser_csv)
+        adv_df.columns = adv_df.columns.str.strip().str.replace('\ufeff', '')
+        validate_csv(adv_df, ['Id', 'Demand', 'Payment', 'Payment_Demand_Ratio'],
+                    "Advertiser CSV")
+        logger.info(f"Loaded {len(adv_df)} advertiser templates")
+        
+        self.ads_db: List[Ad] = []
+        for aid, demand, payment, ratio in zip(
+            adv_df['Id'].values,
+            adv_df['Demand'].values,
+            adv_df['Payment'].values,
+            adv_df['Payment_Demand_Ratio'].values):
+            
+            self.ads_db.append(
+                Ad(aid=int(aid), demand=float(demand), payment=float(payment),
+                   payment_demand_ratio=float(ratio), ttl=self.config.ad_ttl)
+            )
+        
+        # Load and validate trajectory data
+        traj_df = pd.read_csv(trajectory_csv)
+        validate_csv(traj_df, ['Time', 'Latitude', 'Longitude'], "Trajectory CSV")
+        
+        traj_df['t_min'] = traj_df['Time'].apply(time_str_to_minutes)
+        self.start_time_min = int(start_time_min if start_time_min is not None 
+                                 else traj_df['t_min'].min())
+        
+        # Preprocess trajectories as NumPy arrays for efficient operations
+        self.trajectory_map = self._preprocess_trajectories_optimized(traj_df)
+        logger.info(f"Processed trajectories for {len(self.trajectory_map)} time points")
+    
+    def _preprocess_trajectories_optimized(self, df: pd.DataFrame) -> Dict[int, np.ndarray]:
+        """Preprocess trajectory data as NumPy arrays for vectorized operations."""
+        traj_map: Dict[int, np.ndarray] = {}
+        
+        for t_min, grp in df.groupby('t_min'):
+            # Store as float32 NumPy array for efficiency
+            coords = np.column_stack([
+                grp['Latitude'].values.astype(np.float32),
+                grp['Longitude'].values.astype(np.float32)
+            ])
+            traj_map[int(t_min)] = coords
+        
+        return traj_map
+    
+    def _precompute_billboard_properties(self):
+        """Precompute billboard properties for efficiency."""
+        # Find max billboard size
+        self.max_billboard_size = max((b.b_size for b in self.billboards), default=1.0)
+        
+        # Precompute normalized sizes
+        for b in self.billboards:
+            b.p_size = (b.b_size / self.max_billboard_size) if self.max_billboard_size > 0 else 0.0
+        
+        # Store billboard coordinates as NumPy arrays for vectorized distance calculations
+        self.billboard_coords = np.array([
+            [b.latitude, b.longitude] for b in self.billboards
+        ], dtype=np.float32)
+        
+        # Precompute size ratios
+        self.billboard_size_ratios = np.array([
+            b.b_size / self.max_billboard_size for b in self.billboards
+        ], dtype=np.float32)
+    
+    def _create_billboard_graph(self) -> np.ndarray:
+        """Create adjacency matrix for billboards using vectorized distance calculation."""
+        n = len(self.billboards)
+        
+        if n == 0:
+            return np.array([[0], [0]])
+        
+        # Vectorized distance calculation
+        coords = self.billboard_coords
+        lat1 = coords[:, 0:1]  # Shape (n, 1)
+        lon1 = coords[:, 1:2]  # Shape (n, 1)
+        lat2 = coords[:, 0].reshape(1, -1)  # Shape (1, n)
+        lon2 = coords[:, 1].reshape(1, -1)  # Shape (1, n)
+        
+        # Calculate all pairwise distances at once
+        distances = haversine_distance_vectorized(lat1, lon1, lat2, lon2)
+        
+        # Find edges within threshold
+        valid_pairs = np.where((distances <= self.config.graph_connection_distance) & 
+                              (distances > 0))
+        
+        if len(valid_pairs[0]) > 0:
+            edges = np.column_stack(valid_pairs)
+            # Add reverse edges for bidirectional graph
+            edges_reverse = edges[:, [1, 0]]
+            all_edges = np.vstack([edges, edges_reverse])
+            return all_edges.T
+        else:
+            # If no edges, create self-loops
+            edges = np.array([[i, i] for i in range(n)])
+            return edges.T
+    
+    def _setup_action_observation_spaces(self):
+        """Setup action and observation spaces based on action mode (Gym-style)."""
+        # Node features: billboard properties
+        self.n_node_features = 10
+        # Ad features: advertisement properties (updated to 12 with budget tracking)
+        self.n_ad_features = 12
+
+        if self.action_mode == 'na':
+            # Node Action: select billboard (ad chosen by environment)
+            self.action_space = spaces.Discrete(self.n_nodes)
+            self.observation_space = spaces.Dict({
+                'graph_nodes': spaces.Box(low=-np.inf, high=np.inf,
+                                         shape=(self.n_nodes, self.n_node_features), 
+                                         dtype=np.float32),
+                'graph_edge_links': spaces.Box(low=0, high=self.n_nodes-1,
+                                              shape=(2, self.edge_index.shape[1]), 
+                                              dtype=np.int64),
+                'mask': spaces.MultiBinary(self.n_nodes),
+                'current_ad': spaces.Box(low=-np.inf, high=np.inf,
+                                        shape=(self.n_ad_features,), dtype=np.float32)
+            })
+        
+        elif self.action_mode == 'ea':
+            # Edge Action: select ad-billboard pairs
+            max_pairs = self.config.max_active_ads * self.n_nodes
+            self.action_space = spaces.MultiBinary(max_pairs)
+            self.observation_space = spaces.Dict({
+                'graph_nodes': spaces.Box(low=-np.inf, high=np.inf,
+                                         shape=(self.n_nodes, self.n_node_features),
+                                         dtype=np.float32),
+                'graph_edge_links': spaces.Box(low=0, high=self.n_nodes-1,
+                                              shape=(2, self.edge_index.shape[1]),
+                                              dtype=np.int64),
+                'ad_features': spaces.Box(low=-np.inf, high=np.inf,
+                                         shape=(self.config.max_active_ads, self.n_ad_features),
+                                         dtype=np.float32),
+                'mask': spaces.MultiBinary(max_pairs)
+            })
+
+        elif self.action_mode == 'mh':
+            # Multi-Head: select ad, then billboard
+            self.action_space = spaces.MultiBinary(
+                [self.config.max_active_ads, self.n_nodes])
+            self.observation_space = spaces.Dict({
+                'graph_nodes': spaces.Box(low=-np.inf, high=np.inf,
+                                         shape=(self.n_nodes, self.n_node_features),
+                                         dtype=np.float32),
+                'graph_edge_links': spaces.Box(low=0, high=self.n_nodes-1,
+                                              shape=(2, self.edge_index.shape[1]),
+                                              dtype=np.int64),
+                'ad_features': spaces.Box(low=-np.inf, high=np.inf,
+                                         shape=(self.config.max_active_ads, self.n_ad_features),
+                                         dtype=np.float32),
+                'mask': spaces.MultiBinary([self.config.max_active_ads, self.n_nodes])
+            })
+    
+    def _initialize_state(self):
+        """Initialize runtime state variables (Gym-style, single-agent)."""
+        self.current_step = 0
+        self.ads: List[Ad] = []
+        self.placement_history: List[Dict[str, Any]] = []
+        self.current_ad_for_na_mode: Optional[Ad] = None
+        self.performance_metrics = {
+            'total_ads_processed': 0,
+            'total_ads_completed': 0,
+            'total_ads_tardy': 0,
+            'total_revenue': 0.0,
+            'billboard_utilization': 0.0
+        }
+
+        # CANONICAL REWARD: Event-based tracking
+        self.ads_completed_this_step: List[int] = []
+        self.ads_failed_this_step: List[int] = []  # Track new failures
+
+        # Clear cache
+        self.influence_cache.clear()
+
+        if self.perf_monitor:
+            self.perf_monitor.reset()
+    
+    def distance_factor(self, dist_meters: np.ndarray) -> np.ndarray:
+        """Vectorized distance effect on billboard influence with 10m cap at 0.9."""
+        factor = np.ones_like(dist_meters) * 0.9  # Default for distances <= 10m
+        mask = dist_meters > 10.0
+        factor[mask] = np.maximum(0.1, 1.0 - (dist_meters[mask] / self.config.influence_radius_meters))
+        return factor
+    
+    def get_mask(self) -> np.ndarray:
+        """
+        Get action mask based on current action mode with budget validation.
+
+        OPTIMIZED: Uses NumPy vectorization instead of nested Python loops.
+        """
+        # Precompute billboard properties once (used by all modes)
+        free_mask = np.array([b.is_free() for b in self.billboards], dtype=bool)
+        costs = np.array([b.b_cost for b in self.billboards], dtype=np.float32)
+
+        # Account for per-timestep cost: use max duration for conservative estimate
+        max_duration = self.config.slot_duration_range[1]
+        total_costs = costs * max_duration
+
+        if self.action_mode == 'na':
+            # NA mode: mask free billboards that current ad can afford
+            if self.current_ad_for_na_mode is not None:
+                # Vectorized: free AND affordable (cost × max_duration)
+                affordable = self.current_ad_for_na_mode.remaining_budget >= total_costs
+                mask = (free_mask & affordable).astype(np.int8)
+            else:
+                mask = free_mask.astype(np.int8)
+
+            if mask.sum() == 0:
+                logger.warning("No affordable free billboards available for 'na' mode")
+            return mask
+
+        elif self.action_mode == 'ea':
+            # EA mode: mask valid ad-billboard pairs (flattened)
+            active_ads = [ad for ad in self.ads if ad.state == 0]
+            n_active = min(len(active_ads), self.config.max_active_ads)
+
+            if n_active == 0:
+                logger.warning("No affordable ad-billboard pairs for 'ea' mode")
+                return np.zeros(self.config.max_active_ads * self.n_nodes, dtype=np.int8)
+
+            # Vectorized budget check: (n_active,) budgets vs (n_nodes,) total_costs
+            budgets = np.array([active_ads[i].remaining_budget for i in range(n_active)], dtype=np.float32)
+            # Broadcasting: (n_active, 1) >= (1, n_nodes) -> (n_active, n_nodes)
+            # Use total_costs (cost × max_duration) for conservative estimate
+            affordable = budgets[:, None] >= total_costs[None, :]
+            # Combine: (n_active, n_nodes) & (n_nodes,) broadcast
+            valid_pairs = affordable & free_mask
+
+            # Create full mask with zero-padding for unused ad slots
+            full_mask = np.zeros((self.config.max_active_ads, self.n_nodes), dtype=np.int8)
+            full_mask[:n_active, :] = valid_pairs.astype(np.int8)
+
+            mask = full_mask.flatten()
+            if mask.sum() == 0:
+                logger.warning("No affordable ad-billboard pairs for 'ea' mode")
+            return mask
+
+        elif self.action_mode == 'mh':
+            # MH mode: 2D mask over (ad_idx, bb_idx) pairs
+            active_ads = [ad for ad in self.ads if ad.state == 0]
+            n_active = min(len(active_ads), self.config.max_active_ads)
+
+            if n_active == 0:
+                logger.warning("No affordable ad-billboard pairs for 'mh' mode")
+                return np.zeros((self.config.max_active_ads, self.n_nodes), dtype=np.int8)
+
+            # Vectorized budget check (cost × max_duration)
+            budgets = np.array([active_ads[i].remaining_budget for i in range(n_active)], dtype=np.float32)
+            affordable = budgets[:, None] >= total_costs[None, :]
+            valid_pairs = affordable & free_mask
+
+            # Create full mask with zero-padding
+            pair_mask = np.zeros((self.config.max_active_ads, self.n_nodes), dtype=np.int8)
+            pair_mask[:n_active, :] = valid_pairs.astype(np.int8)
+
+            if pair_mask.sum() == 0:
+                logger.warning("No affordable ad-billboard pairs for 'mh' mode")
+            return pair_mask
+
+        return np.array([1], dtype=np.int8)
+    
+    def _get_obs(self) -> Dict[str, Any]:
+        """Get current observation."""
+        # Node features (billboards)
+        nodes = np.zeros((self.n_nodes, self.n_node_features), dtype=np.float32)
+        for i, b in enumerate(self.billboards):
+            nodes[i] = b.get_feature_vector()
+        
+        obs = {
+            'graph_nodes': nodes,
+            'graph_edge_links': self.edge_index.copy(),
+            'mask': self.get_mask()
+        }
+        
+        # Add ad features for modes that need them
+        if self.action_mode in ['ea', 'mh']:
+            ad_features = np.zeros((self.config.max_active_ads, self.n_ad_features), 
+                                  dtype=np.float32)
+            active_ads = [ad for ad in self.ads if ad.state == 0]
+            
+            for i, ad in enumerate(active_ads[:self.config.max_active_ads]):
+                ad_features[i] = ad.get_feature_vector()
+            
+            obs['ad_features'] = ad_features
+        
+        # Add current ad for NA mode
+        elif self.action_mode == 'na':
+            active_ads = [ad for ad in self.ads if ad.state == 0]
+            if active_ads:
+                # DETERMINISTIC: Select most urgent ad (lowest TTL ratio) for Markov property
+                # This fixes the non-Markovian behavior from random selection
+                self.current_ad_for_na_mode = min(active_ads,
+                                                  key=lambda ad: ad.ttl / max(ad.original_ttl, 1))
+                obs['current_ad'] = self.current_ad_for_na_mode.get_feature_vector()
+            else:
+                self.current_ad_for_na_mode = None
+                obs['current_ad'] = np.zeros(self.n_ad_features, dtype=np.float32)
+        
+        return obs
+    
+    def _calculate_influence_for_ad_vectorized(self, ad: Ad) -> float:
+        """
+        Vectorized influence calculation using NumPy broadcasting.
+        
+        Implements: I(S) = sum_{u_i in U} [1 - prod_{b_j in S} (1 - Pr(b_j, u_i))]
+        """
+        # CRITICAL FIX: Cache key must include minute (trajectory changes every minute)
+        minute_key = (self.start_time_min + self.current_step) % 1440
+        cache_key = (minute_key, frozenset(ad.assigned_billboards))
+        if cache_key in self.influence_cache:
+            cached_value, cached_step = self.influence_cache[cache_key]
+            if self.current_step - cached_step <= self.config.cache_ttl:
+                if self.perf_monitor:
+                    self.perf_monitor.record_cache_hit()
+                return cached_value
+        
+        if self.perf_monitor:
+            self.perf_monitor.record_cache_miss()
+
+        # S: Set of billboards assigned to this ad
+        if not ad.assigned_billboards:
+            return 0.0
+
+        bb_indices = [self.billboard_id_to_node_idx[b_id]
+                     for b_id in ad.assigned_billboards
+                     if b_id in self.billboard_id_to_node_idx]
+
+        if not bb_indices:
+            return 0.0
+
+        # Get user locations for current time (set U)
+        # minute_key was computed above for cache_key
+        user_locs = self.trajectory_map.get(minute_key, np.array([]))
+        
+        if len(user_locs) == 0:
+            return 0.0
+        
+        # Get billboard coordinates and size ratios for assigned billboards
+        bb_coords = self.billboard_coords[bb_indices]  # Shape: (n_billboards, 2)
+        bb_size_ratios = self.billboard_size_ratios[bb_indices]  # Shape: (n_billboards,)
+        
+        # Vectorized distance calculation
+        # user_locs shape: (n_users, 2)
+        # bb_coords shape: (n_billboards, 2)
+        # We need distances between all users and all billboards
+        
+        user_lats = user_locs[:, 0:1]  # Shape: (n_users, 1)
+        user_lons = user_locs[:, 1:2]  # Shape: (n_users, 1)
+        bb_lats = bb_coords[:, 0].reshape(1, -1)  # Shape: (1, n_billboards)
+        bb_lons = bb_coords[:, 1].reshape(1, -1)  # Shape: (1, n_billboards)
+        
+        # Calculate distances: shape (n_users, n_billboards)
+        distances = haversine_distance_vectorized(user_lats, user_lons, bb_lats, bb_lons)
+        
+        # Apply radius mask
+        within_radius = distances <= self.config.influence_radius_meters
+        
+        # Calculate probabilities where within radius
+        probabilities = np.zeros_like(distances)
+        mask = within_radius
+        
+        if np.any(mask):
+            # Base probability from size normalization
+            # Broadcasting: (n_users, n_billboards) * (1, n_billboards)
+            probabilities[mask] = bb_size_ratios[None, :].repeat(len(user_locs), axis=0)[mask]
+            
+            # Apply distance decay
+            probabilities[mask] *= self.distance_factor(distances[mask])
+            
+            # Numerical safety clamp
+            probabilities = np.clip(probabilities, 0.0, 0.999999)
+        
+        # Calculate influence for each user
+        # prod_{b_j in S} (1 - Pr(b_j, u_i)) for each user
+        prob_no_influence = np.prod(1.0 - probabilities, axis=1)  # Shape: (n_users,)
+        
+        # Total influence: sum of (1 - prob_no_influence) for all users
+        total_influence = np.sum(1.0 - prob_no_influence)
+        
+        # Cache the result
+        self.influence_cache[cache_key] = (total_influence, self.current_step)
+        
+        # Clean old cache entries periodically
+        if len(self.influence_cache) > 1000:
+            current_step = self.current_step
+            self.influence_cache = {
+                k: v for k, v in self.influence_cache.items() 
+                if current_step - v[1] <= self.config.cache_ttl
+            }
+        
+        return total_influence
+    
+    def _compute_reward(self) -> float:
+        """
+        IMPROVED PROFIT-BASED REWARD FUNCTION (DRL-Optimized)
+
+        Design principles (DRL best practices):
+        1. Stronger progress shaping for better credit assignment
+        2. Efficiency bonus to encourage cost-effective decisions
+        3. Single penalty for failures (not double-counting)
+        4. Less aggressive normalization for clearer gradients
+
+        Components:
+        - R_complete: Profit + efficiency bonus when ad completes
+        - R_progress: Strong auxiliary shaping (6x stronger than before)
+        - C_failure: Single proportional penalty for failed ads
+
+        Key improvements over original:
+        - Progress coefficient: 0.05 → 0.3 (6x stronger signal)
+        - Efficiency bonus: Rewards high profit margins
+        - No double penalty: Only waste penalty (no unfulfilled penalty)
+        - Better normalization: tanh(x/3) for clearer gradients
+        """
+
+        reward = 0.0
+
+        # === 1. COMPLETION REWARDS (profit + efficiency bonus) ===
+        for ad_id in self.ads_completed_this_step:
+            ad = next((a for a in self.ads if a.aid == ad_id), None)
+            if ad:
+                # Base profit reward
+                profit = ad.payment - ad.total_cost_spent
+                reward += profit / 100.0  # Scale down for stability
+
+                # Efficiency bonus: Reward high profit margins
+                efficiency = profit / max(ad.payment, 1e-6)
+                reward += efficiency * 2.0  # Bonus for cost-effective completion
+            else:
+                if self.config.debug:
+                    logger.warning(f"Completion reward: Ad {ad_id} not found")
+
+        # === 2. PROGRESS REWARDS (MUCH STRONGER shaping) ===
+        # Immediate feedback for influence gains - critical for credit assignment
+        for ad in self.ads:
+            if ad.state == 0:  # Active ads only
+                delta = getattr(ad, '_step_delta', 0.0)
+                progress_ratio = delta / max(ad.demand, 1e-6)
+                reward += progress_ratio * 0.3  # 6x stronger than original 0.05!
+
+        # === 3. FAILURE PENALTIES (SINGLE penalty, not double) ===
+        # Only penalize wasted resources, not unfulfilled demand separately
+        for ad_id in self.ads_failed_this_step:
+            ad = next((a for a in self.ads if a.aid == ad_id), None)
+            if ad:
+                # Single penalty: proportional to budget waste
+                waste_ratio = ad.total_cost_spent / max(ad.payment, 1e-6)
+                reward -= waste_ratio * 5.0  # Proportional to waste
+
+        # === 4. SOFT NORMALIZATION (less aggressive for clearer gradients) ===
+        # Maps to approximately [-2, 2] range for better gradient flow
+        return 2.0 * np.tanh(reward / 3.0)
+    
+    def _apply_influence_for_current_minute(self):
+        """
+        Apply influence for current minute using vectorized calculations.
+        CANONICAL REWARD: Track per-step delta for progress shaping.
+        """
+        if self.config.debug:
+            minute = (self.start_time_min + self.current_step) % 1440
+            logger.debug(f"Applying influence at step {self.current_step} (minute {minute})")
+
+        # Use vectorized influence calculation
+        if self.config.enable_profiling and self.perf_monitor:
+            @self.perf_monitor.time_function('influence')
+            def calculate_influence(ad):
+                return self._calculate_influence_for_ad_vectorized(ad)
+        else:
+            calculate_influence = self._calculate_influence_for_ad_vectorized
+
+        for ad in list(self.ads):
+            if ad.state != 0:
+                continue
+
+            # Calculate TOTAL influence at this step
+            if ad._cached_influence is not None and ad._cache_step == self.current_step:
+                total_influence = ad._cached_influence
+            else:
+                total_influence = calculate_influence(ad)
+                ad._cached_influence = total_influence
+                ad._cache_step = self.current_step
+
+            # CRITICAL FIX: Compute INCREMENTAL delta, not total
+            # Initialize _last_total_influence on first calculation
+            if not hasattr(ad, '_last_total_influence'):
+                ad._last_total_influence = 0.0
+
+            # Delta = new total - previous total
+            delta = max(0.0, total_influence - ad._last_total_influence)
+            ad._last_total_influence = total_influence
+
+            # CANONICAL REWARD: Store per-step delta for progress shaping
+            ad._step_delta = delta
+
+            ad.cumulative_influence += delta
+
+            if self.config.debug and delta > 0:
+                logger.debug(f"Ad {ad.aid} gained {delta:.4f} influence")
+
+            # Complete ad if demand is satisfied
+            if ad.cumulative_influence >= ad.demand:
+                ad.state = 1  # completed
+                self.performance_metrics['total_ads_completed'] += 1
+
+                # CANONICAL REWARD: Track completion event
+                self.ads_completed_this_step.append(ad.aid)
+
+                # Release billboards and generate revenue
+                for b_id in list(ad.assigned_billboards):
+                    if b_id in self.billboard_map:
+                        billboard = self.billboard_map[b_id]
+                        billboard.revenue_generated += ad.payment / max(1, len(ad.assigned_billboards))
+                        billboard.release()
+                    ad.release_billboard(b_id)
+
+                if self.config.debug:
+                    logger.debug(f"Ad {ad.aid} completed with {ad.cumulative_influence:.2f}/{ad.demand} demand")
+    
+    def _tick_and_release_boards(self):
+        """Tick billboard timers and release expired ones."""
+        for b in self.billboards:
+            if not b.is_free():
+                b.occupied_until -= 1
+                
+                if b.occupied_until <= 0:
+                    ad_id = b.release()
+                    if ad_id is not None:
+                        ad = next((a for a in self.ads if a.aid == ad_id), None)
+                        if ad:
+                            ad.release_billboard(b.b_id)
+                            
+                            # Update placement history
+                            for rec in self.placement_history:
+                                if (rec['ad_id'] == ad.aid and
+                                    rec['billboard_id'] == b.b_id and
+                                    'fulfilled_by_end' not in rec):
+                                    rec['fulfilled_by_end'] = ad.cumulative_influence
+                                    break
+    
+    def _spawn_ads(self):
+        """Spawn new ads based on configuration."""
+        # Remove completed/tardy ads
+        self.ads = [ad for ad in self.ads if ad.state == 0]
+        
+        # Spawn new ads
+        n_spawn = random.randint(*self.config.new_ads_per_step_range)
+        current_ad_ids = {ad.aid for ad in self.ads}
+        available_templates = [a for a in self.ads_db if a.aid not in current_ad_ids]
+        
+        spawn_count = min(
+            self.config.max_active_ads - len(self.ads),
+            n_spawn,
+            len(available_templates)
+        )
+        
+        if spawn_count > 0:
+            selected_templates = random.sample(available_templates, spawn_count)
+            for template in selected_templates:
+                new_ad = Ad(
+                    template.aid, template.demand, template.payment,
+                    template.payment_demand_ratio, template.ttl
+                )
+                new_ad.spawn_step = self.current_step
+                self.ads.append(new_ad)
+                self.performance_metrics['total_ads_processed'] += 1
+            
+            if self.config.debug:
+                logger.debug(f"Spawned {spawn_count} new ads")
+    
+    def _execute_action(self, action):
+        """Execute the selected action with validation."""
+        try:
+            if self.action_mode == 'na':
+                # Node Action mode - now accepts single integer
+                ad_to_assign = self.current_ad_for_na_mode
+                if ad_to_assign and isinstance(action, (int, np.integer)):
+                    bb_idx = int(action)
+                    
+                    # Check if action is valid and billboard is free
+                    if 0 <= bb_idx < self.n_nodes and self.billboards[bb_idx].is_free():
+                        billboard = self.billboards[bb_idx]
+
+                        # BUDGET TRACKING: Charge cost × duration (per-timestep cost)
+                        duration = random.randint(*self.config.slot_duration_range)
+                        total_cost = billboard.b_cost * duration
+                        if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
+                            billboard.assign(ad_to_assign.aid, duration)
+
+                            self.placement_history.append({
+                                'spawn_step': ad_to_assign.spawn_step,
+                                'allocated_step': self.current_step,
+                                'ad_id': ad_to_assign.aid,
+                                'billboard_id': billboard.b_id,
+                                'duration': duration,
+                                'demand': ad_to_assign.demand,
+                                'cost': total_cost  # Total cost (per-timestep cost × duration)
+                            })
+
+                            if self.config.debug:
+                                logger.debug(f"Assigned ad {ad_to_assign.aid} to billboard {billboard.b_id} "
+                                           f"(total cost: ${total_cost:.2f} = ${billboard.b_cost:.2f}/step × {duration} steps, "
+                                           f"remaining budget: ${ad_to_assign.remaining_budget:.2f})")
+                        elif self.config.debug:
+                            logger.warning(f"Ad {ad_to_assign.aid} can't afford billboard {billboard.b_id} "
+                                         f"(total cost: ${total_cost:.2f} = ${billboard.b_cost:.2f}/step × {duration} steps, "
+                                         f"budget: ${ad_to_assign.remaining_budget:.2f})")
+                    
+                    elif self.config.debug:
+                        if not (0 <= bb_idx < self.n_nodes):
+                            logger.warning(f"Invalid action (billboard index) {bb_idx}")
+                        elif not self.billboards[bb_idx].is_free():
+                            logger.warning(f"Action failed: Billboard {bb_idx} is not free")
+                
+                elif self.config.debug:
+                    if not ad_to_assign:
+                        logger.warning("NA action skipped: No ad to assign")
+                    else:
+                        logger.warning(f"Invalid action type for NA mode: {type(action)}")
+            
+            elif self.action_mode == 'ea':
+                # Edge Action mode
+                if isinstance(action, (list, np.ndarray)):
+                    action = np.asarray(action).flatten()
+                    expected_shape = self.config.max_active_ads * self.n_nodes
+                    if action.shape[0] != expected_shape:
+                        logger.warning(f"Invalid action shape for 'ea' mode: {action.shape}")
+                        return
+
+                    active_ads = [ad for ad in self.ads if ad.state == 0]
+
+                    # CRITICAL FIX: Track used billboards to prevent multi-assign in same step
+                    used_billboards = set()
+
+                    for pair_idx, chosen in enumerate(action):
+                        if chosen == 1:
+                            ad_idx = pair_idx // self.n_nodes
+                            bb_idx = pair_idx % self.n_nodes
+
+                            if (ad_idx < min(len(active_ads), self.config.max_active_ads) and
+                                self.billboards[bb_idx].is_free() and
+                                bb_idx not in used_billboards):  # FIXED: Check not already used
+
+                                ad_to_assign = active_ads[ad_idx]
+                                billboard = self.billboards[bb_idx]
+
+                                # BUDGET TRACKING: Charge cost × duration (per-timestep cost)
+                                duration = random.randint(*self.config.slot_duration_range)
+                                total_cost = billboard.b_cost * duration
+                                if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
+                                    billboard.assign(ad_to_assign.aid, duration)
+
+                                    # FIXED: Mark billboard as used for this step
+                                    used_billboards.add(bb_idx)
+
+                                    self.placement_history.append({
+                                        'spawn_step': ad_to_assign.spawn_step,
+                                        'allocated_step': self.current_step,
+                                        'ad_id': ad_to_assign.aid,
+                                        'billboard_id': billboard.b_id,
+                                        'duration': duration,
+                                        'demand': ad_to_assign.demand,
+                                        'cost': total_cost  # Total cost (per-timestep cost × duration)
+                                    })
+            
+            elif self.action_mode == 'mh':
+                # Multi-Head mode
+                if isinstance(action, (list, np.ndarray)):
+                    action = np.asarray(action)
+                    if action.shape != (self.config.max_active_ads, self.n_nodes):
+                        logger.warning(f"Invalid action shape for 'mh' mode: {action.shape}")
+                        return
+
+                    active_ads = [ad for ad in self.ads if ad.state == 0]
+
+                    # CRITICAL FIX: Track used billboards to prevent multi-assign in same step
+                    used_billboards = set()
+
+                    for ad_idx in range(min(len(active_ads), self.config.max_active_ads)):
+                        for bb_idx in range(self.n_nodes):
+                            if (action[ad_idx, bb_idx] == 1 and
+                                self.billboards[bb_idx].is_free() and
+                                bb_idx not in used_billboards):  # FIXED: Check not already used
+
+                                ad_to_assign = active_ads[ad_idx]
+                                billboard = self.billboards[bb_idx]
+
+                                # BUDGET TRACKING: Charge cost × duration (per-timestep cost)
+                                duration = random.randint(*self.config.slot_duration_range)
+                                total_cost = billboard.b_cost * duration
+                                if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
+                                    billboard.assign(ad_to_assign.aid, duration)
+
+                                    # FIXED: Mark billboard as used for this step
+                                    used_billboards.add(bb_idx)
+
+                                    self.placement_history.append({
+                                        'spawn_step': ad_to_assign.spawn_step,
+                                        'allocated_step': self.current_step,
+                                        'ad_id': ad_to_assign.aid,
+                                        'billboard_id': billboard.b_id,
+                                        'duration': duration,
+                                        'demand': ad_to_assign.demand,
+                                        'cost': total_cost  # Total cost (per-timestep cost × duration)
+                                    })
+        
+        except Exception as e:
+            logger.error(f"Error executing action: {e}")
+            if self.config.debug:
+                import traceback
+                traceback.print_exc()
+
+    # --- Gym required methods ---
+
+    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
+        """Reset environment to initial state (Gym-style)."""
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+
+        self.current_step = 0
+        self.ads.clear()
+
+        # Reset billboards
+        for b in self.billboards:
+            b.release()
+            b.total_usage = 0
+            b.revenue_generated = 0.0
+
+        # Reset tracking
+        self.placement_history.clear()
+        self.performance_metrics = {
+            'total_ads_processed': 0,
+            'total_ads_completed': 0,
+            'total_ads_tardy': 0,
+            'total_revenue': 0.0,
+            'billboard_utilization': 0.0
+        }
+
+        # CANONICAL REWARD: Clear event tracking
+        self.ads_completed_this_step.clear()
+        self.ads_failed_this_step.clear()
+
+        # Clear cache
+        self.influence_cache.clear()
+
+        if self.perf_monitor:
+            self.perf_monitor.reset()
+
+        # Spawn initial ads
+        self._spawn_ads()
+
+        logger.info(f"Environment reset with {len(self.ads)} initial ads")
+
+        return self._get_obs(), {}
+    
+    def step(self, action):
+        """Execute one environment step (Gym-style)."""
+        return self._step_internal(action)
+    
+    
+    def _step_internal(self, action):
+        """Internal step implementation (Gym-style)."""
+        # CANONICAL REWARD: Clear events from previous step
+        self.ads_completed_this_step.clear()
+        self.ads_failed_this_step.clear()
+
+        # 1. Apply influence for current minute
+        self._apply_influence_for_current_minute()
+
+        # 2. Tick and release expired billboards
+        self._tick_and_release_boards()
+
+        # 3. Tick ad TTLs
+        for ad in self.ads:
+            prev_state = ad.state
+            ad.step_time()
+            if ad.state == 2 and prev_state != 2:  # became tardy
+                self.performance_metrics['total_ads_tardy'] += 1
+                # CANONICAL REWARD: Track new failures for event-based penalty
+                self.ads_failed_this_step.append(ad.aid)
+
+        # 4. Execute agent action
+        self._execute_action(action)
+
+        # 5. Compute reward
+        reward = self._compute_reward()
+
+        # 6. Update performance metrics
+        self.performance_metrics['total_revenue'] = sum(b.revenue_generated for b in self.billboards)
+        occupied_count = sum(1 for b in self.billboards if not b.is_free())
+        self.performance_metrics['billboard_utilization'] = occupied_count / max(1, self.n_nodes) * 100
+
+        # 7. Spawn new ads
+        self._spawn_ads()
+
+        # 8. Update termination conditions
+        self.current_step += 1
+        terminated = (self.current_step >= self.config.max_events)
+        truncated = False
+
+        # Build info dict
+        info = {
+            'total_revenue': self.performance_metrics['total_revenue'],
+            'utilization': self.performance_metrics['billboard_utilization'],
+            'ads_completed': self.performance_metrics['total_ads_completed'],
+            'ads_processed': self.performance_metrics['total_ads_processed'],
+            'ads_tardy': self.performance_metrics['total_ads_tardy'],
+            'current_minute': (self.start_time_min + self.current_step) % 1440
+        }
+
+        return self._get_obs(), reward, terminated, truncated, info
+    
+    def render(self, mode="human"):
+        """Render current environment state."""
+        minute = (self.start_time_min + self.current_step) % 1440
+        print(f"\n--- Step {self.current_step} | Time: {minute//60:02d}:{minute%60:02d} ---")
+        
+        # Show occupied billboards
+        occupied = [b for b in self.billboards if not b.is_free()]
+        print(f"\nOccupied Billboards ({len(occupied)}/{self.n_nodes}):")
+        
+        if not occupied:
+            print("  None")
+        else:
+            for b in occupied[:10]:  # Show first 10
+                idx = self.billboard_id_to_node_idx[b.b_id]
+                print(f"  Node {idx} (ID: {b.b_id}): Ad {b.current_ad}, "
+                      f"Time Left: {b.occupied_until}, Cost: {b.b_cost:.2f}")
+            if len(occupied) > 10:
+                print(f"  ... and {len(occupied) - 10} more")
+        
+        # Show active ads
+        active_with_assignments = [ad for ad in self.ads if ad.assigned_billboards]
+        print(f"\nActive Ads with Assignments ({len(active_with_assignments)}):")
+        
+        if not active_with_assignments:
+            print("  None")
+        else:
+            for ad in active_with_assignments[:10]:
+                state_str = ('Ongoing', 'Finished', 'Tardy')[ad.state]
+                progress = f"{ad.cumulative_influence:.2f}/{ad.demand:.2f}"
+                print(f"  Ad {ad.aid}: Progress={progress}, TTL={ad.ttl}, "
+                      f"State={state_str}, Billboards={len(ad.assigned_billboards)}")
+            if len(active_with_assignments) > 10:
+                print(f"  ... and {len(active_with_assignments) - 10} more")
+        
+        # Show performance metrics
+        metrics = self.performance_metrics
+        print(f"\nPerformance Metrics:")
+        print(f"  Processed: {metrics['total_ads_processed']}")
+        print(f"  Completed: {metrics['total_ads_completed']}")
+        print(f"  Tardy: {metrics['total_ads_tardy']}")
+        print(f"  Revenue: ${metrics['total_revenue']:.2f}")
+        print(f"  Utilization: {metrics['billboard_utilization']:.1f}%")
+        if self.current_step >= self.config.max_events:
+            self.render_summary()
+    
+    def render_summary(self):
+        """Render final performance summary."""
+        print(f"\n{'='*60}")
+        print(f"SIMULATION COMPLETE - Final Results")
+        print(f"{'='*60}")
+        
+        metrics = self.performance_metrics
+        
+        print(f"Total Ads Processed: {metrics['total_ads_processed']}")
+        print(f"Successfully Completed: {metrics['total_ads_completed']}")
+        print(f"Failed (Tardy): {metrics['total_ads_tardy']}")
+        success_rate = (metrics['total_ads_completed'] / max(1, metrics['total_ads_processed'])) * 100.0
+        print(f"Success Rate: {success_rate:.1f}%")
+        print(f"Total Revenue Generated: ${metrics['total_revenue']:.2f}")
+        print(f"Average Billboard Utilization: {metrics['billboard_utilization']:.1f}%")
+        print(f"Total Placements: {len(self.placement_history)}")
+        
+        # Performance stats if profiling enabled
+        if self.perf_monitor:
+            self.perf_monitor.print_stats()
+    
+    def close(self):
+        """Clean up environment."""
+        pass
