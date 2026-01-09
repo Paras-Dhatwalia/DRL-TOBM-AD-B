@@ -52,9 +52,9 @@ from models import BillboardAllocatorGNN, DEFAULT_CONFIGS
 
 # Configuration for MH mode
 env_config = {
-    "billboard_csv": r"C:\Coding Files\DynamicBillboard\env\BillBoard_NYC.csv",  # Update path
-    "advertiser_csv": r"C:\Coding Files\DynamicBillboard\env\Advertiser_NYC2.csv",  # Update path
-    "trajectory_csv": r"C:\Coding Files\DynamicBillboard\env\TJ_NYC.csv",  # Update path
+    "billboard_csv": r"path/to/folder", 
+    "advertiser_csv": r"path/to/folder",  
+    "trajectory_csv": r"path/to/folder", 
     "action_mode": "mh",
     "max_events": 1000,
     "influence_radius": 500.0,
@@ -363,3 +363,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
