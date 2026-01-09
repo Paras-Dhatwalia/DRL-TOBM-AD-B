@@ -236,9 +236,9 @@ class GraphAwareCritic(torch.nn.Module):
 
 
 env_config = {
-    "billboard_csv": r"/home/pintu/Drl_billboard_c/BB_NYC.csv",
-    "advertiser_csv": r"/home/pintu/Drl_billboard_c/Advertiser_5.csv",
-    "trajectory_csv": r"/home/pintu/Drl_billboard_c/TJ_NYC.csv",
+    "billboard_csv": r"path/to/folder",
+    "advertiser_csv": r"path/to/folder",
+    "trajectory_csv": r"path/to/folder",
     "action_mode": "na",
     "max_events": 1000,
     "influence_radius": 500.0,
@@ -566,3 +566,4 @@ if __name__ == "__main__":
         logger.info("Success!")
     else:
         logger.error("Training had issues")
+
