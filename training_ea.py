@@ -90,9 +90,9 @@ def get_test_config():
     return {
         # Environment config
         "env": {
-            "billboard_csv": r"/home/pintu/Drl_billboard_c/BB_NYC.csv",
-            "advertiser_csv": r"/home/pintu/Drl_billboard_c/Advertiser_5.csv",
-            "trajectory_csv": r"/home/pintu/Drl_billboard_c/TJ_NYC.csv",
+            "billboard_csv": r"path/to/folder",
+            "advertiser_csv": r"path/to/folder",
+            "trajectory_csv": r"path/to/folder",
             "action_mode": "ea",
             "max_events": 50,  # Very small for quick testing
             "max_active_ads": 3,  # Reduced action space
@@ -145,9 +145,9 @@ def get_full_config():
     return {
         # Environment config
         "env": {
-            "billboard_csv": r"/home/pintu/Drl_billboard_c/BB_NYC.csv",
-            "advertiser_csv": r"/home/pintu/Drl_billboard_c/Advertiser_5.csv",
-            "trajectory_csv": r"/home/pintu/Drl_billboard_c/TJ_NYC.csv",
+            "billboard_csv": r"path/to/folder",
+            "advertiser_csv": r"path/to/folder",
+            "trajectory_csv": r"path/to/folder",
             "action_mode": "ea",
             "max_events": 1000,
             "max_active_ads": 20,  # Full action space
@@ -794,4 +794,5 @@ if __name__ == "__main__":
     # Run training
     use_test = args.test
     result = main(use_test_config=use_test)
+
 
