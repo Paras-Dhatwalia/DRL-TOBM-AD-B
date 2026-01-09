@@ -493,7 +493,12 @@ class BillboardAllocatorGNN(nn.Module):
         self.min_val = min_val
         self.use_attention = use_attention
         self.hidden_dim = hidden_dim
-        
+
+        # PERFORMANCE: Skip validation after first successful forward pass
+        # Validation is expensive (CPU-bound shape checks) and unnecessary after
+        # confirming dimensions are correct on the first pass
+        self._validation_done = False
+
         logger.info(f"Initializing BillboardAllocatorGNN: mode={self.mode}, "
                    f"n_billboards={n_billboards}, max_ads={max_ads}")
         
@@ -634,12 +639,16 @@ class BillboardAllocatorGNN(nn.Module):
         device = next(self.parameters()).device
 
         # Input validation with proper dimension inference
-        node_feat_dim = observations['graph_nodes'].shape[-1]
-        ad_feat_dim = self.ad_encoder[0].in_features
-        
-        validate_observations(observations, self.mode, self.n_billboards, 
-                            self.max_ads, node_feat_dim, ad_feat_dim)
-        
+        # PERFORMANCE: Only validate on first forward pass to catch dimension bugs early
+        # After first successful validation, skip to avoid CPU overhead on every call
+        if not self._validation_done:
+            node_feat_dim = observations['graph_nodes'].shape[-1]
+            ad_feat_dim = self.ad_encoder[0].in_features
+            validate_observations(observations, self.mode, self.n_billboards,
+                                self.max_ads, node_feat_dim, ad_feat_dim)
+            self._validation_done = True
+            logger.info("Input validation passed - skipping future validations for performance")
+
         # Optional debugging statistics
         if logger.isEnabledFor(logging.DEBUG):
             log_input_statistics(observations, self.mode)
