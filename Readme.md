@@ -7,7 +7,7 @@ This is a Setup Guide for Billboard Ad Allocation Environment
 
 ```bash
 # Create virtual environment
-python3 -m venv venv
+python3 -m venv venv       # Recommended Python 3.12
 
 # Activate it
 source venv/bin/activate  # Linux/Mac
