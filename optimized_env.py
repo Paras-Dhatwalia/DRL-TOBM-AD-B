@@ -304,9 +304,6 @@ class OptimizedBillboardEnv(gym.Env):
         # Gym-style action/observation spaces
         self._setup_action_observation_spaces()
 
-        # Cache for influence calculations (must be before _initialize_state)
-        self.influence_cache: Dict[Tuple[int, frozenset], Tuple[float, int]] = {}
-
         # Runtime state
         self._initialize_state()
     
@@ -512,9 +509,6 @@ class OptimizedBillboardEnv(gym.Env):
         # cannot be used again until reset() is called (new episode/game)
         self.used_advertiser_ids: set = set()
 
-        # Clear cache
-        self.influence_cache.clear()
-
         if self.perf_monitor:
             self.perf_monitor.reset()
     
@@ -640,99 +634,7 @@ class OptimizedBillboardEnv(gym.Env):
                 obs['current_ad'] = np.zeros(self.n_ad_features, dtype=np.float32)
         
         return obs
-    
-    def _calculate_influence_for_ad_vectorized(self, ad: Ad) -> float:
-        """
-        Vectorized influence calculation using NumPy broadcasting.
-        
-        Implements: I(S) = sum_{u_i in U} [1 - prod_{b_j in S} (1 - Pr(b_j, u_i))]
-        """
-        # CRITICAL FIX: Cache key must include minute (trajectory changes every minute)
-        minute_key = (self.start_time_min + self.current_step) % 1440
-        cache_key = (minute_key, frozenset(ad.assigned_billboards))
-        if cache_key in self.influence_cache:
-            cached_value, cached_step = self.influence_cache[cache_key]
-            if self.current_step - cached_step <= self.config.cache_ttl:
-                if self.perf_monitor:
-                    self.perf_monitor.record_cache_hit()
-                return cached_value
-        
-        if self.perf_monitor:
-            self.perf_monitor.record_cache_miss()
 
-        # S: Set of billboards assigned to this ad
-        if not ad.assigned_billboards:
-            return 0.0
-
-        bb_indices = [self.billboard_id_to_node_idx[b_id]
-                     for b_id in ad.assigned_billboards
-                     if b_id in self.billboard_id_to_node_idx]
-
-        if not bb_indices:
-            return 0.0
-
-        # Get user locations for current time (set U)
-        # minute_key was computed above for cache_key
-        user_locs = self.trajectory_map.get(minute_key, np.array([]))
-        
-        if len(user_locs) == 0:
-            return 0.0
-        
-        # Get billboard coordinates and size ratios for assigned billboards
-        bb_coords = self.billboard_coords[bb_indices]  # Shape: (n_billboards, 2)
-        bb_size_ratios = self.billboard_size_ratios[bb_indices]  # Shape: (n_billboards,)
-        
-        # Vectorized distance calculation
-        # user_locs shape: (n_users, 2)
-        # bb_coords shape: (n_billboards, 2)
-        # We need distances between all users and all billboards
-        
-        user_lats = user_locs[:, 0:1]  # Shape: (n_users, 1)
-        user_lons = user_locs[:, 1:2]  # Shape: (n_users, 1)
-        bb_lats = bb_coords[:, 0].reshape(1, -1)  # Shape: (1, n_billboards)
-        bb_lons = bb_coords[:, 1].reshape(1, -1)  # Shape: (1, n_billboards)
-        
-        # Calculate distances: shape (n_users, n_billboards)
-        distances = haversine_distance_vectorized(user_lats, user_lons, bb_lats, bb_lons)
-        
-        # Apply radius mask
-        within_radius = distances <= self.config.influence_radius_meters
-        
-        # Calculate probabilities where within radius
-        probabilities = np.zeros_like(distances)
-        mask = within_radius
-        
-        if np.any(mask):
-            # Base probability from size normalization
-            # Broadcasting: (n_users, n_billboards) * (1, n_billboards)
-            probabilities[mask] = bb_size_ratios[None, :].repeat(len(user_locs), axis=0)[mask]
-            
-            # Apply distance decay
-            probabilities[mask] *= self.distance_factor(distances[mask])
-            
-            # Numerical safety clamp
-            probabilities = np.clip(probabilities, 0.0, 0.999999)
-        
-        # Calculate influence for each user
-        # prod_{b_j in S} (1 - Pr(b_j, u_i)) for each user
-        prob_no_influence = np.prod(1.0 - probabilities, axis=1)  # Shape: (n_users,)
-        
-        # Total influence: sum of (1 - prob_no_influence) for all users
-        total_influence = np.sum(1.0 - prob_no_influence)
-        
-        # Cache the result
-        self.influence_cache[cache_key] = (total_influence, self.current_step)
-        
-        # Clean old cache entries periodically
-        if len(self.influence_cache) > 1000:
-            current_step = self.current_step
-            self.influence_cache = {
-                k: v for k, v in self.influence_cache.items() 
-                if current_step - v[1] <= self.config.cache_ttl
-            }
-        
-        return total_influence
-    
     def _compute_reward(self) -> float:
         """
         IMPROVED PROFIT-BASED REWARD FUNCTION (DRL-Optimized)
@@ -795,45 +697,95 @@ class OptimizedBillboardEnv(gym.Env):
     
     def _apply_influence_for_current_minute(self):
         """
-        Apply influence for current minute using vectorized calculations.
+        Apply influence for current minute using GLOBAL MATRIX vectorization.
+
+        PERFORMANCE OPTIMIZATION: Single-pass computation for ALL billboards.
+        Instead of computing distances per-ad (20 NumPy calls), we compute ONE
+        global probability matrix and slice columns for each ad (O(1) lookup).
+
+        This eliminates Python dispatch overhead by calling NumPy C-API once
+        instead of N_ads times per timestep.
+
         CANONICAL REWARD: Track per-step delta for progress shaping.
         """
+        minute_key = (self.start_time_min + self.current_step) % 1440
+
         if self.config.debug:
-            minute = (self.start_time_min + self.current_step) % 1440
-            logger.debug(f"Applying influence at step {self.current_step} (minute {minute})")
+            logger.debug(f"Applying influence at step {self.current_step} (minute {minute_key})")
 
-        # Use vectorized influence calculation
-        if self.config.enable_profiling and self.perf_monitor:
-            @self.perf_monitor.time_function('influence')
-            def calculate_influence(ad):
-                return self._calculate_influence_for_ad_vectorized(ad)
-        else:
-            calculate_influence = self._calculate_influence_for_ad_vectorized
+        # Get active ads that need influence calculation
+        active_ads = [ad for ad in self.ads if ad.state == 0]
+        if not active_ads:
+            return
 
-        for ad in list(self.ads):
-            if ad.state != 0:
+        # Get user locations for current time
+        user_locs = self.trajectory_map.get(minute_key, np.array([]))
+        if len(user_locs) == 0:
+            # No users at this minute - no influence to apply
+            for ad in active_ads:
+                ad._step_delta = 0.0
+            return
+
+        # ========== GLOBAL MATRIX COMPUTATION (Single NumPy call) ==========
+        # Compute distance from ALL users to ALL billboards in one operation
+        n_users = len(user_locs)
+        n_billboards = len(self.billboard_coords)
+
+        # Extract coordinates for broadcasting
+        user_lats = user_locs[:, 0:1]  # Shape: (n_users, 1)
+        user_lons = user_locs[:, 1:2]  # Shape: (n_users, 1)
+        bb_lats = self.billboard_coords[:, 0].reshape(1, -1)  # Shape: (1, n_billboards)
+        bb_lons = self.billboard_coords[:, 1].reshape(1, -1)  # Shape: (1, n_billboards)
+
+        # SINGLE Haversine call: (n_users, n_billboards) distance matrix
+        global_distances = haversine_distance_vectorized(user_lats, user_lons, bb_lats, bb_lons)
+
+        # Apply influence radius mask globally
+        within_radius = global_distances <= self.config.influence_radius_meters
+
+        # Compute global probability matrix
+        global_probabilities = np.zeros_like(global_distances)
+
+        if np.any(within_radius):
+            # Base probability from size ratios: broadcast (1, n_billboards) across users
+            global_probabilities[within_radius] = np.broadcast_to(
+                self.billboard_size_ratios[None, :], (n_users, n_billboards)
+            )[within_radius]
+
+            # Apply distance decay factor
+            global_probabilities[within_radius] *= self.distance_factor(global_distances[within_radius])
+
+            # Numerical safety clamp
+            global_probabilities = np.clip(global_probabilities, 0.0, 0.999999)
+
+        # ========== PER-AD COLUMN SLICING (O(1) lookups) ==========
+        for ad in active_ads:
+            # Get billboard indices for this ad (fast dict lookups)
+            bb_indices = [self.billboard_id_to_node_idx[b_id]
+                         for b_id in ad.assigned_billboards
+                         if b_id in self.billboard_id_to_node_idx]
+
+            if not bb_indices:
+                ad._step_delta = 0.0
                 continue
 
-            # Calculate TOTAL influence at this step
-            if ad._cached_influence is not None and ad._cache_step == self.current_step:
-                total_influence = ad._cached_influence
-            else:
-                total_influence = calculate_influence(ad)
-                ad._cached_influence = total_influence
-                ad._cache_step = self.current_step
+            # COLUMN SLICE: Extract probabilities for this ad's billboards
+            # This is O(1) memory reference, not recomputation
+            ad_probabilities = global_probabilities[:, bb_indices]  # Shape: (n_users, n_ad_billboards)
 
-            # CRITICAL FIX: Compute INCREMENTAL delta, not total
-            # Initialize _last_total_influence on first calculation
+            # Aggregate: 1 - prod(1 - p) for each user, then sum
+            prob_no_influence = np.prod(1.0 - ad_probabilities, axis=1)
+            total_influence = np.sum(1.0 - prob_no_influence)
+
+            # Compute INCREMENTAL delta (not total)
             if not hasattr(ad, '_last_total_influence'):
                 ad._last_total_influence = 0.0
 
-            # Delta = new total - previous total
             delta = max(0.0, total_influence - ad._last_total_influence)
             ad._last_total_influence = total_influence
 
             # CANONICAL REWARD: Store per-step delta for progress shaping
             ad._step_delta = delta
-
             ad.cumulative_influence += delta
 
             if self.config.debug and delta > 0:
@@ -1118,9 +1070,6 @@ class OptimizedBillboardEnv(gym.Env):
         # ADVERTISER TRACKING: Shuffle deck - all advertisers become available again
         # This is the "new game" reset - the discard pile is cleared
         self.used_advertiser_ids.clear()
-
-        # Clear cache
-        self.influence_cache.clear()
 
         if self.perf_monitor:
             self.perf_monitor.reset()
