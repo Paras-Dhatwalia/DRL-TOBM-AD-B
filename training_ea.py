@@ -2,7 +2,6 @@
 PPO Training for Billboard Allocation - EA (Edge Action) Mode (Minimal Logging Version)
 
 This version suppresses verbose logging for clean training output.
-For detailed debugging logs, use training_ea_2.py instead.
 
 EA Mode Design:
 - Combinatorial action space: select multiple (ad, billboard) pairs simultaneously
@@ -795,3 +794,4 @@ if __name__ == "__main__":
     # Run training
     use_test = args.test
     result = main(use_test_config=use_test)
+
