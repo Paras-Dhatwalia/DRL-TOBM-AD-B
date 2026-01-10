@@ -90,13 +90,13 @@ def get_test_config():
     return {
         # Environment config
         "env": {
-            "billboard_csv": r"path/to/folder",
-            "advertiser_csv": r"path/to/folder",
-            "trajectory_csv": r"path/to/folder",
+            "billboard_csv": r"path\to\folder",
+            "advertiser_csv": r"path\to\folder",
+            "trajectory_csv": r"path\to\folder",
             "action_mode": "ea",
             "max_events": 50,  # Very small for quick testing
             "max_active_ads": 3,  # Reduced action space
-            "influence_radius": 500.0,
+            "influence_radius": 100.0,
             "tardiness_cost": 50.0,
         },
         # Training config
@@ -107,7 +107,7 @@ def get_test_config():
             "discount_factor": 0.99,
             "gae_lambda": 0.95,
             "vf_coef": 0.5,
-            "ent_coef": 0.01,  # EA: lower entropy coefficient
+            "ent_coef": 0.001,  # EA: reduced for 8880-dim action space (was 0.01)
             "max_grad_norm": 0.5,
             "eps_clip": 0.2,
             "batch_size": 16,  # Very small
@@ -145,13 +145,13 @@ def get_full_config():
     return {
         # Environment config
         "env": {
-            "billboard_csv": r"path/to/folder",
-            "advertiser_csv": r"path/to/folder",
-            "trajectory_csv": r"path/to/folder",
+            "billboard_csv": r"path\to\folder",
+            "advertiser_csv": r"path\to\folder",
+            "trajectory_csv": r"path\to\folder",
             "action_mode": "ea",
             "max_events": 1000,
             "max_active_ads": 20,  # Full action space
-            "influence_radius": 500.0,
+            "influence_radius": 100.0,
             "tardiness_cost": 50.0,
         },
         # Training config
@@ -162,14 +162,14 @@ def get_full_config():
             "discount_factor": 0.99,
             "gae_lambda": 0.95,
             "vf_coef": 0.5,
-            "ent_coef": 0.005,  # EA: much lower entropy (high-dim action space)
+            "ent_coef": 0.0001,  # EA: very low for 8880-dim action space (was 0.005)
             "max_grad_norm": 0.5,
             "eps_clip": 0.2,
-            "batch_size": 32,  # Reduced from 128 for EA mode
+            "batch_size": 64,  # Reduced from 128 for EA mode
             "nr_envs": 4,  # Reduced from 8 for memory
-            "max_epoch": 200,
+            "max_epoch": 100,
             "step_per_collect": 2048,  # Reduced from 4096
-            "step_per_epoch": 100000,
+            "step_per_epoch": 20000,
             "repeat_per_collect": 15,
             "save_path": "models/ppo_billboard_ea.pt",
             "log_path": "logs/ppo_billboard_ea",
@@ -268,103 +268,7 @@ def create_vectorized_envs(env_config: Dict[str, Any], n_envs: int, use_validati
     return venv
 
 
-#  OBSERVATION PREPROCESSING 
-
-def preprocess_observations(**kwargs):
-    """
-    Convert numpy observations to torch tensors for EA mode.
-
-    Handles:
-    - Converting numpy arrays to torch tensors
-    - Moving tensors to correct device
-    - Reshaping masks for EA mode (flatten if needed)
-    - Batch processing
-
-    Note: Graph structure is kept in observations for now.
-    Can be optimized later by storing graph once in model.
-    """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    def process_obs(obs_dict):
-        """Process single observation dict"""
-        if isinstance(obs_dict, dict) and 'graph_nodes' in obs_dict:
-            processed = {
-                "graph_nodes": torch.from_numpy(obs_dict['graph_nodes']).float().to(device),
-                "graph_edge_links": torch.from_numpy(obs_dict['graph_edge_links']).long().to(device),
-                "ad_features": torch.from_numpy(obs_dict['ad_features']).float().to(device),
-                "mask": torch.from_numpy(obs_dict['mask']).bool().to(device)
-            }
-
-            # EA mode: mask should be flattened to (batch, max_ads * n_billboards)
-            if len(processed["mask"].shape) == 3:
-                batch_size, max_ads, n_billboards = processed["mask"].shape
-                processed["mask"] = processed["mask"].reshape(batch_size, -1)
-
-            return processed
-        return obs_dict
-
-    # Process observations and next observations
-    if "obs" in kwargs:
-        kwargs["obs"] = [process_obs(obs) for obs in kwargs["obs"]]
-    if "obs_next" in kwargs:
-        kwargs["obs_next"] = [process_obs(obs) for obs in kwargs["obs_next"]]
-
-    return kwargs
-
-
-#  EA-SPECIFIC METRICS 
-
-class EAMetricsLogger:
-    """
-    Track EA-specific metrics for research validation.
-
-    Metrics tracked:
-    - Number of active ads per step
-    - Number of valid (ad, billboard) pairs
-    - Mean number of selected edges per step
-    - Percentage of masked actions
-    - Action distribution statistics
-
-    These are critical for:
-    - Debugging
-    - Sanity checks
-    - Reviewer-facing validation
-    """
-
-    def __init__(self, writer: SummaryWriter):
-        self.writer = writer
-        self.step_count = 0
-
-    def log_step_metrics(self, batch, global_step: int):
-        """Log metrics for a batch of transitions"""
-        if not hasattr(batch, 'obs') or not isinstance(batch.obs, list):
-            return
-
-        # Aggregate metrics across batch
-        n_active_ads_list = []
-        n_valid_pairs_list = []
-        mask_ratio_list = []
-
-        for obs in batch.obs:
-            if isinstance(obs, dict) and 'mask' in obs:
-                mask = obs['mask']
-
-                # Count valid actions
-                n_valid = mask.sum().item() if hasattr(mask, 'sum') else np.sum(mask)
-                total = mask.numel() if hasattr(mask, 'numel') else mask.size
-
-                n_valid_pairs_list.append(n_valid)
-                mask_ratio_list.append(n_valid / total if total > 0 else 0)
-
-        # Log to tensorboard
-        if n_valid_pairs_list:
-            self.writer.add_scalar('ea/mean_valid_pairs', np.mean(n_valid_pairs_list), global_step)
-            self.writer.add_scalar('ea/mean_mask_ratio', np.mean(mask_ratio_list), global_step)
-
-        self.step_count += 1
-
-
-#  MAIN TRAINING 
+#  MAIN TRAINING
 
 def main(use_test_config: bool = True):
     """
@@ -602,9 +506,6 @@ def main(use_test_config: bool = True):
     os.makedirs(os.path.dirname(train_config["log_path"]), exist_ok=True)
     writer = SummaryWriter(train_config["log_path"])
     logger_tb = TensorboardLogger(writer)
-
-    # EA-specific metrics logger
-    ea_metrics = EAMetricsLogger(writer)
 
     # Save function
     os.makedirs(os.path.dirname(train_config["save_path"]), exist_ok=True)
