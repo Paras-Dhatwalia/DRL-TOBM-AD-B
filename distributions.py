@@ -32,11 +32,18 @@ class IndependentBernoulli(Distribution):
     Each dimension i has probability p[i] of being 1, independent of other dims.
     Used for combinatorial action spaces like EA mode in billboard allocation.
 
+    NUMERICAL STABILITY (Critical for 8880-dim action spaces):
+    - Logits are clamped to [-20, 20] to prevent sigmoid overflow
+    - Probabilities are clamped to [eps, 1-eps] to prevent log(0)
+    - Safe log_prob computation that never produces -inf or NaN
+    - Safe entropy computation with clamped probabilities
+
     Args:
         logits: Unnormalized log probabilities, shape (batch_size, action_dim)
         probs: Probabilities, shape (batch_size, action_dim). Mutually exclusive with logits.
         mask: Optional boolean mask, shape (batch_size, action_dim).
               If provided, masked dimensions are forced to 0.
+        eps: Small constant for numerical stability (default: 1e-7)
 
     Example:
         >>> logits = torch.randn(32, 8880)  # batch=32, 20 ads × 444 billboards
@@ -53,34 +60,63 @@ class IndependentBernoulli(Distribution):
     support = constraints.boolean
     has_rsample = False  # Bernoulli doesn't support reparameterized sampling
 
+    # Numerical stability constants
+    LOGIT_CLAMP_MIN = -20.0  # sigmoid(-20) ≈ 2e-9
+    LOGIT_CLAMP_MAX = 20.0   # sigmoid(20) ≈ 1 - 2e-9
+    MASKED_LOGIT = -20.0     # Logit value for masked (invalid) actions
+
     def __init__(
         self,
         logits: Optional[torch.Tensor] = None,
         probs: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
+        eps: float = 1e-7,
         validate_args: bool = False
     ):
         if (logits is None) == (probs is None):
             raise ValueError("Exactly one of 'logits' or 'probs' must be specified")
 
+        self.eps = eps
+        self.mask = mask
+
         if logits is not None:
-            self.logits = logits
-            self._probs = None
+            # NUMERICAL STABILITY: Clamp logits to prevent extreme probabilities
+            logits = torch.clamp(logits, min=self.LOGIT_CLAMP_MIN, max=self.LOGIT_CLAMP_MAX)
+
+            # Handle NaN in input logits (defensive)
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=self.LOGIT_CLAMP_MAX, neginf=self.LOGIT_CLAMP_MIN)
+
+            # Apply mask to logits if provided
+            if mask is not None:
+                mask_bool = mask.bool() if mask.dtype != torch.bool else mask
+                logits = torch.where(mask_bool, logits, torch.full_like(logits, self.MASKED_LOGIT))
+
+            self._logits = logits
+            # Compute probabilities with clamping for numerical safety
+            self._probs = torch.clamp(torch.sigmoid(logits), self.eps, 1.0 - self.eps)
             param = logits
         else:
-            self.logits = None
+            # NUMERICAL STABILITY: Clamp probabilities
+            probs = torch.clamp(probs, self.eps, 1.0 - self.eps)
+
+            # Handle NaN in input probs (defensive)
+            probs = torch.nan_to_num(probs, nan=0.5)
+
+            # Apply mask to probs if provided
+            if mask is not None:
+                mask_bool = mask.bool() if mask.dtype != torch.bool else mask
+                probs = torch.where(mask_bool, probs, torch.full_like(probs, self.eps))
+
             self._probs = probs
+            self._logits = None
             param = probs
 
-        self.mask = mask
         self._batch_shape = param.shape[:-1]
         self._event_shape = param.shape[-1:]
 
-        # Create underlying Bernoulli distributions
-        if self.logits is not None:
-            self._bernoulli = Bernoulli(logits=self.logits, validate_args=validate_args)
-        else:
-            self._bernoulli = Bernoulli(probs=self._probs, validate_args=validate_args)
+        # Create underlying Bernoulli with CLAMPED probabilities (not logits)
+        # This ensures the Bernoulli never sees extreme values
+        self._bernoulli = Bernoulli(probs=self._probs, validate_args=False)
 
         super().__init__(
             batch_shape=self._batch_shape,
@@ -89,16 +125,22 @@ class IndependentBernoulli(Distribution):
         )
 
     @property
+    def logits(self) -> torch.Tensor:
+        """Get logits (compute from probs if needed)."""
+        if self._logits is not None:
+            return self._logits
+        # Safe logit computation from clamped probs
+        return torch.log(self._probs / (1.0 - self._probs))
+
+    @property
     def probs(self) -> torch.Tensor:
-        """Get probabilities (compute from logits if needed)."""
-        if self._probs is not None:
-            return self._probs
-        return torch.sigmoid(self.logits)
+        """Get clamped probabilities."""
+        return self._probs
 
     @property
     def param(self) -> torch.Tensor:
         """Get the parameter tensor (logits or probs)."""
-        return self.logits if self.logits is not None else self._probs
+        return self._logits if self._logits is not None else self._probs
 
     def sample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
         """
@@ -113,11 +155,9 @@ class IndependentBernoulli(Distribution):
         with torch.no_grad():
             samples = self._bernoulli.sample(sample_shape)
 
-            # Apply mask if provided
+            # Apply mask if provided (redundant safety - mask already applied to probs)
             if self.mask is not None:
-                # Ensure mask is boolean
                 mask_bool = self.mask.bool() if self.mask.dtype != torch.bool else self.mask
-                # Zero out masked (invalid) actions
                 samples = samples * mask_bool.float()
 
             return samples
@@ -133,6 +173,8 @@ class IndependentBernoulli(Distribution):
         """
         Compute log probability of a binary action vector.
 
+        NUMERICAL STABILITY: Uses clamped probabilities to prevent log(0).
+
         For independent Bernoulli, log_prob is sum of individual log probs:
         log P(a) = sum_i [a_i * log(p_i) + (1-a_i) * log(1-p_i)]
 
@@ -142,21 +184,27 @@ class IndependentBernoulli(Distribution):
         Returns:
             Log probability, shape (*batch_shape,)
         """
-        # Get individual log probs
-        individual_log_probs = self._bernoulli.log_prob(value)
+        # SAFE log_prob computation using clamped probabilities
+        # This guarantees no -inf or NaN since eps <= p <= 1-eps
+        p = self._probs
+        log_p = value * torch.log(p) + (1.0 - value) * torch.log(1.0 - p)
+
+        # Extra safety: handle any residual NaN (should never happen with clamped probs)
+        log_p = torch.nan_to_num(log_p, nan=0.0, neginf=-100.0)
 
         # If mask is provided, only sum over valid (unmasked) dimensions
         if self.mask is not None:
             mask_bool = self.mask.bool() if self.mask.dtype != torch.bool else self.mask
-            # Set log_prob of masked dimensions to 0 (log(1) = 0, no contribution)
-            individual_log_probs = individual_log_probs * mask_bool.float()
+            log_p = log_p * mask_bool.float()
 
         # Sum over action dimensions to get total log_prob per batch
-        return individual_log_probs.sum(dim=-1)
+        return log_p.sum(dim=-1)
 
     def entropy(self) -> torch.Tensor:
         """
         Compute entropy of the distribution.
+
+        NUMERICAL STABILITY: Uses clamped probabilities to prevent log(0).
 
         For independent Bernoulli, entropy is sum of individual entropies:
         H = sum_i [-p_i * log(p_i) - (1-p_i) * log(1-p_i)]
@@ -164,14 +212,19 @@ class IndependentBernoulli(Distribution):
         Returns:
             Entropy, shape (*batch_shape,)
         """
-        individual_entropy = self._bernoulli.entropy()
+        # SAFE entropy computation using clamped probabilities
+        p = self._probs
+        entropy_per_dim = -p * torch.log(p) - (1.0 - p) * torch.log(1.0 - p)
+
+        # Extra safety: handle any residual NaN
+        entropy_per_dim = torch.nan_to_num(entropy_per_dim, nan=0.0)
 
         # If mask is provided, only sum over valid dimensions
         if self.mask is not None:
             mask_bool = self.mask.bool() if self.mask.dtype != torch.bool else self.mask
-            individual_entropy = individual_entropy * mask_bool.float()
+            entropy_per_dim = entropy_per_dim * mask_bool.float()
 
-        return individual_entropy.sum(dim=-1)
+        return entropy_per_dim.sum(dim=-1)
 
     @property
     def mean(self) -> torch.Tensor:

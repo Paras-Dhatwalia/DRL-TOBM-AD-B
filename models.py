@@ -239,27 +239,31 @@ def log_input_statistics(observations: Dict[str, torch.Tensor], mode: str) -> No
 def preprocess_observations(observations: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     """
     Preprocess and normalize observations for stable training.
-    
+
+    NUMERICAL STABILITY (Critical for preventing NaN propagation):
+    - When std ≈ 0, replace with 1.0 to avoid division creating extreme values
+    - Apply torch.nan_to_num after normalization to catch edge cases
+    - Clamp normalized values to [-10, 10] to prevent outliers
+
     This preprocessing is critical for training stability because:
     1. Raw features may have vastly different scales leading to gradient issues
     2. Standardization helps attention mechanisms focus on relationships vs magnitudes
     3. Proper normalization prevents exploding/vanishing gradients
     4. Batch-wise normalization ensures consistency across different batch compositions
-    
+
     Args:
         observations: Raw observations dictionary
-        
+
     Returns:
         Dictionary with normalized observations
-        
-    Note: This function preserves the original observations structure while applying
-    standardization. The small epsilon (1e-8) prevents division by zero for features
-    with zero standard deviation.
-    Preprocess and normalize observations for stable training.
     """
-    
+    # Numerical stability threshold - if std < this, replace with 1.0
+    STD_THRESHOLD = 1e-6
+    # Value clamp range to prevent outliers after normalization
+    VALUE_CLAMP = 10.0
+
     processed = {}
-    
+
     # Convert ALL numpy arrays to tensors FIRST
     for key, value in observations.items():
         if isinstance(value, np.ndarray):
@@ -271,28 +275,46 @@ def preprocess_observations(observations: Dict[str, torch.Tensor]) -> Dict[str, 
             processed[key] = tensor
         else:
             processed[key] = value
-    
+
     # NOW normalize (everything is already tensors)
     if 'graph_nodes' in processed:
         nodes = processed['graph_nodes']
         nodes_flat = nodes.reshape(-1, nodes.shape[-1])
         mean = nodes_flat.mean(dim=0, keepdim=True)
-        std = nodes_flat.std(dim=0, keepdim=True) + 1e-8
-        processed['graph_nodes'] = (nodes - mean.reshape(1, 1, -1)) / std.reshape(1, 1, -1)
-    
+        std = nodes_flat.std(dim=0, keepdim=True)
+
+        # NUMERICAL STABILITY: Replace near-zero std with 1.0 (not just add epsilon)
+        # This prevents division from creating extreme values when all features are identical
+        std = torch.where(std < STD_THRESHOLD, torch.ones_like(std), std)
+
+        normalized = (nodes - mean.reshape(1, 1, -1)) / std.reshape(1, 1, -1)
+
+        # NUMERICAL STABILITY: Handle any NaN/Inf that might have slipped through
+        normalized = torch.nan_to_num(normalized, nan=0.0, posinf=VALUE_CLAMP, neginf=-VALUE_CLAMP)
+
+        # NUMERICAL STABILITY: Clamp to prevent extreme outliers
+        processed['graph_nodes'] = torch.clamp(normalized, -VALUE_CLAMP, VALUE_CLAMP)
+
     # Normalize ad features
     for ad_key in ['current_ad', 'ad_features']:
         if ad_key in processed:
             ads = processed[ad_key]
             ads_flat = ads.reshape(-1, ads.shape[-1])
             mean = ads_flat.mean(dim=0, keepdim=True)
-            std = ads_flat.std(dim=0, keepdim=True) + 1e-8
-            
+            std = ads_flat.std(dim=0, keepdim=True)
+
+            # NUMERICAL STABILITY: Replace near-zero std with 1.0
+            std = torch.where(std < STD_THRESHOLD, torch.ones_like(std), std)
+
             if ad_key == 'current_ad':
-                processed[ad_key] = (ads - mean.reshape(1, -1)) / std.reshape(1, -1)
+                normalized = (ads - mean.reshape(1, -1)) / std.reshape(1, -1)
             else:
-                processed[ad_key] = (ads - mean.reshape(1, 1, -1)) / std.reshape(1, 1, -1)
-    
+                normalized = (ads - mean.reshape(1, 1, -1)) / std.reshape(1, 1, -1)
+
+            # NUMERICAL STABILITY: Handle NaN/Inf and clamp
+            normalized = torch.nan_to_num(normalized, nan=0.0, posinf=VALUE_CLAMP, neginf=-VALUE_CLAMP)
+            processed[ad_key] = torch.clamp(normalized, -VALUE_CLAMP, VALUE_CLAMP)
+
     return processed
 
 class AttentionModule(nn.Module):
