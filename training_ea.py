@@ -168,7 +168,7 @@ def get_full_config():
             "batch_size": 64,  # Reduced from 128 for EA mode
             "nr_envs": 4,  # Reduced from 8 for memory
             "max_epoch": 100,
-            "step_per_collect": 2048,  # Reduced from 4096
+            "step_per_collect": 4096,  # Full episodes (4 envs x 1000 steps)
             "step_per_epoch": 20000,
             "repeat_per_collect": 15,
             "save_path": "models/ppo_billboard_ea.pt",
