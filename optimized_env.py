@@ -680,7 +680,7 @@ class OptimizedBillboardEnv(gym.Env):
             if ad.state == 0:  # Active ads only
                 delta = getattr(ad, '_step_delta', 0.0)
                 progress_ratio = delta / max(ad.demand, 1e-6)
-                reward += progress_ratio * 0.3  # 6x stronger than original 0.05!
+                reward += progress_ratio * 5.0  # Amplified for sparse 100m radius
 
         # === 3. FAILURE PENALTIES (SINGLE penalty, not double) ===
         # Only penalize wasted resources, not unfulfilled demand separately
@@ -689,7 +689,7 @@ class OptimizedBillboardEnv(gym.Env):
             if ad:
                 # Single penalty: proportional to budget waste
                 waste_ratio = ad.total_cost_spent / max(ad.payment, 1e-6)
-                reward -= waste_ratio * 5.0  # Proportional to waste
+                reward -= waste_ratio * 0.5  # Reduced to allow exploration
 
         # === 4. SOFT NORMALIZATION (less aggressive for clearer gradients) ===
         # Maps to approximately [-2, 2] range for better gradient flow
