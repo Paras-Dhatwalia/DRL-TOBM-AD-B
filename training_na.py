@@ -126,6 +126,52 @@ class NoGraphObsWrapper(gym.Env):
 
 # MODEL WRAPPER: Stores graph internally, injects during forward
 
+
+def _add_graph_to_batch(
+    obs: Union[Dict, ts.data.Batch],
+    graph: torch.Tensor
+) -> Union[Dict, ts.data.Batch]:
+    """
+    Inject graph_edge_links into observation batch.
+    Shared utility for Actor and Critic wrappers (DRY principle).
+    """
+    # Helper to get values safely from Dict or Batch
+    def get(obj, key):
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    # If graph already exists, return as-is
+    if get(obs, 'graph_edge_links') is not None:
+        return obs
+
+    # Get nodes to determine batch size
+    nodes = get(obs, 'graph_nodes')
+    if nodes is None:
+        return obs
+
+    if isinstance(nodes, np.ndarray):
+        nodes = torch.from_numpy(nodes).float()
+
+    # Determine batch size: (B, N, F) -> B, (N, F) -> 1
+    batch_size = nodes.shape[0] if len(nodes.shape) == 3 else 1
+    device = nodes.device
+
+    # Expand graph: (2, E) -> (B, 2, E)
+    graph_batch = graph.unsqueeze(0).expand(batch_size, -1, -1).to(device)
+
+    # Inject based on type
+    if isinstance(obs, dict):
+        new_obs = obs.copy()
+        new_obs['graph_edge_links'] = graph_batch
+        return new_obs
+    else:
+        # Tianshou Batch - shallow copy to prevent in-place issues
+        new_obs = ts.data.Batch(obs)
+        new_obs.graph_edge_links = graph_batch
+        return new_obs
+
+
 class GraphAwareActor(torch.nn.Module):
     """
     Actor wrapper that stores graph as a buffer and injects it during forward.
@@ -140,49 +186,8 @@ class GraphAwareActor(torch.nn.Module):
 
     def forward(self, obs, state=None, info={}):
         """Add graph to observation and forward to model."""
-        # FIX: Directly handle obs whether it is a Batch or a Dict
-        obs_with_graph = self._add_graph_to_obs(obs)
+        obs_with_graph = _add_graph_to_batch(obs, self.graph)
         return self.model(obs_with_graph, state, info)
-
-    def _add_graph_to_obs(self, obs: Union[Dict, ts.data.Batch]):
-        """Add graph_edge_links to observation."""
-
-        # 1. Helper to get values safely from Dict or Batch
-        def get(obj, key):
-            if isinstance(obj, dict): return obj.get(key)
-            return getattr(obj, key, None)
-
-        # 2. If graph already exists, return as is
-        if get(obs, 'graph_edge_links') is not None:
-            return obs
-
-        # 3. Get nodes to determine batch size
-        nodes = get(obs, 'graph_nodes')
-        if nodes is None:
-            return obs
-
-        if isinstance(nodes, np.ndarray):
-            nodes = torch.from_numpy(nodes).float()
-
-        # Determine batch size
-        # If nodes is (B, N, F), batch_size is B. If (N, F), batch_size is 1.
-        batch_size = nodes.shape[0] if len(nodes.shape) == 3 else 1
-        device = nodes.device
-
-        # 4. Prepare the graph batch: (2, E) -> (B, 2, E)
-        graph_batch = self.graph.unsqueeze(0).expand(batch_size, -1, -1).to(device)
-
-        # 5. Inject based on type
-        if isinstance(obs, dict):
-            new_obs = obs.copy()
-            new_obs['graph_edge_links'] = graph_batch
-            return new_obs
-        else:
-            # Tianshou Batch
-            # Create a shallow copy to prevent in-place modification issues
-            new_obs = ts.data.Batch(obs)
-            new_obs.graph_edge_links = graph_batch
-            return new_obs
 
 
 class GraphAwareCritic(torch.nn.Module):
@@ -197,38 +202,8 @@ class GraphAwareCritic(torch.nn.Module):
 
     def forward(self, obs, state=None, info={}):
         """Add graph to observation and call critic_forward."""
-        obs_with_graph = self._add_graph_to_obs(obs)
+        obs_with_graph = _add_graph_to_batch(obs, self.graph)
         return self.model.critic_forward(obs_with_graph)
-
-    def _add_graph_to_obs(self, obs: Union[Dict, ts.data.Batch]):
-        """Add graph_edge_links to observation."""
-
-        def get(obj, key):
-            if isinstance(obj, dict): return obj.get(key)
-            return getattr(obj, key, None)
-
-        if get(obs, 'graph_edge_links') is not None:
-            return obs
-
-        nodes = get(obs, 'graph_nodes')
-        if nodes is None: return obs
-
-        if isinstance(nodes, np.ndarray):
-            nodes = torch.from_numpy(nodes).float()
-
-        batch_size = nodes.shape[0] if len(nodes.shape) == 3 else 1
-        device = nodes.device
-
-        graph_batch = self.graph.unsqueeze(0).expand(batch_size, -1, -1).to(device)
-
-        if isinstance(obs, dict):
-            new_obs = obs.copy()
-            new_obs['graph_edge_links'] = graph_batch
-            return new_obs
-        else:
-            new_obs = ts.data.Batch(obs)
-            new_obs.graph_edge_links = graph_batch
-            return new_obs
 
 
 
@@ -241,12 +216,12 @@ env_config = {
     "trajectory_csv": r"path/to/folder",
     "action_mode": "na",
     "max_events": 1000,
-    "influence_radius": 500.0,
+    "influence_radius": 100.0,
     "tardiness_cost": 50.0
 }
 
 train_config = {
-    "nr_envs": 6,               # 4 → 6: More parallel experience (memory-safe)
+    "nr_envs": 4,               # Reduced for VRAM safety with larger buffer
     "hidden_dim": 160,          # 128 → 160: 30% more capacity for complex problem
     "n_graph_layers": 4,        # 3 → 4: Deeper spatial reasoning
     "lr": 3e-4,                 # KEEP: Works well
@@ -259,7 +234,7 @@ train_config = {
     "eps_clip": 0.2,            # KEEP
     "batch_size": 96,           # 64 → 96: Better gradient estimates
     "max_epoch": 60,            # 20 → 60: 3x longer training (600K samples)
-    "step_per_collect": 768,    # 512 → 768: More samples per update
+    "step_per_collect": 4096,   # Full episode capture (4 envs x 1000 steps)
     "step_per_epoch": 10000,    # KEEP
     "repeat_per_collect": 6,    # 4 → 6: More gradient updates per collection
     "save_path": "models/ppo_billboard_na.pt",
@@ -535,35 +510,6 @@ def main():
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description='Train PPO for billboard allocation (NA mode) - Minimal Logging')
-    parser.add_argument('--billboards', type=str, help='Path to billboard CSV')
-    parser.add_argument('--advertisers', type=str, help='Path to advertiser CSV')
-    parser.add_argument('--trajectories', type=str, help='Path to trajectory CSV')
-    parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--lr', type=float, default=3e-4)
-    parser.add_argument('--batch-size', type=int, default=64)
-    parser.add_argument('--buffer-size', type=int, default=20000)
-
-    args = parser.parse_args()
-
-    if args.billboards:
-        env_config['billboard_csv'] = args.billboards
-    if args.advertisers:
-        env_config['advertiser_csv'] = args.advertisers
-    if args.trajectories:
-        env_config['trajectory_csv'] = args.trajectories
-
-    train_config['max_epoch'] = args.epochs
-    train_config['lr'] = args.lr
-    train_config['batch_size'] = args.batch_size
-    train_config['buffer_size'] = args.buffer_size
-
-    result = main()
-
-    if result is not None:
-        logger.info("Success!")
-    else:
-        logger.error("Training had issues")
+    # All config from env_config and train_config dicts at top of file
+    main()
 

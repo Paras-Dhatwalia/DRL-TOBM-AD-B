@@ -670,6 +670,9 @@ class OptimizedBillboardEnv(gym.Env):
                 # Efficiency bonus: Reward high profit margins
                 efficiency = profit / max(ad.payment, 1e-6)
                 reward += efficiency * 2.0  # Bonus for cost-effective completion
+
+                # COMPLETION JACKPOT - dominates reward landscape
+                reward += 20.0
             else:
                 if self.config.debug:
                     logger.warning(f"Completion reward: Ad {ad_id} not found")
@@ -680,7 +683,7 @@ class OptimizedBillboardEnv(gym.Env):
             if ad.state == 0:  # Active ads only
                 delta = getattr(ad, '_step_delta', 0.0)
                 progress_ratio = delta / max(ad.demand, 1e-6)
-                reward += progress_ratio * 5.0  # Amplified for sparse 100m radius
+                reward += progress_ratio * 0.5  # Shaping only, not exploitable
 
         # === 3. FAILURE PENALTIES (SINGLE penalty, not double) ===
         # Only penalize wasted resources, not unfulfilled demand separately
@@ -689,11 +692,11 @@ class OptimizedBillboardEnv(gym.Env):
             if ad:
                 # Single penalty: proportional to budget waste
                 waste_ratio = ad.total_cost_spent / max(ad.payment, 1e-6)
-                reward -= waste_ratio * 0.5  # Reduced to allow exploration
+                reward -= waste_ratio * 0.1  # Low penalty ensures positive EV for exploration
 
-        # === 4. SOFT NORMALIZATION (less aggressive for clearer gradients) ===
-        # Maps to approximately [-2, 2] range for better gradient flow
-        return 2.0 * np.tanh(reward / 3.0)
+        # === 4. SOFT NORMALIZATION (wider range to preserve jackpot signal) ===
+        # Maps to approximately [-2, 2] but preserves +20 completion bonus
+        return 2.0 * np.tanh(reward / 10.0)
     
     def _apply_influence_for_current_minute(self):
         """
