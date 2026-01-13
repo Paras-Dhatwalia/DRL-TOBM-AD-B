@@ -588,11 +588,13 @@ class BillboardAllocatorGNN(nn.Module):
             
         elif self.mode == 'ea':
             # Edge Action: Score ad-billboard pairs directly
+            # SEMANTIC FEATURES: +3 for edge features (budget_ratio, influence, is_free)
+            edge_feat_dim = 3
             if self.use_attention:
-                pair_dim = hidden_dim  # After attention projection
+                pair_dim = hidden_dim + edge_feat_dim  # After attention projection + edge features
             else:
-                pair_dim = self.billboard_embed_dim + hidden_dim
-                
+                pair_dim = self.billboard_embed_dim + hidden_dim + edge_feat_dim
+
             self.pair_scorer = nn.Sequential(
                 Linear(pair_dim, hidden_dim),
                 BatchNorm1d(hidden_dim),
@@ -759,32 +761,49 @@ class BillboardAllocatorGNN(nn.Module):
                          mask: torch.Tensor, batch_size: int, state: Optional[torch.Tensor],
                          info: Dict[str, Any]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        FIXED: Edge Action forward pass using pre-initialized parameters.
+        SEMANTIC LEARNING: Edge Action forward with edge features.
+
+        Edge features provide explicit semantic signals for ad-billboard matching:
+        - budget_ratio: Can the ad afford this billboard?
+        - influence_score: Billboard's reach potential
+        - is_free: Is the billboard available?
         """
-        
+
         # Get ad features
         ad_features = observations['ad_features']  # (batch_size, max_ads, ad_feat_dim)
         ad_embeds = self.ad_encoder(ad_features.view(-1, ad_features.shape[-1]))
         ad_embeds = ad_embeds.view(batch_size, self.max_ads, -1)
-        
+
+        # Get edge features (semantic signals for matching)
+        edge_features = observations.get('edge_features')  # (batch_size, max_ads, n_billboards, 3)
+        if edge_features is None:
+            # Fallback for backwards compatibility
+            edge_features = torch.zeros(
+                batch_size, self.max_ads, self.n_billboards, 3,
+                device=ad_embeds.device, dtype=ad_embeds.dtype
+            )
+
         # Create all ad-billboard pairs
-        ad_expanded = ad_embeds.unsqueeze(2).expand(-1, -1, self.n_billboards, -1)  
-        billboard_expanded = billboard_embeds.unsqueeze(1).expand(-1, self.max_ads, -1, -1)  
-        
+        ad_expanded = ad_embeds.unsqueeze(2).expand(-1, -1, self.n_billboards, -1)
+        billboard_expanded = billboard_embeds.unsqueeze(1).expand(-1, self.max_ads, -1, -1)
+
         if self.use_attention:
-            # FIXED: Apply attention using pre-initialized projection layer
+            # Apply attention using pre-initialized projection layer
             ad_query = ad_expanded.reshape(-1, self.n_billboards, ad_expanded.shape[-1])
             billboard_kv = billboard_expanded.reshape(-1, self.n_billboards, billboard_expanded.shape[-1])
-            
-            # FIXED: Use pre-initialized projection layer
+
             billboard_kv_proj = self.ea_billboard_proj(billboard_kv)
-            
+
             pair_features = self.attention(ad_query, billboard_kv_proj, billboard_kv_proj)
             pair_features = pair_features.reshape(batch_size, self.max_ads, self.n_billboards, -1)
         else:
             # Simple concatenation fallback
             pair_features = torch.cat([ad_expanded, billboard_expanded], dim=-1)
-        
+
+        # SEMANTIC FEATURES: Concatenate edge features to pair representation
+        # This gives the scorer explicit signals for matching quality
+        pair_features = torch.cat([pair_features, edge_features], dim=-1)
+
         # Score pairs
         pair_flat = pair_features.reshape(-1, pair_features.shape[-1])
         scores = self.pair_scorer(pair_flat).reshape(batch_size, self.max_ads * self.n_billboards)

@@ -13,9 +13,11 @@ import tianshou as ts
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 from tianshou.utils import TensorboardLogger
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from pettingzoo.utils import BaseWrapper
-from typing import Dict, Any, Tuple
+from torch.optim.lr_scheduler import ExponentialLR
+from typing import Dict, Any, Tuple, Optional, Union
+import platform
+import gymnasium as gym
+from gymnasium import spaces
 import logging
 import warnings
 
@@ -46,9 +48,10 @@ logging.getLogger('torch_geometric').setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# Import your environment and model
+from tianshou.trainer import OnpolicyTrainer
+
 from optimized_env import OptimizedBillboardEnv, EnvConfig
-from models import BillboardAllocatorGNN, DEFAULT_CONFIGS
+from models import BillboardAllocatorGNN
 
 # Configuration for MH mode
 env_config = {
@@ -62,45 +65,184 @@ env_config = {
 }
 
 train_config = {
-    "hidden_dim": 256,
-    "n_graph_layers": 4,
-    "lr": 2.5e-4,
-    "discount_factor": 0.99,
-    "gae_lambda": 0.95,
-    "vf_coef": 0.5,
-    "ent_coef": 0.015,
-    "max_grad_norm": 0.5,
-    "eps_clip": 0.2,
-    "batch_size": 96,
-    "nr_envs": 5,
-    "max_epoch": 120,
-    "step_per_collect": 2560,
-    "step_per_epoch": 100000,
-    "repeat_per_collect": 12,
+    "nr_envs": 4,               # Reduced for VRAM safety with larger buffer
+    "hidden_dim": 160,          # Moderate capacity for MH mode
+    "n_graph_layers": 4,        # Deeper spatial reasoning
+    "lr": 3e-4,                 # Standard learning rate
+    "lr_decay": 0.97,           # Slower LR decay
+    "discount_factor": 0.99,    # Standard discount
+    "gae_lambda": 0.95,         # Standard GAE
+    "vf_coef": 0.5,             # Value loss coefficient
+    "ent_coef": 0.015,          # Entropy bonus for exploration
+    "max_grad_norm": 0.5,       # Gradient clipping
+    "eps_clip": 0.2,            # PPO clipping
+    "batch_size": 64,           # Safe for multi-head model
+    "max_epoch": 60,            # Reasonable training length
+    "step_per_collect": 4096,   # Full episode capture (4 envs x 1000 steps)
+    "step_per_epoch": 10000,    # Steps per epoch
+    "repeat_per_collect": 6,    # Gradient updates per collection
     "save_path": "models/ppo_billboard_mh.pt",
-    "log_path": "logs/ppo_billboard_mh"
+    "log_path": "logs/ppo_billboard_mh",
+    "buffer_size": 30000        # Large replay buffer
 }
 
 
-class BillboardPettingZooWrapper(BaseWrapper):
-    """Wrapper for PettingZoo compatibility"""
+# WRAPPER: Returns observations WITHOUT graph_edge_links
 
-    def __init__(self, env):
-        super().__init__(env)
 
-    def reset(self, *args, **kwargs):
-        obs, info = self.env.reset(*args, **kwargs)
-        observations = {agent: obs for agent in self.agents}
-        infos = {agent: info for agent in self.agents}
-        return observations, infos
+class NoGraphObsWrapper(gym.Env):
+    """
+    Wrapper that completely removes graph_edge_links from observations.
+    The graph is accessed separately via get_graph() method.
+    """
 
-    def step(self, actions):
-        action = actions.get(self.agent_selection, actions)
-        return self.env.step(action)
+    metadata = {"render_modes": ["human"]}
+
+    def __init__(self, env: OptimizedBillboardEnv):
+        super().__init__()
+        self.env = env
+        self._agent = "Allocator_0"
+
+        # Store the graph ONCE
+        self._graph = env.edge_index.copy()
+
+        # Create observation space WITHOUT graph (Gym-style, no agent parameter)
+        orig_space = env.observation_space
+        self._observation_space = spaces.Dict({
+            k: v for k, v in orig_space.spaces.items()
+            if k != 'graph_edge_links'
+        })
+        self._action_space = env.action_space
+
+    def get_graph(self) -> np.ndarray:
+        """Get the graph structure (call once, store in model)."""
+        return self._graph
+
+    @property
+    def action_space(self) -> spaces.Space:
+        return self._action_space
+
+    @property
+    def observation_space(self) -> spaces.Space:
+        return self._observation_space
+
+    def _strip_obs(self, obs: Dict) -> Dict:
+        """Remove graph_edge_links from observation."""
+        return {k: v for k, v in obs.items() if k != 'graph_edge_links'}
+
+    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[Dict, Dict]:
+        obs, info = self.env.reset(seed=seed, options=options)
+        return self._strip_obs(obs), info
+
+    def step(self, action) -> Tuple[Dict, float, bool, bool, Dict]:
+        obs, rewards, terminations, truncations, infos = self.env.step(action)
+
+        reward = rewards.get(self._agent, 0.0) if isinstance(rewards, dict) else rewards
+        terminated = terminations.get(self._agent, False) if isinstance(terminations, dict) else terminations
+        truncated = truncations.get(self._agent, False) if isinstance(truncations, dict) else truncations
+        info = infos.get(self._agent, {}) if isinstance(infos, dict) else infos
+
+        return self._strip_obs(obs), float(reward), bool(terminated), bool(truncated), info
+
+    def render(self):
+        return self.env.render()
+
+    def close(self):
+        self.env.close()
+
+    # Expose env properties
+    @property
+    def n_nodes(self): return self.env.n_nodes
+    @property
+    def config(self): return self.env.config
+    @property
+    def edge_index(self): return self.env.edge_index
+
+
+# MODEL WRAPPER: Stores graph internally, injects during forward
+
+
+def _add_graph_to_batch(
+    obs: Union[Dict, ts.data.Batch],
+    graph: torch.Tensor
+) -> Union[Dict, ts.data.Batch]:
+    """
+    Inject graph_edge_links into observation batch.
+    Shared utility for Actor and Critic wrappers (DRY principle).
+    """
+    # Helper to get values safely from Dict or Batch
+    def get(obj, key):
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    # If graph already exists, return as-is
+    if get(obs, 'graph_edge_links') is not None:
+        return obs
+
+    # Get nodes to determine batch size
+    nodes = get(obs, 'graph_nodes')
+    if nodes is None:
+        return obs
+
+    if isinstance(nodes, np.ndarray):
+        nodes = torch.from_numpy(nodes).float()
+
+    # Determine batch size: (B, N, F) -> B, (N, F) -> 1
+    batch_size = nodes.shape[0] if len(nodes.shape) == 3 else 1
+    device = nodes.device
+
+    # Expand graph: (2, E) -> (B, 2, E)
+    graph_batch = graph.unsqueeze(0).expand(batch_size, -1, -1).to(device)
+
+    # Inject based on type
+    if isinstance(obs, dict):
+        new_obs = obs.copy()
+        new_obs['graph_edge_links'] = graph_batch
+        return new_obs
+    else:
+        # Tianshou Batch - shallow copy to prevent in-place issues
+        new_obs = ts.data.Batch(obs)
+        new_obs.graph_edge_links = graph_batch
+        return new_obs
+
+
+class GraphAwareActor(torch.nn.Module):
+    """
+    Actor wrapper that stores graph as a buffer and injects it during forward.
+    """
+
+    def __init__(self, model: BillboardAllocatorGNN, graph: np.ndarray):
+        super().__init__()
+        self.model = model
+        # Register graph as a buffer (not a parameter, won't be trained)
+        self.register_buffer('graph', torch.from_numpy(graph).long())
+        self.n_nodes = model.n_billboards
+
+    def forward(self, obs, state=None, info={}):
+        """Add graph to observation and forward to model."""
+        obs_with_graph = _add_graph_to_batch(obs, self.graph)
+        return self.model(obs_with_graph, state, info)
+
+
+class GraphAwareCritic(torch.nn.Module):
+    """
+    Critic wrapper that stores graph as a buffer and injects it during forward.
+    """
+
+    def __init__(self, model: BillboardAllocatorGNN, graph: np.ndarray):
+        super().__init__()
+        self.model = model
+        self.register_buffer('graph', torch.from_numpy(graph).long())
+
+    def forward(self, obs, state=None, info={}):
+        """Add graph to observation and call critic_forward."""
+        obs_with_graph = _add_graph_to_batch(obs, self.graph)
+        return self.model.critic_forward(obs_with_graph)
 
 
 def get_env():
-    """Create wrapped environment for MH mode"""
+    """Create wrapped environment for MH mode."""
     env = OptimizedBillboardEnv(
         billboard_csv=env_config["billboard_csv"],
         advertiser_csv=env_config["advertiser_csv"],
@@ -112,46 +254,7 @@ def get_env():
             tardiness_cost=env_config["tardiness_cost"]
         )
     )
-    return BillboardPettingZooWrapper(env)
-
-
-def preprocess_observations(**kwargs):
-    """Convert numpy observations to torch tensors for MH mode"""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    def process_obs(obs_dict):
-        if isinstance(obs_dict, dict) and 'graph_nodes' in obs_dict:
-            processed = {
-                "graph_nodes": torch.from_numpy(obs_dict['graph_nodes']).float().to(device),
-                "graph_edge_links": torch.from_numpy(obs_dict['graph_edge_links']).long().to(device),
-                "ad_features": torch.from_numpy(obs_dict['ad_features']).float().to(device),
-                "mask": torch.from_numpy(obs_dict['mask']).bool().to(device)
-            }
-
-            # MH mode expects 3D mask (batch, max_ads, n_billboards)
-            if len(processed["mask"].shape) == 2:
-                # If it comes as 2D, we need to reshape appropriately
-                batch_size = processed["graph_nodes"].shape[0] if len(processed["graph_nodes"].shape) > 2 else 1
-                max_ads = processed["ad_features"].shape[-2] if len(processed["ad_features"].shape) > 2 else \
-                processed["ad_features"].shape[0]
-                n_billboards = processed["graph_nodes"].shape[-2] if len(processed["graph_nodes"].shape) > 2 else \
-                processed["graph_nodes"].shape[0]
-
-                # Ensure correct 3D shape
-                if processed["mask"].shape != (batch_size, max_ads, n_billboards):
-                    # Try to reshape if possible
-                    if processed["mask"].numel() == batch_size * max_ads * n_billboards:
-                        processed["mask"] = processed["mask"].reshape(batch_size, max_ads, n_billboards)
-
-            return processed
-        return obs_dict
-
-    if "obs" in kwargs:
-        kwargs["obs"] = [process_obs(obs) for obs in kwargs["obs"]]
-    if "obs_next" in kwargs:
-        kwargs["obs_next"] = [process_obs(obs) for obs in kwargs["obs_next"]]
-
-    return kwargs
+    return NoGraphObsWrapper(env)
 
 
 class MultiHeadCategorical:
@@ -193,25 +296,38 @@ def multi_head_dist_fn(logits):
 
 
 def main():
-    """Main training function for MH mode"""
+    """Main training function for MH mode."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Training MH mode on device: {device}")
 
-    # Create environments
-    logger.info("Creating environments...")
-    train_envs = ts.env.SubprocVectorEnv([get_env for _ in range(train_config["nr_envs"])])
-    test_envs = ts.env.DummyVectorEnv([get_env for _ in range(2)])
+    os.makedirs(os.path.dirname(train_config["save_path"]), exist_ok=True)
+    os.makedirs(train_config["log_path"], exist_ok=True)
 
-    # Get environment info
+    # Create sample environment first
     sample_env = get_env()
-    n_billboards = sample_env.env.n_nodes
-    max_ads = sample_env.env.config.max_active_ads
-    logger.info(f"Environment: {n_billboards} billboards, max {max_ads} ads")
+    n_billboards = sample_env.n_nodes
+    max_ads = sample_env.config.max_active_ads
+
+    # Verify observation space has no graph
+    obs, _ = sample_env.reset()
+    assert 'graph_edge_links' not in obs, "Graph should not be in observations!"
+
+    # Extract graph directly from sample environment (no global needed)
+    graph_numpy = sample_env.get_graph()
+
+    action_space = sample_env.action_space
+
+    # Create vectorized environments
+    if platform.system() == "Windows":
+        train_envs = ts.env.DummyVectorEnv([get_env for _ in range(train_config["nr_envs"])])
+    else:
+        train_envs = ts.env.SubprocVectorEnv([get_env for _ in range(train_config["nr_envs"])])
+
+    test_envs = ts.env.DummyVectorEnv([get_env for _ in range(2)])
 
     # Create model configuration for MH mode
     model_config = {
         'node_feat_dim': 10,
-        'ad_feat_dim': 8,
+        'ad_feat_dim': 12,  # Updated from 8: added 4 budget features
         'hidden_dim': train_config['hidden_dim'],
         'n_graph_layers': train_config['n_graph_layers'],
         'mode': 'mh',  # Multi-Head mode
@@ -222,32 +338,30 @@ def main():
         'dropout': 0.1
     }
 
-    # Initialize networks
-    logger.info("Creating actor and critic networks...")
-    actor = BillboardAllocatorGNN(**model_config).to(device)
-    critic = BillboardAllocatorGNN(**model_config).to(device)
+    # SHARED BACKBONE: Create ONE model used by both actor and critic
+    # This halves parameters and improves learning via shared representations
+    shared_model = BillboardAllocatorGNN(**model_config)
 
-    # Log model parameters
-    total_params = sum(p.numel() for p in actor.parameters()) + \
-                   sum(p.numel() for p in critic.parameters())
-    logger.info(f"Total model parameters: {total_params:,}")
+    # Wrap with graph-aware wrappers - BOTH use the SAME underlying model
+    actor = GraphAwareActor(shared_model, graph_numpy).to(device)
+    critic = GraphAwareCritic(shared_model, graph_numpy).to(device)
 
-    # Optimizer and scheduler
+    # Optimizer - use shared_model.parameters() directly to avoid duplicates
     optimizer = torch.optim.Adam(
-        list(actor.parameters()) + list(critic.parameters()),
+        shared_model.parameters(),
         lr=train_config["lr"],
         eps=1e-5
     )
-
-    lr_scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=train_config["max_epoch"],
-        eta_min=train_config["lr"] * 0.1
-    )
+    lr_scheduler = ExponentialLR(optimizer, gamma=train_config.get("lr_decay", 0.97))
 
     # Create PPO policy with multi-head distribution
     policy = ts.policy.PPOPolicy(
-        actor, critic, optimizer,
+        actor=actor,
+        critic=critic,
+        optim=optimizer,
+        dist_fn=multi_head_dist_fn,  # Custom distribution for multi-head
+        action_space=action_space,
+        action_scaling=False,
         discount_factor=train_config["discount_factor"],
         gae_lambda=train_config["gae_lambda"],
         vf_coef=train_config["vf_coef"],
@@ -255,112 +369,163 @@ def main():
         max_grad_norm=train_config["max_grad_norm"],
         eps_clip=train_config["eps_clip"],
         value_clip=True,
-        dist_fn=multi_head_dist_fn,  # Custom distribution for multi-head
         deterministic_eval=True,
         lr_scheduler=lr_scheduler
     )
 
-    # Create collectors
-    buffer_size = max(25000, train_config["step_per_collect"] * 2)
+    # Create collectors with standard buffers
     train_collector = ts.data.Collector(
-        policy, train_envs,
-        ts.data.VectorReplayBuffer(buffer_size, train_config["nr_envs"]),
-        exploration_noise=True,
-        preprocess_fn=preprocess_observations
+        policy,
+        train_envs,
+        ts.data.VectorReplayBuffer(train_config["buffer_size"], train_config["nr_envs"]),
+        exploration_noise=True
     )
 
     test_collector = ts.data.Collector(
-        policy, test_envs,
-        exploration_noise=False,
-        preprocess_fn=preprocess_observations
+        policy,
+        test_envs,
+        exploration_noise=False
     )
 
-    # Setup logging
-    os.makedirs(os.path.dirname(train_config["log_path"]), exist_ok=True)
+    # Logging
     writer = SummaryWriter(train_config["log_path"])
-    logger_tb = TensorboardLogger(writer)
+    tb_logger = TensorboardLogger(writer)
 
     # Save function
-    os.makedirs(os.path.dirname(train_config["save_path"]), exist_ok=True)
     best_reward = -float('inf')
 
     def save_best_fn(policy):
         nonlocal best_reward
         test_result = test_collector.collect(n_episode=10)
-        current_reward = test_result["rews"].mean()
+        current_reward = test_result.returns.mean()
 
         if current_reward > best_reward:
             best_reward = current_reward
-            logger.info(f"New best reward: {best_reward:.2f}, saving model...")
+            logger.info(f"New best reward: {best_reward:.2f}, saving...")
             torch.save({
-                'actor_state_dict': actor.state_dict(),
-                'critic_state_dict': critic.state_dict(),
+                'model_state_dict': shared_model.state_dict(),  # Single shared model
                 'optimizer_state_dict': optimizer.state_dict(),
                 'config': model_config,
-                'best_reward': best_reward
+                'best_reward': best_reward,
+                'graph': graph_numpy
             }, train_config["save_path"])
 
-    # Custom callback for multi-head monitoring
-    def train_callback(epoch, env_step):
-        # Log learning rate
-        current_lr = optimizer.param_groups[0]['lr']
-        writer.add_scalar('train/learning_rate', current_lr, env_step)
-
-        # Log additional MH-specific metrics if available
-        if hasattr(policy, '_last_ad_entropy'):
-            writer.add_scalar('train/ad_selection_entropy', policy._last_ad_entropy, env_step)
-        if hasattr(policy, '_last_bb_entropy'):
-            writer.add_scalar('train/billboard_selection_entropy', policy._last_bb_entropy, env_step)
-
-    # Train
+    # Training
+    total_params = sum(p.numel() for p in shared_model.parameters())
     logger.info("="*60)
     logger.info("Training Configuration:")
-    logger.info(f"  Mode: MH (Multi-Head)")
+    logger.info(f"  Mode: MH (Multi-Head) - SHARED BACKBONE")
     logger.info(f"  Billboards: {n_billboards}, Max Ads: {max_ads}")
+    logger.info(f"  Shared model params: {total_params:,}")
     logger.info(f"  Epochs: {train_config['max_epoch']}, Steps/epoch: {train_config['step_per_epoch']}")
-    logger.info(f"  Parallel envs: {train_config['nr_envs']}, Batch size: {train_config['batch_size']}")
-    logger.info(f"  Device: {device}")
+    logger.info(f"  Batch: {train_config['batch_size']}, Collect: {train_config['step_per_collect']}")
+    logger.info(f"  Parallel envs: {train_config['nr_envs']}, Device: {device}")
     logger.info("="*60)
 
-    result = ts.trainer.onpolicy_trainer(
-        policy, train_collector,
-        test_collector=test_collector,
-        max_epoch=train_config["max_epoch"],
-        step_per_epoch=train_config["step_per_epoch"],
-        step_per_collect=train_config["step_per_collect"],
-        episode_per_test=10,
-        batch_size=train_config["batch_size"],
-        repeat_per_collect=train_config["repeat_per_collect"],
-        save_best_fn=save_best_fn,
-        logger=logger_tb,
-        show_progress=True,
-        test_in_train=True,
-        train_fn=train_callback
-    )
+    try:
+        trainer = OnpolicyTrainer(
+            policy=policy,
+            train_collector=train_collector,
+            test_collector=test_collector,
+            max_epoch=train_config["max_epoch"],
+            step_per_epoch=train_config["step_per_epoch"],
+            repeat_per_collect=train_config["repeat_per_collect"],
+            episode_per_test=10,
+            batch_size=train_config["batch_size"],
+            step_per_collect=train_config["step_per_collect"],
+            save_best_fn=save_best_fn,
+            logger=tb_logger,
+            show_progress=True,
+            test_in_train=True
+        )
 
-    # Save final model
-    final_path = train_config["save_path"].replace('.pt', '_final.pt')
-    torch.save({
-        'actor_state_dict': actor.state_dict(),
-        'critic_state_dict': critic.state_dict(),
-        'config': model_config,
-        'training_config': train_config,
-        'final_reward': result.get("best_reward", 0)
-    }, final_path)
+        result = trainer.run()
 
-    logger.info("="*60)
-    logger.info(f"Training complete! Best reward: {best_reward:.2f}")
-    logger.info(f"Model saved to: {train_config['save_path']}")
-    logger.info("="*60)
+        # === POST-TRAINING EVALUATION ===
+        logger.info("="*60)
+        logger.info("POST-TRAINING EVALUATION")
+        logger.info("="*60)
+        logger.info("Running full episode with trained policy...")
 
-    # Clean up
-    train_envs.close()
-    test_envs.close()
-    writer.close()
+        try:
+            # Create a fresh evaluation environment
+            eval_env = get_env()
+            obs, info = eval_env.reset()
 
-    return result
+            total_reward = 0.0
+            step_count = 0
+            done = False
+
+            # Run full episode
+            while not done:
+                with torch.no_grad():
+                    # Create batch for policy
+                    batch = ts.data.Batch(obs=[obs], info=[{}])
+                    result_batch = policy(batch)
+                    action = result_batch.act[0]
+
+                    # Convert to numpy if needed
+                    if hasattr(action, 'cpu'):
+                        action = action.cpu().numpy()
+
+                # Step environment
+                obs, reward, terminated, truncated, info = eval_env.step(action)
+                total_reward += reward
+                step_count += 1
+                done = terminated or truncated
+
+            # Display environment's internal performance metrics
+            logger.info("")
+            logger.info("Environment Performance Metrics:")
+            logger.info("-" * 40)
+
+            # Access the base environment through the wrapper
+            base_env = eval_env.env if hasattr(eval_env, 'env') else eval_env
+            base_env.render_summary()
+
+            logger.info("")
+            logger.info(f"Episode Statistics:")
+            logger.info(f"  - Total steps: {step_count}")
+            logger.info(f"  - Total reward: {total_reward:.4f}")
+            logger.info(f"  - Avg reward/step: {total_reward/max(1, step_count):.6f}")
+
+            eval_env.close()
+
+        except Exception as e:
+            logger.error(f"Post-training evaluation failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+        logger.info("="*60)
+        logger.info(f"Training complete! Best reward: {best_reward:.2f}")
+        logger.info(f"Model saved to: {train_config['save_path']}")
+        logger.info("="*60)
+
+        # Save final model
+        torch.save({
+            'model_state_dict': shared_model.state_dict(),
+            'config': model_config,
+            'training_config': train_config,
+            'final_reward': best_reward,
+            'graph': graph_numpy
+        }, train_config["save_path"].replace('.pt', '_final.pt'))
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Training failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+    finally:
+        train_envs.close()
+        test_envs.close()
+        writer.close()
+        sample_env.close()
 
 
 if __name__ == "__main__":
+    # All config from env_config and train_config dicts at top of file
     main()
 

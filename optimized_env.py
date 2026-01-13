@@ -23,7 +23,7 @@ class EnvConfig:
     """Environment configuration parameters"""
     influence_radius_meters: float = 100.0
     slot_duration_range: Tuple[int, int] = (1, 5)
-    new_ads_per_step_range: Tuple[int, int] = (1, 5)
+    new_ads_per_step_range: Tuple[int, int] = (0, 2)
     tardiness_cost: float = 50.0
     max_events: int = 1000
     max_active_ads: int = 20
@@ -456,6 +456,8 @@ class OptimizedBillboardEnv(gym.Env):
             # Edge Action: select ad-billboard pairs
             max_pairs = self.config.max_active_ads * self.n_nodes
             self.action_space = spaces.MultiBinary(max_pairs)
+            # Edge features: 3 semantic features per (ad, billboard) pair
+            n_edge_features = 3
             self.observation_space = spaces.Dict({
                 'graph_nodes': spaces.Box(low=-np.inf, high=np.inf,
                                          shape=(self.n_nodes, self.n_node_features),
@@ -466,6 +468,9 @@ class OptimizedBillboardEnv(gym.Env):
                 'ad_features': spaces.Box(low=-np.inf, high=np.inf,
                                          shape=(self.config.max_active_ads, self.n_ad_features),
                                          dtype=np.float32),
+                'edge_features': spaces.Box(low=0.0, high=1.0,
+                                           shape=(self.config.max_active_ads, self.n_nodes, n_edge_features),
+                                           dtype=np.float32),
                 'mask': spaces.MultiBinary(max_pairs)
             })
 
@@ -503,6 +508,7 @@ class OptimizedBillboardEnv(gym.Env):
         # CANONICAL REWARD: Event-based tracking
         self.ads_completed_this_step: List[int] = []
         self.ads_failed_this_step: List[int] = []  # Track new failures
+        self.allocations_this_step: int = 0  # Track successful allocations for reward shaping
 
         # ADVERTISER TRACKING: Track used advertiser IDs within current episode
         # This set acts as a "discard pile" - once an advertiser is used, they
@@ -595,7 +601,53 @@ class OptimizedBillboardEnv(gym.Env):
             return pair_mask
 
         return np.array([1], dtype=np.int8)
-    
+
+    def get_edge_features(self) -> np.ndarray:
+        """Compute semantic edge features for all (ad, billboard) pairs.
+
+        Returns 3 features per pair to help the model learn matching rules:
+        1. budget_ratio: Can the ad afford this billboard? (0-1)
+        2. influence_score: Billboard's reach potential (normalized influence)
+        3. is_free: Is the billboard available? (0 or 1)
+
+        Returns:
+            edge_features: (max_ads, n_billboards, 3) array
+        """
+        n_edge_features = 3
+        edge_features = np.zeros(
+            (self.config.max_active_ads, self.n_nodes, n_edge_features),
+            dtype=np.float32
+        )
+
+        active_ads = [ad for ad in self.ads if ad.state == 0]
+        n_active = min(len(active_ads), self.config.max_active_ads)
+
+        if n_active == 0:
+            return edge_features
+
+        # Precompute billboard properties (vectorized)
+        max_duration = self.config.slot_duration_range[1]
+        billboard_costs = np.array([b.b_cost * max_duration for b in self.billboards],
+                                   dtype=np.float32)
+        billboard_influence = np.array([b.influence for b in self.billboards],
+                                       dtype=np.float32)
+        billboard_free = np.array([1.0 if b.is_free() else 0.0 for b in self.billboards],
+                                  dtype=np.float32)
+
+        # Compute features for each active ad
+        for i in range(n_active):
+            ad = active_ads[i]
+            # Feature 1: Budget ratio (can afford?)
+            edge_features[i, :, 0] = np.minimum(
+                1.0, ad.remaining_budget / np.maximum(billboard_costs, 1e-6)
+            )
+            # Feature 2: Billboard influence (reach potential)
+            edge_features[i, :, 1] = billboard_influence
+            # Feature 3: Is billboard free?
+            edge_features[i, :, 2] = billboard_free
+
+        return edge_features
+
     def _get_obs(self) -> Dict[str, Any]:
         """Get current observation."""
         # Node features (billboards)
@@ -611,14 +663,18 @@ class OptimizedBillboardEnv(gym.Env):
         
         # Add ad features for modes that need them
         if self.action_mode in ['ea', 'mh']:
-            ad_features = np.zeros((self.config.max_active_ads, self.n_ad_features), 
+            ad_features = np.zeros((self.config.max_active_ads, self.n_ad_features),
                                   dtype=np.float32)
             active_ads = [ad for ad in self.ads if ad.state == 0]
-            
+
             for i, ad in enumerate(active_ads[:self.config.max_active_ads]):
                 ad_features[i] = ad.get_feature_vector()
-            
+
             obs['ad_features'] = ad_features
+
+            # Add semantic edge features for EA mode
+            if self.action_mode == 'ea':
+                obs['edge_features'] = self.get_edge_features()
         
         # Add current ad for NA mode
         elif self.action_mode == 'na':
@@ -637,24 +693,18 @@ class OptimizedBillboardEnv(gym.Env):
 
     def _compute_reward(self) -> float:
         """
-        IMPROVED PROFIT-BASED REWARD FUNCTION (DRL-Optimized)
+        SEMANTIC LEARNING REWARD FUNCTION (v2.0)
 
-        Design principles (DRL best practices):
-        1. Stronger progress shaping for better credit assignment
-        2. Efficiency bonus to encourage cost-effective decisions
-        3. Single penalty for failures (not double-counting)
-        4. Less aggressive normalization for clearer gradients
+        Design principles:
+        1. Allocation bonus: Encourage exploration by rewarding valid allocations
+        2. Strong progress signal: High coefficient for credit assignment
+        3. Completion jackpot: Preserved without aggressive compression
+        4. Minimal failure penalty: Don't discourage exploration
 
-        Components:
-        - R_complete: Profit + efficiency bonus when ad completes
-        - R_progress: Strong auxiliary shaping (6x stronger than before)
-        - C_failure: Single proportional penalty for failed ads
-
-        Key improvements over original:
-        - Progress coefficient: 0.05 → 0.3 (6x stronger signal)
-        - Efficiency bonus: Rewards high profit margins
-        - No double penalty: Only waste penalty (no unfulfilled penalty)
-        - Better normalization: tanh(x/3) for clearer gradients
+        Key changes from v1:
+        - Added allocation bonus (+0.1 per valid allocation)
+        - Progress coefficient: 0.5 → 2.0 (4x stronger)
+        - Removed tanh compression: Use clip to preserve jackpot signal
         """
 
         reward = 0.0
@@ -671,32 +721,33 @@ class OptimizedBillboardEnv(gym.Env):
                 efficiency = profit / max(ad.payment, 1e-6)
                 reward += efficiency * 2.0  # Bonus for cost-effective completion
 
-                # COMPLETION JACKPOT - dominates reward landscape
+                # COMPLETION JACKPOT - preserved without compression
                 reward += 20.0
             else:
                 if self.config.debug:
                     logger.warning(f"Completion reward: Ad {ad_id} not found")
 
-        # === 2. PROGRESS REWARDS (MUCH STRONGER shaping) ===
-        # Immediate feedback for influence gains - critical for credit assignment
+        # === 2. PROGRESS REWARDS (STRONGER shaping for credit assignment) ===
         for ad in self.ads:
             if ad.state == 0:  # Active ads only
                 delta = getattr(ad, '_step_delta', 0.0)
                 progress_ratio = delta / max(ad.demand, 1e-6)
-                reward += progress_ratio * 0.5  # Shaping only, not exploitable
+                reward += progress_ratio * 2.0  # 4x stronger than before
 
-        # === 3. FAILURE PENALTIES (SINGLE penalty, not double) ===
-        # Only penalize wasted resources, not unfulfilled demand separately
+        # === 3. ALLOCATION BONUS (encourage exploration) ===
+        # Breaking the "do nothing" local optimum by rewarding valid allocations
+        reward += self.allocations_this_step * 0.1
+
+        # === 4. FAILURE PENALTIES (minimal to encourage exploration) ===
         for ad_id in self.ads_failed_this_step:
             ad = next((a for a in self.ads if a.aid == ad_id), None)
             if ad:
-                # Single penalty: proportional to budget waste
                 waste_ratio = ad.total_cost_spent / max(ad.payment, 1e-6)
-                reward -= waste_ratio * 0.1  # Low penalty ensures positive EV for exploration
+                reward -= waste_ratio * 0.1  # Low penalty
 
-        # === 4. SOFT NORMALIZATION (wider range to preserve jackpot signal) ===
-        # Maps to approximately [-2, 2] but preserves +20 completion bonus
-        return 2.0 * np.tanh(reward / 10.0)
+        # === 5. NO TANH COMPRESSION (preserve jackpot signal) ===
+        # Clip to reasonable range but don't compress the completion bonus
+        return np.clip(reward, -10.0, 25.0)   
     
     def _apply_influence_for_current_minute(self):
         """
@@ -909,6 +960,7 @@ class OptimizedBillboardEnv(gym.Env):
                         total_cost = billboard.b_cost * duration
                         if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
                             billboard.assign(ad_to_assign.aid, duration)
+                            self.allocations_this_step += 1  # Track for reward shaping
 
                             self.placement_history.append({
                                 'spawn_step': ad_to_assign.spawn_step,
@@ -972,6 +1024,7 @@ class OptimizedBillboardEnv(gym.Env):
                                 total_cost = billboard.b_cost * duration
                                 if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
                                     billboard.assign(ad_to_assign.aid, duration)
+                                    self.allocations_this_step += 1  # Track for reward shaping
 
                                     # FIXED: Mark billboard as used for this step
                                     used_billboards.add(bb_idx)
@@ -985,7 +1038,7 @@ class OptimizedBillboardEnv(gym.Env):
                                         'demand': ad_to_assign.demand,
                                         'cost': total_cost  # Total cost (per-timestep cost × duration)
                                     })
-            
+
             elif self.action_mode == 'mh':
                 # Multi-Head mode
                 if isinstance(action, (list, np.ndarray)):
@@ -1013,6 +1066,7 @@ class OptimizedBillboardEnv(gym.Env):
                                 total_cost = billboard.b_cost * duration
                                 if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
                                     billboard.assign(ad_to_assign.aid, duration)
+                                    self.allocations_this_step += 1  # Track for reward shaping
 
                                     # FIXED: Mark billboard as used for this step
                                     used_billboards.add(bb_idx)
@@ -1026,7 +1080,7 @@ class OptimizedBillboardEnv(gym.Env):
                                         'demand': ad_to_assign.demand,
                                         'cost': total_cost  # Total cost (per-timestep cost × duration)
                                     })
-        
+
         except Exception as e:
             logger.error(f"Error executing action: {e}")
             if self.config.debug:
@@ -1069,6 +1123,7 @@ class OptimizedBillboardEnv(gym.Env):
         # CANONICAL REWARD: Clear event tracking
         self.ads_completed_this_step.clear()
         self.ads_failed_this_step.clear()
+        self.allocations_this_step = 0
 
         # ADVERTISER TRACKING: Shuffle deck - all advertisers become available again
         # This is the "new game" reset - the discard pile is cleared
@@ -1094,6 +1149,7 @@ class OptimizedBillboardEnv(gym.Env):
         # CANONICAL REWARD: Clear events from previous step
         self.ads_completed_this_step.clear()
         self.ads_failed_this_step.clear()
+        self.allocations_this_step = 0
 
         # 1. Apply influence for current minute
         self._apply_influence_for_current_minute()

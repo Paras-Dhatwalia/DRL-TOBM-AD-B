@@ -242,14 +242,8 @@ train_config = {
     "buffer_size": 30000        # 20000 → 30000: Larger replay buffer
 }
 
-# Global graph storage for environment factory
-GRAPH_NUMPY = None
-
-
 def get_env():
     """Create wrapped environment."""
-    global GRAPH_NUMPY
-
     env = OptimizedBillboardEnv(
         billboard_csv=env_config["billboard_csv"],
         advertiser_csv=env_config["advertiser_csv"],
@@ -261,19 +255,12 @@ def get_env():
             tardiness_cost=env_config["tardiness_cost"]
         )
     )
-    wrapped = NoGraphObsWrapper(env)
-
-    # Store graph globally for model initialization
-    if GRAPH_NUMPY is None:
-        GRAPH_NUMPY = wrapped.get_graph()
-
-    return wrapped
+    return NoGraphObsWrapper(env)
 
 
 # MAIN TRAINING
 
 def main():
-    global GRAPH_NUMPY
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -288,6 +275,9 @@ def main():
     # Verify observation space has no graph
     obs, _ = sample_env.reset()
     assert 'graph_edge_links' not in obs, "Graph should not be in observations!"
+
+    # Extract graph directly from sample environment (no global needed)
+    graph_numpy = sample_env.get_graph()
 
     action_space = sample_env.action_space
 
@@ -318,8 +308,8 @@ def main():
     shared_model = BillboardAllocatorGNN(**model_config)
 
     # Wrap with graph-aware wrappers - BOTH use the SAME underlying model
-    actor = GraphAwareActor(shared_model, GRAPH_NUMPY).to(device)
-    critic = GraphAwareCritic(shared_model, GRAPH_NUMPY).to(device)
+    actor = GraphAwareActor(shared_model, graph_numpy).to(device)
+    critic = GraphAwareCritic(shared_model, graph_numpy).to(device)
 
     # Optimizer - use shared_model.parameters() directly to avoid duplicates
     optimizer = torch.optim.Adam(
@@ -382,7 +372,7 @@ def main():
                 'optimizer_state_dict': optimizer.state_dict(),
                 'config': model_config,
                 'best_reward': best_reward,
-                'graph': GRAPH_NUMPY
+                'graph': graph_numpy
             }, train_config["save_path"])
 
     # Training
@@ -491,7 +481,7 @@ def main():
             'config': model_config,
             'training_config': train_config,
             'final_reward': best_reward,
-            'graph': GRAPH_NUMPY
+            'graph': graph_numpy
         }, train_config["save_path"].replace('.pt', '_final.pt'))
 
         return result
