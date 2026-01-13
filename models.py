@@ -550,10 +550,11 @@ class BillboardAllocatorGNN(nn.Module):
         
         if self.mode == 'na':
             # Node Action: Score individual billboards for a given ad
+            # INFERENCE-STABLE: Use LayerNorm instead of BatchNorm1d
             input_dim = self.billboard_embed_dim + hidden_dim
             self.actor_head = nn.Sequential(
                 Linear(input_dim, 2 * hidden_dim),
-                BatchNorm1d(2 * hidden_dim),
+                LayerNorm(2 * hidden_dim),  # Was BatchNorm1d - caused train/eval gap
                 ReLU(),
                 Dropout(dropout),
                 Linear(2 * hidden_dim, hidden_dim),
@@ -580,9 +581,12 @@ class BillboardAllocatorGNN(nn.Module):
             else:
                 pair_dim = self.billboard_embed_dim + hidden_dim + projected_edge_feat_dim
 
+            # INFERENCE-STABLE: Use LayerNorm instead of BatchNorm1d
+            # BatchNorm uses different statistics in train vs eval mode, causing
+            # the model to output zeros during evaluation (test_reward=0)
             self.pair_scorer = nn.Sequential(
                 Linear(pair_dim, hidden_dim),
-                BatchNorm1d(hidden_dim),
+                LayerNorm(hidden_dim),  # Was BatchNorm1d - caused train/eval gap
                 ReLU(),
                 Dropout(dropout),
                 Linear(hidden_dim, hidden_dim // 2),
@@ -612,21 +616,23 @@ class BillboardAllocatorGNN(nn.Module):
             )
             
             # Head 2: Billboard selection network (conditioned on chosen ad)
+            # INFERENCE-STABLE: Use LayerNorm instead of BatchNorm1d
             billboard_input_dim = self.billboard_embed_dim + hidden_dim
             self.billboard_head = nn.Sequential(
                 Linear(billboard_input_dim, 2 * hidden_dim),
-                BatchNorm1d(2 * hidden_dim),
+                LayerNorm(2 * hidden_dim),  # Was BatchNorm1d - caused train/eval gap
                 ReLU(),
                 Dropout(dropout),
                 Linear(2 * hidden_dim, hidden_dim),
                 ReLU(),
                 Linear(hidden_dim, 1)
             )
-            
+
         # Critic network (shared across all modes)
+        # INFERENCE-STABLE: Use LayerNorm instead of BatchNorm1d
         self.critic = nn.Sequential(
             Linear(self.billboard_embed_dim, 2 * hidden_dim),
-            BatchNorm1d(2 * hidden_dim),
+            LayerNorm(2 * hidden_dim),  # Was BatchNorm1d - caused train/eval gap
             ReLU(),
             Dropout(dropout),
             Linear(2 * hidden_dim, hidden_dim),
