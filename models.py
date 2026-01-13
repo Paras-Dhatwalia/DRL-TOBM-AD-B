@@ -236,84 +236,53 @@ def log_input_statistics(observations: Dict[str, torch.Tensor], mode: str) -> No
         if ad_coverage < 0.1 or bb_coverage < 0.1:
             logger.warning("Low availability in MH mode may cause sequential selection issues")
 
-def preprocess_observations(observations: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+def preprocess_observations(observations: Dict[str, torch.Tensor],
+                           device: Optional[torch.device] = None) -> Dict[str, torch.Tensor]:
     """
-    Preprocess and normalize observations for stable training.
+    Convert observations to tensors and move to device.
 
-    NUMERICAL STABILITY (Critical for preventing NaN propagation):
-    - When std ≈ 0, replace with 1.0 to avoid division creating extreme values
-    - Apply torch.nan_to_num after normalization to catch edge cases
-    - Clamp normalized values to [-10, 10] to prevent outliers
+    FIXED: No more batch-dependent normalization.
 
-    This preprocessing is critical for training stability because:
-    1. Raw features may have vastly different scales leading to gradient issues
-    2. Standardization helps attention mechanisms focus on relationships vs magnitudes
-    3. Proper normalization prevents exploding/vanishing gradients
-    4. Batch-wise normalization ensures consistency across different batch compositions
+    The "Inference Blindness" Bug (RESOLVED):
+    Previously, this function computed mean/std across the batch dimension, which caused
+    the model to receive "blank" inputs during inference (batch_size=1). The statistics
+    were computed over a single sample, making mean ≈ sample itself and std → 0.
+
+    The Fix:
+    1. Raw features are now pre-normalized in the environment using fixed scaling constants
+       (see Ad.get_feature_vector() and Billboard.get_feature_vector() in optimized_env.py)
+    2. Learnable LayerNorm is applied INSIDE the model after projection to latent space
+    3. This function is now just a simple tensor conversion + device placement
+
+    This ensures identical behavior for batch_size=1 (inference) and batch_size=64 (training).
 
     Args:
-        observations: Raw observations dictionary
+        observations: Raw observations dictionary (already normalized in environment)
+        device: Optional device to move tensors to
 
     Returns:
-        Dictionary with normalized observations
+        Dictionary with tensor observations on the specified device
     """
-    # Numerical stability threshold - if std < this, replace with 1.0
-    STD_THRESHOLD = 1e-6
-    # Value clamp range to prevent outliers after normalization
-    VALUE_CLAMP = 10.0
-
     processed = {}
 
-    # Convert ALL numpy arrays to tensors FIRST
     for key, value in observations.items():
         if isinstance(value, np.ndarray):
-            tensor = torch.from_numpy(value).float()
+            # Convert numpy to tensor with appropriate dtype
             if key == 'graph_edge_links':
-                tensor = tensor.long()
+                tensor = torch.from_numpy(value).long()
             elif key == 'mask':
-                tensor = tensor.bool()
+                tensor = torch.from_numpy(value).bool()
+            else:
+                tensor = torch.from_numpy(value).float()
             processed[key] = tensor
+        elif isinstance(value, torch.Tensor):
+            processed[key] = value
         else:
             processed[key] = value
 
-    # NOW normalize (everything is already tensors)
-    if 'graph_nodes' in processed:
-        nodes = processed['graph_nodes']
-        nodes_flat = nodes.reshape(-1, nodes.shape[-1])
-        mean = nodes_flat.mean(dim=0, keepdim=True)
-        std = nodes_flat.std(dim=0, keepdim=True)
-
-        # NUMERICAL STABILITY: Replace near-zero std with 1.0 (not just add epsilon)
-        # This prevents division from creating extreme values when all features are identical
-        std = torch.where(std < STD_THRESHOLD, torch.ones_like(std), std)
-
-        normalized = (nodes - mean.reshape(1, 1, -1)) / std.reshape(1, 1, -1)
-
-        # NUMERICAL STABILITY: Handle any NaN/Inf that might have slipped through
-        normalized = torch.nan_to_num(normalized, nan=0.0, posinf=VALUE_CLAMP, neginf=-VALUE_CLAMP)
-
-        # NUMERICAL STABILITY: Clamp to prevent extreme outliers
-        processed['graph_nodes'] = torch.clamp(normalized, -VALUE_CLAMP, VALUE_CLAMP)
-
-    # Normalize ad features
-    for ad_key in ['current_ad', 'ad_features']:
-        if ad_key in processed:
-            ads = processed[ad_key]
-            ads_flat = ads.reshape(-1, ads.shape[-1])
-            mean = ads_flat.mean(dim=0, keepdim=True)
-            std = ads_flat.std(dim=0, keepdim=True)
-
-            # NUMERICAL STABILITY: Replace near-zero std with 1.0
-            std = torch.where(std < STD_THRESHOLD, torch.ones_like(std), std)
-
-            if ad_key == 'current_ad':
-                normalized = (ads - mean.reshape(1, -1)) / std.reshape(1, -1)
-            else:
-                normalized = (ads - mean.reshape(1, 1, -1)) / std.reshape(1, 1, -1)
-
-            # NUMERICAL STABILITY: Handle NaN/Inf and clamp
-            normalized = torch.nan_to_num(normalized, nan=0.0, posinf=VALUE_CLAMP, neginf=-VALUE_CLAMP)
-            processed[ad_key] = torch.clamp(normalized, -VALUE_CLAMP, VALUE_CLAMP)
+        # Move to device if specified
+        if device is not None and isinstance(processed[key], torch.Tensor):
+            processed[key] = processed[key].to(device)
 
     return processed
 
@@ -526,19 +495,25 @@ class BillboardAllocatorGNN(nn.Module):
         
         # Shared graph encoder for billboard spatial relationships
         self.graph_encoder = GraphEncoder(
-            input_dim=node_feat_dim, 
-            hidden_dim=hidden_dim, 
-            n_layers=n_graph_layers, 
-            conv_type=conv_type, 
+            input_dim=node_feat_dim,
+            hidden_dim=hidden_dim,
+            n_layers=n_graph_layers,
+            conv_type=conv_type,
             dropout=dropout
         )
         self.billboard_embed_dim = self.graph_encoder.output_dim
-        
-        # Ad feature encoder - shared across all modes
+
+        # INFERENCE-STABLE NORMALIZATION: LayerNorm on latent embeddings (not raw features)
+        # This is applied AFTER graph encoding, ensuring sample-independent normalization
+        # that works identically for batch_size=1 (inference) and batch_size=64 (training)
+        self.billboard_norm = LayerNorm(self.billboard_embed_dim)
+
+        # Ad feature encoder with integrated normalization
+        # Projects raw features → latent space → LayerNorm (the "Pro" pattern)
         self.ad_encoder = nn.Sequential(
             Linear(ad_feat_dim, hidden_dim),
             ReLU(),
-            LayerNorm(hidden_dim),
+            LayerNorm(hidden_dim),  # LayerNorm AFTER projection to latent space
             Dropout(dropout),
             Linear(hidden_dim, hidden_dim)
         )
@@ -588,12 +563,22 @@ class BillboardAllocatorGNN(nn.Module):
             
         elif self.mode == 'ea':
             # Edge Action: Score ad-billboard pairs directly
-            # SEMANTIC FEATURES: +3 for edge features (budget_ratio, influence, is_free)
-            edge_feat_dim = 3
+            # SEMANTIC FEATURES: Edge features (budget_ratio, influence, is_free)
+
+            # SCALE BALANCE: Project 3d edge features to 16d to prevent scale drowning
+            # Raw edge features are 3-dim (0-1 range), while embeddings are 64d+
+            # Without projection, the 3 scalars become "noise" in the concatenation
+            raw_edge_feat_dim = 3
+            projected_edge_feat_dim = 16  # Large enough to carry gradient signal
+            self.edge_feat_proj = nn.Sequential(
+                Linear(raw_edge_feat_dim, projected_edge_feat_dim),
+                ReLU(),
+            )
+
             if self.use_attention:
-                pair_dim = hidden_dim + edge_feat_dim  # After attention projection + edge features
+                pair_dim = hidden_dim + projected_edge_feat_dim  # After attention projection + edge features
             else:
-                pair_dim = self.billboard_embed_dim + hidden_dim + edge_feat_dim
+                pair_dim = self.billboard_embed_dim + hidden_dim + projected_edge_feat_dim
 
             self.pair_scorer = nn.Sequential(
                 Linear(pair_dim, hidden_dim),
@@ -699,6 +684,10 @@ class BillboardAllocatorGNN(nn.Module):
 
         # Stack all samples
         billboard_embeds = torch.cat(billboard_embeds_list, dim=0)
+
+        # INFERENCE-STABLE: Apply LayerNorm to embeddings (not raw features)
+        # This is sample-independent normalization - works for batch_size=1
+        billboard_embeds = self.billboard_norm(billboard_embeds)
         
         # Get action mask
         mask = observations['mask'].bool()
@@ -800,9 +789,10 @@ class BillboardAllocatorGNN(nn.Module):
             # Simple concatenation fallback
             pair_features = torch.cat([ad_expanded, billboard_expanded], dim=-1)
 
-        # SEMANTIC FEATURES: Concatenate edge features to pair representation
-        # This gives the scorer explicit signals for matching quality
-        pair_features = torch.cat([pair_features, edge_features], dim=-1)
+        # SEMANTIC FEATURES: Project edge features to prevent scale drowning (3d → 16d)
+        # Then concatenate to pair representation for explicit matching quality signals
+        edge_features_proj = self.edge_feat_proj(edge_features)
+        pair_features = torch.cat([pair_features, edge_features_proj], dim=-1)
 
         # Score pairs
         pair_flat = pair_features.reshape(-1, pair_features.shape[-1])

@@ -180,22 +180,34 @@ class Ad:
         """Normalized payment ratio using sigmoid function."""
         return 1.0 / (1.0 + math.exp(-(self.payment_demand_ratio - 1.0)))
 
+    # FIXED SCALING CONSTANTS for inference-stable normalization
+    # These ensure all features are in [0, 1] regardless of batch size
+    # Values from Advertiser_100.csv: Demand=100-149, Payment=90k-161k, Ratio=902-1099
+    MAX_DEMAND = 200.0         # Demand range: 100-149, buffer to 200
+    MAX_PAYMENT = 200000.0     # Payment range: 90k-161k, buffer to 200k
+    MAX_RATIO = 1200.0         # Ratio range: 902-1099, buffer to 1200
+    MAX_BILLBOARDS = 25.0      # Max billboards per ad
+
     def get_feature_vector(self) -> np.ndarray:
-        """Get feature vector for this ad (12 features with budget tracking)."""
+        """Get feature vector for this ad (12 features, all normalized to [0, 1]).
+
+        INFERENCE-STABLE: Uses fixed scaling constants instead of batch statistics.
+        This ensures identical normalization for batch_size=1 (inference) and
+        batch_size=64 (training), fixing the "inference blindness" bug.
+        """
         return np.array([
-            self.demand,
-            self.payment,
-            self.payment_demand_ratio,
-            self.norm_payment_ratio(),
-            self.ttl / max(1, self.original_ttl),
-            self.cumulative_influence,
-            len(self.assigned_billboards),
-            1.0 if self.state == 0 else 0.0,
-            # NEW FEATURES for better budget management:
-            self.remaining_budget / max(self.payment, 1e-6),  # Budget remaining [0,1]
-            self.total_cost_spent / max(self.payment, 1e-6),  # Budget used [0,1]
-            (self.demand - self.cumulative_influence) / max(self.demand, 1e-6),  # Unfulfilled [0,1]
-            self.spawn_step / 1000.0 if self.spawn_step is not None else 0.0,  # Temporal context [0,1]
+            min(self.demand / self.MAX_DEMAND, 1.0),              # [0, 1]
+            min(self.payment / self.MAX_PAYMENT, 1.0),            # [0, 1]
+            min(self.payment_demand_ratio / self.MAX_RATIO, 1.0), # [0, 1]
+            self.norm_payment_ratio(),                             # Already sigmoid → [0, 1]
+            self.ttl / max(1, self.original_ttl),                  # [0, 1]
+            min(self.cumulative_influence / max(self.demand, 1e-6), 1.0),  # [0, 1]
+            min(len(self.assigned_billboards) / self.MAX_BILLBOARDS, 1.0), # [0, 1]
+            1.0 if self.state == 0 else 0.0,                       # Boolean [0, 1]
+            self.remaining_budget / max(self.payment, 1e-6),       # [0, 1]
+            self.total_cost_spent / max(self.payment, 1e-6),       # [0, 1]
+            (self.demand - self.cumulative_influence) / max(self.demand, 1e-6),  # [0, 1]
+            min((self.spawn_step or 0) / 1000.0, 1.0),             # [0, 1]
         ], dtype=np.float32)
 
 
@@ -234,19 +246,33 @@ class Billboard:
         self.occupied_until = 0
         return ad_id
 
+    # FIXED SCALING CONSTANTS for inference-stable normalization
+    # These ensure all features are in [0, 1] regardless of batch size
+    # Values from BB_NYC.csv: B_Size=80-670, B_Cost=0.25-104.5, Influence=0.4-149.8
+    MAX_COST = 150.0         # Cost range: 0.25-104.5, buffer to 150
+    MAX_SIZE = 800.0         # Size range: 80-670, buffer to 800
+    MAX_INFLUENCE = 200.0    # Influence range: 0.4-149.8, buffer to 200
+    MAX_DURATION = 10.0      # Max occupation duration
+    MAX_USAGE = 100.0        # Max total usage count
+
     def get_feature_vector(self) -> np.ndarray:
-        """Get feature vector for this billboard."""
+        """Get feature vector for this billboard (10 features, all normalized to [0, 1]).
+
+        INFERENCE-STABLE: Uses fixed scaling constants instead of batch statistics.
+        This ensures identical normalization for batch_size=1 (inference) and
+        batch_size=64 (training), fixing the "inference blindness" bug.
+        """
         return np.array([
             1.0,  # node type (billboard)
-            0.0 if self.is_free() else 1.0,  # is_occupied
-            self.b_cost,
-            self.b_size,
-            self.influence,
-            self.p_size,
-            self.occupied_until,
-            self.total_usage,
-            (self.latitude + 90.0) / 180.0,  # normalized latitude [-90,90] -> [0,1]
-            (self.longitude + 180.0) / 360.0,  # normalized longitude [-180,180] -> [0,1]
+            0.0 if self.is_free() else 1.0,  # is_occupied [0, 1]
+            min(self.b_cost / self.MAX_COST, 1.0),      # [0, 1]
+            min(self.b_size / self.MAX_SIZE, 1.0),      # [0, 1]
+            min(self.influence / self.MAX_INFLUENCE, 1.0),  # [0, 1] - was raw value!
+            self.p_size,                                 # Already normalized [0, 1]
+            min(self.occupied_until / self.MAX_DURATION, 1.0),  # [0, 1]
+            min(self.total_usage / self.MAX_USAGE, 1.0),        # [0, 1]
+            (self.latitude + 90.0) / 180.0,              # [0, 1]
+            (self.longitude + 180.0) / 360.0,            # [0, 1]
         ], dtype=np.float32)
 
 
@@ -629,8 +655,11 @@ class OptimizedBillboardEnv(gym.Env):
         max_duration = self.config.slot_duration_range[1]
         billboard_costs = np.array([b.b_cost * max_duration for b in self.billboards],
                                    dtype=np.float32)
-        billboard_influence = np.array([b.influence for b in self.billboards],
-                                       dtype=np.float32)
+        # NORMALIZED: Use Billboard.MAX_INFLUENCE to scale influence to [0, 1]
+        billboard_influence = np.array(
+            [min(b.influence / Billboard.MAX_INFLUENCE, 1.0) for b in self.billboards],
+            dtype=np.float32
+        )
         billboard_free = np.array([1.0 if b.is_free() else 0.0 for b in self.billboards],
                                   dtype=np.float32)
 
