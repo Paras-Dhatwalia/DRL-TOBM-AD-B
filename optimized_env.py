@@ -23,9 +23,9 @@ class EnvConfig:
     """Environment configuration parameters"""
     influence_radius_meters: float = 100.0
     slot_duration_range: Tuple[int, int] = (1, 5)
-    new_ads_per_step_range: Tuple[int, int] = (0, 2)
+    new_ads_per_step_range: Tuple[int, int] = (0, 3)  # Increased from (0,2) for more ad flow
     tardiness_cost: float = 50.0
-    max_events: int = 1000
+    max_events: int = 1440  # Full day (1 minute per step, 1440 minutes = 24 hours)
     max_active_ads: int = 20
     ad_ttl: int = 600  # Ad time-to-live in timesteps (default: 600 = 10 hours)
     graph_connection_distance: float = 5000.0
@@ -423,7 +423,84 @@ class OptimizedBillboardEnv(gym.Env):
         self.billboard_size_ratios = np.array([
             b.b_size / self.max_billboard_size for b in self.billboards
         ], dtype=np.float32)
-    
+
+    def _precompute_slot_influence(self, start_step: int) -> np.ndarray:
+        """Compute expected influence for each billboard slot starting at current step.
+
+        For each billboard and each possible duration (1-5), compute how many
+        users will pass within influence_radius during that slot.
+
+        This uses pre-loaded trajectory data to predict future influence,
+        similar to how real advertising companies use historical traffic data.
+
+        Returns:
+            slot_influence: (n_billboards, max_duration) array
+            slot_influence[b, d] = expected users within influence_radius of billboard b
+                                   over next d+1 steps (cumulative)
+        """
+        max_duration = self.config.slot_duration_range[1]  # 5
+        slot_influence = np.zeros((self.n_nodes, max_duration), dtype=np.float32)
+
+        for d in range(max_duration):
+            future_step = start_step + d + 1
+            minute_key = (self.start_time_min + future_step) % 1440
+            user_locs = self.trajectory_map.get(minute_key, np.array([]))
+
+            if len(user_locs) == 0:
+                # No users at this minute - carry forward previous cumulative value
+                if d > 0:
+                    slot_influence[:, d] = slot_influence[:, d-1]
+                continue
+
+            # Vectorized distance: (n_users, n_billboards)
+            distances = haversine_distance_vectorized(
+                user_locs[:, 0:1], user_locs[:, 1:2],
+                self.billboard_coords[:, 0:1].T, self.billboard_coords[:, 1:2].T
+            )
+
+            # Count users within influence radius for each billboard
+            within_radius = distances <= self.config.influence_radius_meters
+            users_per_billboard = within_radius.sum(axis=0).astype(np.float32)  # (n_billboards,)
+
+            # Cumulative: slot_influence[b, d] = total users over steps 1..d+1
+            if d == 0:
+                slot_influence[:, d] = users_per_billboard
+            else:
+                slot_influence[:, d] = slot_influence[:, d-1] + users_per_billboard
+
+        return slot_influence
+
+    def get_expected_slot_influence(self) -> np.ndarray:
+        """Get expected influence for average slot duration (3 steps).
+
+        Returns:
+            expected_influence: (n_billboards,) array normalized to [0, 1]
+        """
+        slot_influence = self._precompute_slot_influence(self.current_step)
+
+        # Use average duration (3 steps) as representative
+        avg_duration_idx = 2  # 0-indexed, so 3rd column (duration=3)
+        raw_influence = slot_influence[:, avg_duration_idx]
+
+        # Normalize: typical range is 0-50 users, cap at 100
+        MAX_USERS = 100.0
+        normalized = np.clip(raw_influence / MAX_USERS, 0.0, 1.0)
+
+        return normalized.astype(np.float32)
+
+    def _get_allocation_expected_influence(self, bb_idx: int, duration: int) -> float:
+        """Get expected influence for a specific allocation.
+
+        Args:
+            bb_idx: Billboard index
+            duration: Slot duration (1-5)
+
+        Returns:
+            Expected number of users that will see this billboard over the slot duration
+        """
+        slot_influence = self._precompute_slot_influence(self.current_step)
+        return float(slot_influence[bb_idx, duration - 1])  # duration is 1-indexed
+
     def _create_billboard_graph(self) -> np.ndarray:
         """Create adjacency matrix for billboards using vectorized distance calculation."""
         n = len(self.billboards)
@@ -655,11 +732,10 @@ class OptimizedBillboardEnv(gym.Env):
         max_duration = self.config.slot_duration_range[1]
         billboard_costs = np.array([b.b_cost * max_duration for b in self.billboards],
                                    dtype=np.float32)
-        # NORMALIZED: Use Billboard.MAX_INFLUENCE to scale influence to [0, 1]
-        billboard_influence = np.array(
-            [min(b.influence / Billboard.MAX_INFLUENCE, 1.0) for b in self.billboards],
-            dtype=np.float32
-        )
+        # DYNAMIC: Expected influence based on trajectory data for current time
+        # This replaces static billboard.influence with time-varying expected users
+        # Real-world analogy: Advertising companies use historical traffic data
+        billboard_influence = self.get_expected_slot_influence()  # Already [0, 1]
         billboard_free = np.array([1.0 if b.is_free() else 0.0 for b in self.billboards],
                                   dtype=np.float32)
 
@@ -722,18 +798,18 @@ class OptimizedBillboardEnv(gym.Env):
 
     def _compute_reward(self) -> float:
         """
-        SEMANTIC LEARNING REWARD FUNCTION (v2.0)
+        SEMANTIC LEARNING REWARD FUNCTION (v3.0) - Expected Influence Edition
 
         Design principles:
-        1. Allocation bonus: Encourage exploration by rewarding valid allocations
+        1. Expected influence bonus: Reward based on PREDICTED allocation value
         2. Strong progress signal: High coefficient for credit assignment
-        3. Completion jackpot: Preserved without aggressive compression
+        3. High completion jackpot: Dominates any spam strategy
         4. Minimal failure penalty: Don't discourage exploration
 
-        Key changes from v1:
-        - Added allocation bonus (+0.1 per valid allocation)
-        - Progress coefficient: 0.5 → 2.0 (4x stronger)
-        - Removed tanh compression: Use clip to preserve jackpot signal
+        Key changes from v2:
+        - Replaced unconditional allocation bonus with expected influence bonus
+        - Completion jackpot: 20.0 → 100.0 (dominates spam)
+        - Reward clip: 25.0 → 150.0 (let big wins show)
         """
 
         reward = 0.0
@@ -750,8 +826,9 @@ class OptimizedBillboardEnv(gym.Env):
                 efficiency = profit / max(ad.payment, 1e-6)
                 reward += efficiency * 2.0  # Bonus for cost-effective completion
 
-                # COMPLETION JACKPOT - preserved without compression
-                reward += 20.0
+                # COMPLETION JACKPOT - high enough to dominate spam strategy
+                # With gamma=0.995, 30-step delay → 0.86 discount → 86 effective value
+                reward += 100.0
             else:
                 if self.config.debug:
                     logger.warning(f"Completion reward: Ad {ad_id} not found")
@@ -763,9 +840,11 @@ class OptimizedBillboardEnv(gym.Env):
                 progress_ratio = delta / max(ad.demand, 1e-6)
                 reward += progress_ratio * 2.0  # 4x stronger than before
 
-        # === 3. ALLOCATION BONUS (encourage exploration) ===
-        # Breaking the "do nothing" local optimum by rewarding valid allocations
-        reward += self.allocations_this_step * 0.1
+        # === 3. EXPECTED INFLUENCE BONUS (replaces unconditional allocation bonus) ===
+        # Reward proportional to EXPECTED influence from allocations made this step
+        # This ties reward directly to billboard quality and traffic patterns
+        # Scale: 10 expected users = +0.1 bonus, cap at 1.0
+        reward += min(self.expected_influence_this_step * 0.01, 1.0)
 
         # === 4. FAILURE PENALTIES (minimal to encourage exploration) ===
         for ad_id in self.ads_failed_this_step:
@@ -774,9 +853,9 @@ class OptimizedBillboardEnv(gym.Env):
                 waste_ratio = ad.total_cost_spent / max(ad.payment, 1e-6)
                 reward -= waste_ratio * 0.1  # Low penalty
 
-        # === 5. NO TANH COMPRESSION (preserve jackpot signal) ===
-        # Clip to reasonable range but don't compress the completion bonus
-        return np.clip(reward, -10.0, 25.0)   
+        # === 5. WIDER CLIP (preserve completion jackpot signal) ===
+        # Completion can now give 100+ reward, don't clip it away
+        return np.clip(reward, -10.0, 150.0)   
     
     def _apply_influence_for_current_minute(self):
         """
@@ -915,7 +994,12 @@ class OptimizedBillboardEnv(gym.Env):
                                     break
     
     def _spawn_ads(self):
-        """Spawn new ads based on configuration.
+        """Spawn new ads based on configuration with HYSTERESIS.
+
+        Hysteresis logic:
+        - Only spawn new ads when active count drops below LOW_THRESHOLD (15)
+        - Then spawn until reaching HIGH_THRESHOLD (max_active_ads = 20)
+        - This ensures continuous ad flow without blocking when at capacity
 
         Uses "deck of cards" logic:
         - Each advertiser can only be used ONCE per episode
@@ -926,7 +1010,15 @@ class OptimizedBillboardEnv(gym.Env):
         # Remove completed/tardy ads
         self.ads = [ad for ad in self.ads if ad.state == 0]
 
-        # Spawn new ads
+        # HYSTERESIS: Only spawn when below low threshold
+        LOW_THRESHOLD = 15
+        HIGH_THRESHOLD = self.config.max_active_ads  # 20
+
+        active_count = len(self.ads)
+        if active_count >= LOW_THRESHOLD:
+            return  # Wait until ads complete/expire
+
+        # Spawn new ads (up to HIGH_THRESHOLD)
         n_spawn = random.randint(*self.config.new_ads_per_step_range)
 
         # Get currently active advertiser IDs
@@ -945,7 +1037,7 @@ class OptimizedBillboardEnv(gym.Env):
             return  # Cannot spawn new ads - deck is empty
 
         spawn_count = min(
-            self.config.max_active_ads - len(self.ads),
+            HIGH_THRESHOLD - len(self.ads),  # Up to HIGH_THRESHOLD
             n_spawn,
             len(available_templates)
         )
@@ -990,6 +1082,8 @@ class OptimizedBillboardEnv(gym.Env):
                         if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
                             billboard.assign(ad_to_assign.aid, duration)
                             self.allocations_this_step += 1  # Track for reward shaping
+                            # Track expected influence for immediate reward
+                            self.expected_influence_this_step += self._get_allocation_expected_influence(bb_idx, duration)
 
                             self.placement_history.append({
                                 'spawn_step': ad_to_assign.spawn_step,
@@ -1054,6 +1148,8 @@ class OptimizedBillboardEnv(gym.Env):
                                 if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
                                     billboard.assign(ad_to_assign.aid, duration)
                                     self.allocations_this_step += 1  # Track for reward shaping
+                                    # Track expected influence for immediate reward
+                                    self.expected_influence_this_step += self._get_allocation_expected_influence(bb_idx, duration)
 
                                     # FIXED: Mark billboard as used for this step
                                     used_billboards.add(bb_idx)
@@ -1096,6 +1192,8 @@ class OptimizedBillboardEnv(gym.Env):
                                 if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
                                     billboard.assign(ad_to_assign.aid, duration)
                                     self.allocations_this_step += 1  # Track for reward shaping
+                                    # Track expected influence for immediate reward
+                                    self.expected_influence_this_step += self._get_allocation_expected_influence(bb_idx, duration)
 
                                     # FIXED: Mark billboard as used for this step
                                     used_billboards.add(bb_idx)
@@ -1153,6 +1251,7 @@ class OptimizedBillboardEnv(gym.Env):
         self.ads_completed_this_step.clear()
         self.ads_failed_this_step.clear()
         self.allocations_this_step = 0
+        self.expected_influence_this_step = 0.0  # Track expected influence from allocations
 
         # ADVERTISER TRACKING: Shuffle deck - all advertisers become available again
         # This is the "new game" reset - the discard pile is cleared
@@ -1179,6 +1278,7 @@ class OptimizedBillboardEnv(gym.Env):
         self.ads_completed_this_step.clear()
         self.ads_failed_this_step.clear()
         self.allocations_this_step = 0
+        self.expected_influence_this_step = 0.0  # Track expected influence from allocations
 
         # 1. Apply influence for current minute
         self._apply_influence_for_current_minute()

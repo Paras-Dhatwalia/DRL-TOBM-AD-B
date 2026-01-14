@@ -59,7 +59,7 @@ env_config = {
     "advertiser_csv": r"path/to/folder",  
     "trajectory_csv": r"path/to/folder", 
     "action_mode": "mh",
-    "max_events": 1000,
+    "max_events": 1440,
     "influence_radius": 500.0,
     "tardiness_cost": 50.0
 }

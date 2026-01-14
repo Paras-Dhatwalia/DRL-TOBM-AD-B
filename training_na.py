@@ -215,7 +215,7 @@ env_config = {
     "advertiser_csv": r"path/to/folder",
     "trajectory_csv": r"path/to/folder",
     "action_mode": "na",
-    "max_events": 1000,
+    "max_events": 1440,
     "influence_radius": 100.0,
     "tardiness_cost": 50.0
 }
@@ -226,7 +226,7 @@ train_config = {
     "n_graph_layers": 4,        # 3 → 4: Deeper spatial reasoning
     "lr": 3e-4,                 # KEEP: Works well
     "lr_decay": 0.97,           # NEW: Slower LR decay (was 0.95)
-    "discount_factor": 0.99,    # KEEP
+    "discount_factor": 0.995,   # 0.99 → 0.995: Better credit assignment for longer episodes
     "gae_lambda": 0.95,         # KEEP
     "vf_coef": 0.5,             # KEEP
     "ent_coef": 0.015,          # 0.01 → 0.015: More exploration
@@ -234,8 +234,8 @@ train_config = {
     "eps_clip": 0.2,            # KEEP
     "batch_size": 96,           # 64 → 96: Better gradient estimates
     "max_epoch": 60,            # 20 → 60: 3x longer training (600K samples)
-    "step_per_collect": 4096,   # Full episode capture (4 envs x 1000 steps)
-    "step_per_epoch": 10000,    # KEEP
+    "step_per_collect": 5760,   # 4 episodes x 1440 steps (full day per episode)
+    "step_per_epoch": 14400,    # 10 episodes worth per epoch
     "repeat_per_collect": 6,    # 4 → 6: More gradient updates per collection
     "save_path": "models/ppo_billboard_na.pt",
     "log_path": "logs/ppo_billboard_na",

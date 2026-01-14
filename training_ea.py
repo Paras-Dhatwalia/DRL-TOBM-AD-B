@@ -149,7 +149,7 @@ def get_full_config():
             "advertiser_csv": r"path\to\folder",
             "trajectory_csv": r"path\to\folder",
             "action_mode": "ea",
-            "max_events": 1000,
+            "max_events": 1440,
             "max_active_ads": 20,  # Full action space
             "influence_radius": 100.0,
             "tardiness_cost": 50.0,
@@ -159,7 +159,7 @@ def get_full_config():
             "hidden_dim": 128,  # Reduced from 256 for memory efficiency
             "n_graph_layers": 3,  # Reduced from 4
             "lr": 1e-4,  # EA: lower LR for stability
-            "discount_factor": 0.99,
+            "discount_factor": 0.995,  # 0.99 → 0.995: Better credit for longer episodes
             "gae_lambda": 0.95,
             "vf_coef": 0.5,
             "ent_coef": 0.0001,  # EA: very low for 8880-dim action space (was 0.005)
@@ -168,8 +168,8 @@ def get_full_config():
             "batch_size": 64,  # Reduced from 128 for EA mode
             "nr_envs": 4,  # Reduced from 8 for memory
             "max_epoch": 100,
-            "step_per_collect": 4096,  # Full episodes (4 envs x 1000 steps)
-            "step_per_epoch": 20000,
+            "step_per_collect": 5760,  # 4 episodes x 1440 steps (full day)
+            "step_per_epoch": 14400,  # 10 episodes worth per epoch
             "repeat_per_collect": 15,
             "save_path": "models/ppo_billboard_ea.pt",
             "log_path": "logs/ppo_billboard_ea",
@@ -328,7 +328,7 @@ def main(use_test_config: bool = True):
         'ad_feat_dim': 12,  # Updated from 8: added 4 budget features
         'hidden_dim': train_config['hidden_dim'],
         'n_graph_layers': train_config['n_graph_layers'],
-        'mode': 'ea',  # CRITICAL: Edge Action mode
+        'mode': 'ea', 
         'n_billboards': n_billboards,
         'max_ads': max_ads,
         'use_attention': False,  # Disabled for EA - attention causes OOM with large action space
