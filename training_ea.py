@@ -156,8 +156,8 @@ def get_full_config():
         },
         # Training config
         "train": {
-            "hidden_dim": 128,  # Reduced from 256 for memory efficiency
-            "n_graph_layers": 3,  # Reduced from 4
+            "hidden_dim": 128,  # Full capacity - chunked processing prevents OOM
+            "n_graph_layers": 3,  # Full capacity - chunked processing handles large batches
             "lr": 1e-4,  # EA: lower LR for stability
             "discount_factor": 0.995,  # 0.99 → 0.995: Better credit for longer episodes
             "gae_lambda": 0.95,

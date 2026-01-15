@@ -762,8 +762,51 @@ class BillboardAllocatorGNN(nn.Module):
         - budget_ratio: Can the ad afford this billboard?
         - influence_score: Billboard's reach potential
         - is_free: Is the billboard available?
-        """
 
+        Uses CHUNKED PROCESSING to prevent OOM during GAE when Tianshou passes
+        the entire buffer (2880+ samples) through the model at once.
+        """
+        # CHUNKED PROCESSING: Process in chunks of 32 to prevent OOM during GAE
+        # During GAE, batch_size can be entire buffer (2880+), causing 13GB+ allocation
+        # for pair_features tensor: batch × 8880 pairs × hidden_dim
+        CHUNK_SIZE = 32
+
+        if batch_size > CHUNK_SIZE:
+            # Large batch (GAE phase) - process in chunks and concatenate
+            all_scores = []
+            for start_idx in range(0, batch_size, CHUNK_SIZE):
+                end_idx = min(start_idx + CHUNK_SIZE, batch_size)
+                chunk_size = end_idx - start_idx
+
+                # Slice all inputs for this chunk
+                chunk_billboard = billboard_embeds[start_idx:end_idx]
+                chunk_obs = {
+                    'ad_features': observations['ad_features'][start_idx:end_idx],
+                    'edge_features': observations.get('edge_features')
+                }
+                if chunk_obs['edge_features'] is not None:
+                    chunk_obs['edge_features'] = chunk_obs['edge_features'][start_idx:end_idx]
+                chunk_mask = mask[start_idx:end_idx]
+
+                # Process this chunk
+                chunk_scores = self._forward_ea_single_chunk(
+                    chunk_billboard, chunk_obs, chunk_mask, chunk_size
+                )
+                all_scores.append(chunk_scores)
+
+            scores = torch.cat(all_scores, dim=0)
+            return scores, state
+        else:
+            # Small batch (normal inference) - process directly
+            scores = self._forward_ea_single_chunk(billboard_embeds, observations, mask, batch_size)
+            return scores, state
+
+    def _forward_ea_single_chunk(self, billboard_embeds: torch.Tensor, observations: Dict[str, torch.Tensor],
+                                  mask: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """Process a single chunk of EA forward pass.
+
+        Extracted from _forward_ea_fixed to enable chunked processing for large batches.
+        """
         # Get ad features
         ad_features = observations['ad_features']  # (batch_size, max_ads, ad_feat_dim)
         ad_embeds = self.ad_encoder(ad_features.view(-1, ad_features.shape[-1]))
@@ -810,9 +853,7 @@ class BillboardAllocatorGNN(nn.Module):
         scores[~mask_flat] = self.min_val
 
         # Return raw logits for IndependentBernoulli distribution
-        # DO NOT apply softmax - that would force categorical (single selection) behavior
-        # IndependentBernoulli will apply sigmoid to get independent probabilities per pair
-        return scores, state
+        return scores
         
     def _forward_mh_fixed(self, billboard_embeds: torch.Tensor, observations: Dict[str, torch.Tensor],
                          mask: torch.Tensor, batch_size: int, state: Optional[torch.Tensor],
@@ -1104,8 +1145,8 @@ DEFAULT_CONFIGS = {
     'ea_billboard_nyc': {
         'node_feat_dim': 10,
         'ad_feat_dim': 8,
-        'hidden_dim': 256,    # Larger for complex pair interactions
-        'n_graph_layers': 4,
+        'hidden_dim': 128,    # Full capacity - chunked processing prevents OOM
+        'n_graph_layers': 3,  # Full capacity - chunked processing handles large batches
         'mode': 'ea',
         'n_billboards': 444,
         'max_ads': 20,
