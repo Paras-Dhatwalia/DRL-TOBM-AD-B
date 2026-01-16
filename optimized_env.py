@@ -435,8 +435,7 @@ class OptimizedBillboardEnv(gym.Env):
 
         Returns:
             slot_influence: (n_billboards, max_duration) array
-            slot_influence[b, d] = expected users within influence_radius of billboard b
-                                   over next d+1 steps (cumulative)
+            slot_influence[b, d] = expected users within influence_radius of billboard over the next timesteps
         """
         max_duration = self.config.slot_duration_range[1]  # 5
         slot_influence = np.zeros((self.n_nodes, max_duration), dtype=np.float32)
@@ -755,10 +754,18 @@ class OptimizedBillboardEnv(gym.Env):
 
     def _get_obs(self) -> Dict[str, Any]:
         """Get current observation."""
+        # Get DYNAMIC influence based on current traffic (trajectory data)
+        # This replaces static CSV influence with time-varying expected users
+        dynamic_influence = self.get_expected_slot_influence()  # Shape: (n_billboards,)
+
         # Node features (billboards)
         nodes = np.zeros((self.n_nodes, self.n_node_features), dtype=np.float32)
         for i, b in enumerate(self.billboards):
-            nodes[i] = b.get_feature_vector()
+            feat = b.get_feature_vector()
+            # CRITICAL FIX: Overwrite static influence (index 4) with dynamic influence
+            # This gives the agent "vision" of current traffic patterns
+            feat[4] = dynamic_influence[i]
+            nodes[i] = feat
         
         obs = {
             'graph_nodes': nodes,
@@ -840,11 +847,16 @@ class OptimizedBillboardEnv(gym.Env):
                 progress_ratio = delta / max(ad.demand, 1e-6)
                 reward += progress_ratio * 2.0  # 4x stronger than before
 
-        # === 3. EXPECTED INFLUENCE BONUS (replaces unconditional allocation bonus) ===
-        # Reward proportional to EXPECTED influence from allocations made this step
-        # This ties reward directly to billboard quality and traffic patterns
-        # Scale: 10 expected users = +0.1 bonus, cap at 1.0
-        reward += min(self.expected_influence_this_step * 0.01, 1.0)
+        # === 3. EXPECTED INFLUENCE BONUS/PENALTY (accuracy-based) ===
+        # Reward for HIT (picking billboards with traffic), penalty for MISS (empty billboards)
+        # This teaches the agent to find the few billboards with actual traffic
+        if self.allocations_this_step > 0:
+            if self.expected_influence_this_step > 0.1:  # HIT: Billboard has traffic
+                # Bonus: +0.05 per expected user, cap at 2.0
+                reward += min(self.expected_influence_this_step * 0.05, 2.0)
+            else:  # MISS: Billboard is empty - waste of money
+                # Penalty: Discourage picking empty billboards
+                reward -= 0.5
 
         # === 4. FAILURE PENALTIES (minimal to encourage exploration) ===
         for ad_id in self.ads_failed_this_step:
