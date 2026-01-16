@@ -1201,7 +1201,13 @@ class OptimizedBillboardEnv(gym.Env):
                     # CRITICAL FIX: Track used billboards to prevent multi-assign in same step
                     used_billboards = set()
 
+                    # PERFORMANCE FIX: Cap allocations per step (same as EA mode)
+                    MAX_ALLOCATIONS_PER_STEP = 50
+
                     for ad_idx in range(min(len(active_ads), self.config.max_active_ads)):
+                        # Check cap at outer loop level
+                        if self.allocations_this_step >= MAX_ALLOCATIONS_PER_STEP:
+                            break
                         for bb_idx in range(self.n_nodes):
                             if (action[ad_idx, bb_idx] == 1 and
                                 self.billboards[bb_idx].is_free() and
