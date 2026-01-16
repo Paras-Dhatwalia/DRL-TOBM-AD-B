@@ -468,7 +468,7 @@ def main(use_test_config: bool = True):
         max_grad_norm=train_config["max_grad_norm"],
         eps_clip=train_config["eps_clip"],
         value_clip=True,
-        deterministic_eval=True,  # Use deterministic actions during evaluation
+        deterministic_eval=False,  # EA MODE: Must use stochastic eval (logits < 0 → mode() = 0)
         action_scaling=False,  # CRITICAL: Must be False for MultiBinary action space
         lr_scheduler=lr_scheduler
     )
@@ -479,17 +479,11 @@ def main(use_test_config: bool = True):
     logger.info(f"  - Learning rate: {train_config['lr']}")
     logger.info(f"  - Batch size: {train_config['batch_size']}")
 
-    # === DIAGNOSTIC: Force stochastic testing ===
-    # Problem: deterministic_eval=True causes all-zero outputs when logits < 0
-    # This overrides dist_fn to use stochastic sampling even during eval
-    # Expected: test_reward should match training_reward (~258)
-    # Remove this block after confirming environment rewards work correctly
-    def force_stochastic_dist_fn(logits):
-        return IndependentBernoulli(logits=logits, mask=None)
-
-    policy.dist_fn = force_stochastic_dist_fn
-    logger.info("DIAGNOSTIC: Stochastic testing enabled (overrides deterministic_eval)")
-    # ============================================
+    # NOTE: deterministic_eval=False is required for EA mode because:
+    # - Logits are typically negative (-3.0) during early training
+    # - sigmoid(-3.0) = 0.047 < 0.5
+    # - Deterministic mode() returns 0 for all actions → test_reward = 0
+    # - Stochastic sampling allows exploration and proper evaluation
 
     # Create collectors
     # Note: preprocess_fn is deprecated in newer Tianshou versions

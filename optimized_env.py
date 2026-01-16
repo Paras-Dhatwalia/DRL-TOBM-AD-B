@@ -1145,7 +1145,16 @@ class OptimizedBillboardEnv(gym.Env):
                     # CRITICAL FIX: Track used billboards to prevent multi-assign in same step
                     used_billboards = set()
 
+                    # PERFORMANCE FIX: Cap allocations per step to prevent explosion
+                    # With stochastic sampling, ~417 pairs selected per step (4.7% of 8880)
+                    # Processing all of them is too slow - cap at reasonable limit
+                    MAX_ALLOCATIONS_PER_STEP = 50  # Reasonable limit for 20 ads
+
                     for pair_idx, chosen in enumerate(action):
+                        # PERFORMANCE FIX: Stop if cap reached
+                        if self.allocations_this_step >= MAX_ALLOCATIONS_PER_STEP:
+                            break
+
                         if chosen == 1:
                             ad_idx = pair_idx // self.n_nodes
                             bb_idx = pair_idx % self.n_nodes
