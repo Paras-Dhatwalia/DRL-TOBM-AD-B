@@ -158,11 +158,11 @@ def get_full_config():
         "train": {
             "hidden_dim": 128,  # Full capacity - chunked processing prevents OOM
             "n_graph_layers": 3,  # Full capacity - chunked processing handles large batches
-            "lr": 1e-4,  # EA: lower LR for stability
+            "lr": 3e-4,  # EA: 3x higher to capture sparse rewards (was 1e-4)
             "discount_factor": 0.995,  # 0.99 → 0.995: Better credit for longer episodes
             "gae_lambda": 0.95,
             "vf_coef": 0.5,
-            "ent_coef": 0.0001,  # EA: very low for 8880-dim action space (was 0.005)
+            "ent_coef": 0.01,  # EA: 100x higher to force exploration (was 0.0001)
             "max_grad_norm": 0.5,
             "eps_clip": 0.2,
             "batch_size": 64,  # Reduced from 128 for EA mode
@@ -478,6 +478,18 @@ def main(use_test_config: bool = True):
     logger.info(f"  - Entropy coefficient: {train_config['ent_coef']}")
     logger.info(f"  - Learning rate: {train_config['lr']}")
     logger.info(f"  - Batch size: {train_config['batch_size']}")
+
+    # === DIAGNOSTIC: Force stochastic testing ===
+    # Problem: deterministic_eval=True causes all-zero outputs when logits < 0
+    # This overrides dist_fn to use stochastic sampling even during eval
+    # Expected: test_reward should match training_reward (~258)
+    # Remove this block after confirming environment rewards work correctly
+    def force_stochastic_dist_fn(logits):
+        return IndependentBernoulli(logits=logits, mask=None)
+
+    policy.dist_fn = force_stochastic_dist_fn
+    logger.info("DIAGNOSTIC: Stochastic testing enabled (overrides deterministic_eval)")
+    # ============================================
 
     # Create collectors
     # Note: preprocess_fn is deprecated in newer Tianshou versions

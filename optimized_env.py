@@ -847,16 +847,19 @@ class OptimizedBillboardEnv(gym.Env):
                 progress_ratio = delta / max(ad.demand, 1e-6)
                 reward += progress_ratio * 2.0  # 4x stronger than before
 
-        # === 3. EXPECTED INFLUENCE BONUS/PENALTY (accuracy-based) ===
-        # Reward for HIT (picking billboards with traffic), penalty for MISS (empty billboards)
-        # This teaches the agent to find the few billboards with actual traffic
+        # === 3. SNIPER APPROACH: Reward quality, not quantity ===
+        # Problem: -0.5 penalty was too harsh → agent paralyzed (-650/episode)
+        # Problem: +0.05 baseline would bring back lazy spammer
+        # Solution: Strong HIT bonus, tiny MISS penalty → 100x contrast
+        # Math: Spam 1000 empty = -10, Pick 1 good (10 users) = +1.0
         if self.allocations_this_step > 0:
-            if self.expected_influence_this_step > 0.1:  # HIT: Billboard has traffic
-                # Bonus: +0.05 per expected user, cap at 2.0
-                reward += min(self.expected_influence_this_step * 0.05, 2.0)
-            else:  # MISS: Billboard is empty - waste of money
-                # Penalty: Discourage picking empty billboards
-                reward -= 0.5
+            if self.expected_influence_this_step > 0.001:  # HIT: Billboard has traffic
+                # Strong positive reinforcement based on quality
+                # Scale: 10 users = +1.0 reward, capped at +5.0
+                reward += min(self.expected_influence_this_step * 0.1, 5.0)
+            else:  # MISS: Billboard is empty
+                # Tiny "transaction cost" - discourages spam without paralysis
+                reward -= 0.01
 
         # === 4. FAILURE PENALTIES (minimal to encourage exploration) ===
         for ad_id in self.ads_failed_this_step:
