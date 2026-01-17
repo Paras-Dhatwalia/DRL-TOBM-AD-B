@@ -1218,15 +1218,15 @@ class OptimizedBillboardEnv(gym.Env):
                     # TOP-K ALLOCATION: Same as EA mode - prioritize by influence
                     MAX_ALLOCATIONS_PER_STEP = 50
 
-                    # Get all selected pairs as (ad_idx, bb_idx) tuples
+                    # Get current expected influence for all billboards
+                    influence_scores = self.get_expected_slot_influence()
+
+                    # Get all selected pairs as (ad_idx, bb_idx, score) tuples
                     selected_pairs = []
                     for ad_idx in range(min(len(active_ads), self.config.max_active_ads)):
                         for bb_idx in range(self.n_nodes):
                             if action[ad_idx, bb_idx] == 1:
-                                if bb_idx < len(self.slot_expected_influence):
-                                    score = self.slot_expected_influence[bb_idx].get('total', 0)
-                                else:
-                                    score = 0
+                                score = influence_scores[bb_idx] if bb_idx < len(influence_scores) else 0
                                 selected_pairs.append((ad_idx, bb_idx, score))
 
                     # Sort by influence score descending
