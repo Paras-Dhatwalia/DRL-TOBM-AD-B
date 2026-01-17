@@ -1154,14 +1154,14 @@ class OptimizedBillboardEnv(gym.Env):
                     selected_indices = np.where(action == 1)[0]
 
                     if len(selected_indices) > 0:
+                        # Get current expected influence for all billboards (normalized 0-1)
+                        influence_scores = self.get_expected_slot_influence()
+
                         # Score each selected pair by billboard's expected influence
                         pair_scores = []
                         for pair_idx in selected_indices:
                             bb_idx = pair_idx % self.n_nodes
-                            if bb_idx < len(self.slot_expected_influence):
-                                score = self.slot_expected_influence[bb_idx].get('total', 0)
-                            else:
-                                score = 0
+                            score = influence_scores[bb_idx] if bb_idx < len(influence_scores) else 0
                             pair_scores.append((pair_idx, score))
 
                         # Sort by influence score descending (best billboards first)
