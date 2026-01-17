@@ -437,6 +437,10 @@ class OptimizedBillboardEnv(gym.Env):
             slot_influence: (n_billboards, max_duration) array
             slot_influence[b, d] = expected users within influence_radius of billboard over the next timesteps
         """
+        # PER-STEP CACHE: Avoid recomputing multiple times per step
+        if hasattr(self, '_slot_influence_cache_step') and self._slot_influence_cache_step == start_step:
+            return self._slot_influence_cache_data
+
         max_duration = self.config.slot_duration_range[1]  # 5
         slot_influence = np.zeros((self.n_nodes, max_duration), dtype=np.float32)
 
@@ -467,6 +471,9 @@ class OptimizedBillboardEnv(gym.Env):
             else:
                 slot_influence[:, d] = slot_influence[:, d-1] + users_per_billboard
 
+        # Cache result for this step
+        self._slot_influence_cache_step = start_step
+        self._slot_influence_cache_data = slot_influence
         return slot_influence
 
     def get_expected_slot_influence(self) -> np.ndarray:
