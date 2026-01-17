@@ -1154,8 +1154,10 @@ class OptimizedBillboardEnv(gym.Env):
                     selected_indices = np.where(action == 1)[0]
 
                     if len(selected_indices) > 0:
-                        # Get current expected influence for all billboards (normalized 0-1)
-                        influence_scores = self.get_expected_slot_influence()
+                        # PERFORMANCE: Compute once and reuse (avoids 50x recomputation)
+                        cached_slot_influence = self._precompute_slot_influence(self.current_step)
+                        # Normalized scores for Top-K sorting (use avg duration col 2)
+                        influence_scores = np.clip(cached_slot_influence[:, 2] / 100.0, 0.0, 1.0)
 
                         # Score each selected pair by billboard's expected influence
                         pair_scores = []
@@ -1188,7 +1190,8 @@ class OptimizedBillboardEnv(gym.Env):
                                 if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
                                     billboard.assign(ad_to_assign.aid, duration)
                                     self.allocations_this_step += 1
-                                    self.expected_influence_this_step += self._get_allocation_expected_influence(bb_idx, duration)
+                                    # Use cached value instead of recomputing
+                                    self.expected_influence_this_step += float(cached_slot_influence[bb_idx, duration - 1])
 
                                     used_billboards.add(bb_idx)
 
@@ -1218,8 +1221,9 @@ class OptimizedBillboardEnv(gym.Env):
                     # TOP-K ALLOCATION: Same as EA mode - prioritize by influence
                     MAX_ALLOCATIONS_PER_STEP = 50
 
-                    # Get current expected influence for all billboards
-                    influence_scores = self.get_expected_slot_influence()
+                    # PERFORMANCE: Compute once and reuse
+                    cached_slot_influence = self._precompute_slot_influence(self.current_step)
+                    influence_scores = np.clip(cached_slot_influence[:, 2] / 100.0, 0.0, 1.0)
 
                     # Get all selected pairs as (ad_idx, bb_idx, score) tuples
                     selected_pairs = []
@@ -1249,7 +1253,8 @@ class OptimizedBillboardEnv(gym.Env):
                             if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
                                 billboard.assign(ad_to_assign.aid, duration)
                                 self.allocations_this_step += 1
-                                self.expected_influence_this_step += self._get_allocation_expected_influence(bb_idx, duration)
+                                # Use cached value instead of recomputing
+                                self.expected_influence_this_step += float(cached_slot_influence[bb_idx, duration - 1])
 
                                 used_billboards.add(bb_idx)
 
