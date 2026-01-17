@@ -1145,23 +1145,39 @@ class OptimizedBillboardEnv(gym.Env):
                     # CRITICAL FIX: Track used billboards to prevent multi-assign in same step
                     used_billboards = set()
 
-                    # PERFORMANCE FIX: Cap allocations per step to prevent explosion
-                    # With stochastic sampling, ~417 pairs selected per step (4.7% of 8880)
-                    # Processing all of them is too slow - cap at reasonable limit
-                    MAX_ALLOCATIONS_PER_STEP = 50  # Reasonable limit for 20 ads
+                    # TOP-K ALLOCATION: Prioritize selected pairs by expected influence
+                    # This ensures the agent learns that high-quality pairs matter,
+                    # not just random ones from stochastic sampling
+                    MAX_ALLOCATIONS_PER_STEP = 50
 
-                    for pair_idx, chosen in enumerate(action):
-                        # PERFORMANCE FIX: Stop if cap reached
-                        if self.allocations_this_step >= MAX_ALLOCATIONS_PER_STEP:
-                            break
+                    # Get all selected pair indices
+                    selected_indices = np.where(action == 1)[0]
 
-                        if chosen == 1:
+                    if len(selected_indices) > 0:
+                        # Score each selected pair by billboard's expected influence
+                        pair_scores = []
+                        for pair_idx in selected_indices:
+                            bb_idx = pair_idx % self.n_nodes
+                            if bb_idx < len(self.slot_expected_influence):
+                                score = self.slot_expected_influence[bb_idx].get('total', 0)
+                            else:
+                                score = 0
+                            pair_scores.append((pair_idx, score))
+
+                        # Sort by influence score descending (best billboards first)
+                        pair_scores.sort(key=lambda x: x[1], reverse=True)
+
+                        # Process top-K pairs by priority
+                        for pair_idx, _ in pair_scores:
+                            if self.allocations_this_step >= MAX_ALLOCATIONS_PER_STEP:
+                                break
+
                             ad_idx = pair_idx // self.n_nodes
                             bb_idx = pair_idx % self.n_nodes
 
                             if (ad_idx < min(len(active_ads), self.config.max_active_ads) and
                                 self.billboards[bb_idx].is_free() and
-                                bb_idx not in used_billboards):  # FIXED: Check not already used
+                                bb_idx not in used_billboards):
 
                                 ad_to_assign = active_ads[ad_idx]
                                 billboard = self.billboards[bb_idx]
@@ -1171,11 +1187,9 @@ class OptimizedBillboardEnv(gym.Env):
                                 total_cost = billboard.b_cost * duration
                                 if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
                                     billboard.assign(ad_to_assign.aid, duration)
-                                    self.allocations_this_step += 1  # Track for reward shaping
-                                    # Track expected influence for immediate reward
+                                    self.allocations_this_step += 1
                                     self.expected_influence_this_step += self._get_allocation_expected_influence(bb_idx, duration)
 
-                                    # FIXED: Mark billboard as used for this step
                                     used_billboards.add(bb_idx)
 
                                     self.placement_history.append({
@@ -1185,7 +1199,7 @@ class OptimizedBillboardEnv(gym.Env):
                                         'billboard_id': billboard.b_id,
                                         'duration': duration,
                                         'demand': ad_to_assign.demand,
-                                        'cost': total_cost  # Total cost (per-timestep cost × duration)
+                                        'cost': total_cost
                                     })
 
             elif self.action_mode == 'mh':
@@ -1201,42 +1215,53 @@ class OptimizedBillboardEnv(gym.Env):
                     # CRITICAL FIX: Track used billboards to prevent multi-assign in same step
                     used_billboards = set()
 
-                    # PERFORMANCE FIX: Cap allocations per step (same as EA mode)
+                    # TOP-K ALLOCATION: Same as EA mode - prioritize by influence
                     MAX_ALLOCATIONS_PER_STEP = 50
 
+                    # Get all selected pairs as (ad_idx, bb_idx) tuples
+                    selected_pairs = []
                     for ad_idx in range(min(len(active_ads), self.config.max_active_ads)):
-                        # Check cap at outer loop level
+                        for bb_idx in range(self.n_nodes):
+                            if action[ad_idx, bb_idx] == 1:
+                                if bb_idx < len(self.slot_expected_influence):
+                                    score = self.slot_expected_influence[bb_idx].get('total', 0)
+                                else:
+                                    score = 0
+                                selected_pairs.append((ad_idx, bb_idx, score))
+
+                    # Sort by influence score descending
+                    selected_pairs.sort(key=lambda x: x[2], reverse=True)
+
+                    # Process top-K pairs by priority
+                    for ad_idx, bb_idx, _ in selected_pairs:
                         if self.allocations_this_step >= MAX_ALLOCATIONS_PER_STEP:
                             break
-                        for bb_idx in range(self.n_nodes):
-                            if (action[ad_idx, bb_idx] == 1 and
-                                self.billboards[bb_idx].is_free() and
-                                bb_idx not in used_billboards):  # FIXED: Check not already used
 
-                                ad_to_assign = active_ads[ad_idx]
-                                billboard = self.billboards[bb_idx]
+                        if (self.billboards[bb_idx].is_free() and
+                            bb_idx not in used_billboards):
 
-                                # BUDGET TRACKING: Charge cost × duration (per-timestep cost)
-                                duration = random.randint(*self.config.slot_duration_range)
-                                total_cost = billboard.b_cost * duration
-                                if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
-                                    billboard.assign(ad_to_assign.aid, duration)
-                                    self.allocations_this_step += 1  # Track for reward shaping
-                                    # Track expected influence for immediate reward
-                                    self.expected_influence_this_step += self._get_allocation_expected_influence(bb_idx, duration)
+                            ad_to_assign = active_ads[ad_idx]
+                            billboard = self.billboards[bb_idx]
 
-                                    # FIXED: Mark billboard as used for this step
-                                    used_billboards.add(bb_idx)
+                            # BUDGET TRACKING: Charge cost × duration (per-timestep cost)
+                            duration = random.randint(*self.config.slot_duration_range)
+                            total_cost = billboard.b_cost * duration
+                            if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
+                                billboard.assign(ad_to_assign.aid, duration)
+                                self.allocations_this_step += 1
+                                self.expected_influence_this_step += self._get_allocation_expected_influence(bb_idx, duration)
 
-                                    self.placement_history.append({
-                                        'spawn_step': ad_to_assign.spawn_step,
-                                        'allocated_step': self.current_step,
-                                        'ad_id': ad_to_assign.aid,
-                                        'billboard_id': billboard.b_id,
-                                        'duration': duration,
-                                        'demand': ad_to_assign.demand,
-                                        'cost': total_cost  # Total cost (per-timestep cost × duration)
-                                    })
+                                used_billboards.add(bb_idx)
+
+                                self.placement_history.append({
+                                    'spawn_step': ad_to_assign.spawn_step,
+                                    'allocated_step': self.current_step,
+                                    'ad_id': ad_to_assign.aid,
+                                    'billboard_id': billboard.b_id,
+                                    'duration': duration,
+                                    'demand': ad_to_assign.demand,
+                                    'cost': total_cost
+                                })
 
         except Exception as e:
             logger.error(f"Error executing action: {e}")
