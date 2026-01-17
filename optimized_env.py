@@ -961,16 +961,10 @@ class OptimizedBillboardEnv(gym.Env):
             prob_no_influence = np.prod(1.0 - ad_probabilities, axis=1)
             total_influence = np.sum(1.0 - prob_no_influence)
 
-            # Compute INCREMENTAL delta (not total)
-            if not hasattr(ad, '_last_total_influence'):
-                ad._last_total_influence = 0.0
-
-            delta = max(0.0, total_influence - ad._last_total_influence)
-            ad._last_total_influence = total_influence
-
-            # CANONICAL REWARD: Store per-step delta for progress shaping
-            ad._step_delta = delta
-            ad.cumulative_influence += delta
+            # Add this minute's influence directly (no delta tracking needed)
+            # total_influence = expected users influenced THIS MINUTE
+            ad._step_delta = total_influence
+            ad.cumulative_influence += total_influence
 
             if self.config.debug and delta > 0:
                 logger.debug(f"Ad {ad.aid} gained {delta:.4f} influence")
