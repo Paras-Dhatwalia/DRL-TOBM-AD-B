@@ -628,11 +628,14 @@ class OptimizedBillboardEnv(gym.Env):
             self.perf_monitor.reset()
     
     def distance_factor(self, dist_meters: np.ndarray) -> np.ndarray:
-        """Vectorized distance effect on billboard influence with 10m cap at 0.9."""
-        factor = np.ones_like(dist_meters) * 0.9  # Default for distances <= 10m
-        mask = dist_meters > 10.0
-        factor[mask] = np.maximum(0.1, 1.0 - (dist_meters[mask] / self.config.influence_radius_meters))
-        return factor
+        """Vectorized distance effect on billboard influence.
+
+        SIMPLIFIED: All users within influence radius are equally influenced.
+        Previously used linear decay which reduced influence at distance.
+        Distance threshold already handled by influence_radius_meters (100m).
+        """
+        # All users within radius contribute equally (no distance decay)
+        return np.ones_like(dist_meters)
     
     def get_mask(self) -> np.ndarray:
         """
