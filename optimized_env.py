@@ -584,9 +584,10 @@ class OptimizedBillboardEnv(gym.Env):
             })
 
         elif self.action_mode == 'mh':
-            # Multi-Head: select ad, then billboard
-            self.action_space = spaces.MultiBinary(
-                [self.config.max_active_ads, self.n_nodes])
+            # Multi-Head: two sequential categorical decisions
+            # Action[0] = ad index (0 to max_active_ads-1)
+            # Action[1] = billboard index (0 to n_nodes-1)
+            self.action_space = spaces.MultiDiscrete([self.config.max_active_ads, self.n_nodes])
             self.observation_space = spaces.Dict({
                 'graph_nodes': spaces.Box(low=-np.inf, high=np.inf,
                                          shape=(self.n_nodes, self.n_node_features),
@@ -597,6 +598,7 @@ class OptimizedBillboardEnv(gym.Env):
                 'ad_features': spaces.Box(low=-np.inf, high=np.inf,
                                          shape=(self.config.max_active_ads, self.n_ad_features),
                                          dtype=np.float32),
+                # Mask shape stays same: (max_active_ads, n_nodes) for valid (ad, bb) pairs
                 'mask': spaces.MultiBinary([self.config.max_active_ads, self.n_nodes])
             })
     
@@ -1210,67 +1212,60 @@ class OptimizedBillboardEnv(gym.Env):
                                     })
 
             elif self.action_mode == 'mh':
-                # Multi-Head mode
-                if isinstance(action, (list, np.ndarray)):
-                    action = np.asarray(action)
-                    if action.shape != (self.config.max_active_ads, self.n_nodes):
-                        logger.warning(f"Invalid action shape for 'mh' mode: {action.shape}")
+                # Multi-Head mode: action is (ad_idx, bb_idx) - two integers
+                if isinstance(action, (list, np.ndarray, torch.Tensor)):
+                    action = np.asarray(action).flatten()
+
+                    if len(action) != 2:
+                        if self.config.debug:
+                            logger.warning(f"Invalid MH action length: {len(action)}, expected 2")
                         return
 
+                    ad_idx = int(action[0])
+                    bb_idx = int(action[1])
+
+                    # Validate indices
                     active_ads = [ad for ad in self.ads if ad.state == 0]
+                    if ad_idx >= len(active_ads) or ad_idx < 0:
+                        if self.config.debug:
+                            logger.debug(f"Invalid ad index: {ad_idx}, active ads: {len(active_ads)}")
+                        return
 
-                    # CRITICAL FIX: Track used billboards to prevent multi-assign in same step
-                    used_billboards = set()
+                    if bb_idx >= self.n_nodes or bb_idx < 0:
+                        if self.config.debug:
+                            logger.debug(f"Invalid billboard index: {bb_idx}")
+                        return
 
-                    # TOP-K ALLOCATION: Same as EA mode - prioritize by influence
-                    MAX_ALLOCATIONS_PER_STEP = 50
+                    ad_to_assign = active_ads[ad_idx]
+                    billboard = self.billboards[bb_idx]
 
-                    # PERFORMANCE: Compute once and reuse
-                    cached_slot_influence = self._precompute_slot_influence(self.current_step)
-                    influence_scores = np.clip(cached_slot_influence[:, 2] / 100.0, 0.0, 1.0)
+                    # Check billboard is free
+                    if not billboard.is_free():
+                        if self.config.debug:
+                            logger.debug(f"Billboard {bb_idx} is occupied")
+                        return
 
-                    # Get all selected pairs as (ad_idx, bb_idx, score) tuples
-                    selected_pairs = []
-                    for ad_idx in range(min(len(active_ads), self.config.max_active_ads)):
-                        for bb_idx in range(self.n_nodes):
-                            if action[ad_idx, bb_idx] == 1:
-                                score = influence_scores[bb_idx] if bb_idx < len(influence_scores) else 0
-                                selected_pairs.append((ad_idx, bb_idx, score))
+                    # BUDGET TRACKING: Charge cost × duration
+                    duration = random.randint(*self.config.slot_duration_range)
+                    total_cost = billboard.b_cost * duration
 
-                    # Sort by influence score descending
-                    selected_pairs.sort(key=lambda x: x[2], reverse=True)
+                    if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
+                        billboard.assign(ad_to_assign.aid, duration)
+                        self.allocations_this_step += 1
 
-                    # Process top-K pairs by priority
-                    for ad_idx, bb_idx, _ in selected_pairs:
-                        if self.allocations_this_step >= MAX_ALLOCATIONS_PER_STEP:
-                            break
+                        # Use cached slot influence
+                        cached_slot_influence = self._precompute_slot_influence(self.current_step)
+                        self.expected_influence_this_step += float(cached_slot_influence[bb_idx, duration - 1])
 
-                        if (self.billboards[bb_idx].is_free() and
-                            bb_idx not in used_billboards):
-
-                            ad_to_assign = active_ads[ad_idx]
-                            billboard = self.billboards[bb_idx]
-
-                            # BUDGET TRACKING: Charge cost × duration (per-timestep cost)
-                            duration = random.randint(*self.config.slot_duration_range)
-                            total_cost = billboard.b_cost * duration
-                            if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
-                                billboard.assign(ad_to_assign.aid, duration)
-                                self.allocations_this_step += 1
-                                # Use cached value instead of recomputing
-                                self.expected_influence_this_step += float(cached_slot_influence[bb_idx, duration - 1])
-
-                                used_billboards.add(bb_idx)
-
-                                self.placement_history.append({
-                                    'spawn_step': ad_to_assign.spawn_step,
-                                    'allocated_step': self.current_step,
-                                    'ad_id': ad_to_assign.aid,
-                                    'billboard_id': billboard.b_id,
-                                    'duration': duration,
-                                    'demand': ad_to_assign.demand,
-                                    'cost': total_cost
-                                })
+                        self.placement_history.append({
+                            'spawn_step': ad_to_assign.spawn_step,
+                            'allocated_step': self.current_step,
+                            'ad_id': ad_to_assign.aid,
+                            'billboard_id': billboard.b_id,
+                            'duration': duration,
+                            'demand': ad_to_assign.demand,
+                            'cost': total_cost
+                        })
 
         except Exception as e:
             logger.error(f"Error executing action: {e}")
@@ -1387,6 +1382,14 @@ class OptimizedBillboardEnv(gym.Env):
             'ads_tardy': self.performance_metrics['total_ads_tardy'],
             'current_minute': (self.start_time_min + self.current_step) % 1440
         }
+
+        # Episode-end summary (always logged, not controlled by debug flag)
+        if terminated:
+            c = self.performance_metrics['total_ads_completed']
+            t = self.performance_metrics['total_ads_tardy']
+            p = self.performance_metrics['total_ads_processed']
+            r = self.performance_metrics['total_revenue']
+            logger.info(f"[{self.action_mode.upper()}] {c}/{p} completed, {t} tardy, ${r:.0f}")
 
         return self._get_obs(), reward, terminated, truncated, info
     

@@ -13,7 +13,7 @@ import tianshou as ts
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 from tianshou.utils import TensorboardLogger
-from torch.optim.lr_scheduler import ExponentialLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from typing import Dict, Any, Tuple, Optional, Union
 import platform
 import gymnasium as gym
@@ -53,38 +53,76 @@ from tianshou.trainer import OnpolicyTrainer
 from optimized_env import OptimizedBillboardEnv, EnvConfig
 from models import BillboardAllocatorGNN
 
-# Configuration for MH mode
-env_config = {
-    "billboard_csv": r"path/to/folder", 
-    "advertiser_csv": r"path/to/folder",  
-    "trajectory_csv": r"path/to/folder", 
-    "action_mode": "mh",
-    "max_events": 1440,
-    "influence_radius": 500.0,
-    "tardiness_cost": 50.0
-}
+def get_test_config():
+    """Test configuration for quick debugging."""
+    return {
+        "env": {
+            "billboard_csv": r"path/to/folder",
+            "advertiser_csv": r"path/to/folder",
+            "trajectory_csv": r"path/to/folder",
+            "action_mode": "mh",
+            "max_events": 1440,
+            "max_active_ads": 20,
+            "influence_radius": 100.0,
+            "tardiness_cost": 50.0,
+        },
+        "train": {
+            "hidden_dim": 64,
+            "n_graph_layers": 2,
+            "lr": 1e-3,
+            "discount_factor": 0.99,
+            "gae_lambda": 0.95,
+            "vf_coef": 0.5,
+            "ent_coef": 0.01,
+            "max_grad_norm": 0.5,
+            "eps_clip": 0.2,
+            "batch_size": 16,
+            "nr_envs": 1,
+            "max_epoch": 3,
+            "step_per_collect": 64,
+            "step_per_epoch": 200,
+            "repeat_per_collect": 4,
+            "buffer_size": 5000,
+            "save_path": "models/test_ppo_billboard_mh.pt",
+            "log_path": "logs/test_ppo_billboard_mh",
+        }
+    }
 
-train_config = {
-    "nr_envs": 4,               # Reduced for VRAM safety with larger buffer
-    "hidden_dim": 160,          # Moderate capacity for MH mode
-    "n_graph_layers": 4,        # Deeper spatial reasoning
-    "lr": 3e-4,                 # Standard learning rate
-    "lr_decay": 0.97,           # Slower LR decay
-    "discount_factor": 0.99,    # Standard discount
-    "gae_lambda": 0.95,         # Standard GAE
-    "vf_coef": 0.5,             # Value loss coefficient
-    "ent_coef": 0.015,          # Entropy bonus for exploration
-    "max_grad_norm": 0.5,       # Gradient clipping
-    "eps_clip": 0.2,            # PPO clipping
-    "batch_size": 64,           # Safe for multi-head model
-    "max_epoch": 60,            # Reasonable training length
-    "step_per_collect": 4096,   # Full episode capture (4 envs x 1000 steps)
-    "step_per_epoch": 10000,    # Steps per epoch
-    "repeat_per_collect": 6,    # Gradient updates per collection
-    "save_path": "models/ppo_billboard_mh.pt",
-    "log_path": "logs/ppo_billboard_mh",
-    "buffer_size": 30000        # Large replay buffer
-}
+
+def get_full_config():
+    """Full configuration for production training."""
+    return {
+        "env": {
+            "billboard_csv": r"path/to/folder",
+            "advertiser_csv": r"path/to/folder",
+            "trajectory_csv": r"path/to/folder",
+            "action_mode": "mh",
+            "max_events": 1440,
+            "max_active_ads": 20,
+            "influence_radius": 100.0,
+            "tardiness_cost": 50.0,
+        },
+        "train": {
+            "hidden_dim": 160,
+            "n_graph_layers": 4,
+            "lr": 3e-4,
+            "discount_factor": 0.995,     # Synced with EA
+            "gae_lambda": 0.95,
+            "vf_coef": 0.5,
+            "ent_coef": 0.01,             # Synced with EA
+            "max_grad_norm": 0.5,
+            "eps_clip": 0.2,
+            "batch_size": 64,
+            "nr_envs": 4,
+            "max_epoch": 100,             # Synced with EA
+            "step_per_collect": 5760,     # Synced with EA
+            "step_per_epoch": 14400,      # Synced with EA
+            "repeat_per_collect": 15,     # Synced with EA
+            "buffer_size": 30000,
+            "save_path": "models/ppo_billboard_mh.pt",
+            "log_path": "logs/ppo_billboard_mh",
+        }
+    }
 
 
 # WRAPPER: Returns observations WITHOUT graph_edge_links
@@ -295,9 +333,26 @@ def multi_head_dist_fn(logits):
         return torch.distributions.Categorical(logits=logits)
 
 
-def main():
-    """Main training function for MH mode."""
+def main(use_test_config: bool = False):
+    """Main training function for MH mode.
+
+    Args:
+        use_test_config: If True, use test config. If False, use full config.
+    """
+    global env_config, train_config
+
+    # Select configuration
+    config = get_test_config() if use_test_config else get_full_config()
+    env_config = config["env"]
+    train_config = config["train"]
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    logger.info("="*60)
+    logger.info("MH MODE TRAINING - Billboard Allocation")
+    logger.info("="*60)
+    logger.info(f"Configuration: {'TEST (correctness validation)' if use_test_config else 'FULL (production)'}")
+    logger.info(f"Device: {device}")
 
     os.makedirs(os.path.dirname(train_config["save_path"]), exist_ok=True)
     os.makedirs(train_config["log_path"], exist_ok=True)
@@ -352,7 +407,11 @@ def main():
         lr=train_config["lr"],
         eps=1e-5
     )
-    lr_scheduler = ExponentialLR(optimizer, gamma=train_config.get("lr_decay", 0.97))
+    lr_scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=train_config["max_epoch"],
+        eta_min=train_config["lr"] * 0.1
+    )
 
     # Create PPO policy with multi-head distribution
     policy = ts.policy.PPOPolicy(
@@ -526,6 +585,6 @@ def main():
 
 
 if __name__ == "__main__":
-    # All config from env_config and train_config dicts at top of file
-    main()
+    # Set to True for quick testing, False for full production training
+    main(use_test_config=False)
 
