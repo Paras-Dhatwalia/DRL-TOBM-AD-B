@@ -93,9 +93,9 @@ def get_full_config():
     """Full configuration for production training."""
     return {
         "env": {
-            "billboard_csv": r"path/to/folder",
-            "advertiser_csv": r"path/to/folder",
-            "trajectory_csv": r"path/to/folder",
+            "billboard_csv": r"C:\Coding Files\DRL-TOBM-AD-B\BB_NYC.csv",
+            "advertiser_csv": r"C:\Coding Files\DRL-TOBM-AD-B\Advertiser_100.csv",
+            "trajectory_csv": r"C:\Coding Files\DRL-TOBM-AD-B\TJ_NYC.csv",
             "action_mode": "mh",
             "max_events": 1440,
             "max_active_ads": 20,
@@ -298,6 +298,11 @@ def get_env():
 class MultiHeadCategorical:
     """Custom distribution for multi-head action selection.
 
+    Tianshou Compatibility: Implements all required attributes/methods:
+    - sample(), log_prob(), entropy(), mode (core methods)
+    - probs, stddev, variance, mean, batch_shape (required properties)
+    - __len__, ndim (batch size detection)
+
     Accepts CONCATENATED logits: [ad_logits, billboard_logits] with shape (batch, max_ads + n_billboards).
     Splits them internally to create two Categorical distributions.
     """
@@ -308,16 +313,42 @@ class MultiHeadCategorical:
     def __init__(self, logits: torch.Tensor):
         # logits shape: (batch, max_ads + n_billboards)
         # Split at MAX_ADS
+        self._logits = logits  # Store for __len__
         ad_logits = logits[..., :self.MAX_ADS]
         bb_logits = logits[..., self.MAX_ADS:]
 
         self.ad_dist = torch.distributions.Categorical(logits=ad_logits)
         self.bb_dist = torch.distributions.Categorical(logits=bb_logits)
 
+        # Cache batch shape for Tianshou compatibility
+        self._batch_shape = logits.shape[:-1]
+
+    # === Batch Size Detection (Tianshou) ===
+    def __len__(self):
+        """Return batch size for Tianshou compatibility."""
+        if self._logits.dim() == 1:
+            return 1
+        return self._logits.shape[0]
+
+    @property
+    def ndim(self):
+        """Return number of dimensions for Tianshou compatibility."""
+        return self._logits.dim()
+
+    @property
+    def batch_shape(self):
+        """Required by Tianshou's get_len_of_dist()."""
+        return self._batch_shape
+
+    # === Core Distribution Methods ===
     def sample(self):
         ad_action = self.ad_dist.sample()
         bb_action = self.bb_dist.sample()
         return torch.stack([ad_action, bb_action], dim=-1)
+
+    def rsample(self, sample_shape=torch.Size()):
+        """Reparameterized sample (same as sample for discrete)."""
+        return self.sample()
 
     def log_prob(self, actions):
         ad_action = actions[..., 0].long()
@@ -334,6 +365,43 @@ class MultiHeadCategorical:
         ad_mode = self.ad_dist.probs.argmax(dim=-1)
         bb_mode = self.bb_dist.probs.argmax(dim=-1)
         return torch.stack([ad_mode, bb_mode], dim=-1)
+
+    # === Statistical Properties (Tianshou Collector) ===
+    @property
+    def probs(self):
+        """Combined probability tensor for Tianshou stats.
+        Returns concatenated probs: (batch, max_ads + n_billboards)
+        """
+        return torch.cat([self.ad_dist.probs, self.bb_dist.probs], dim=-1)
+
+    @property
+    def mean(self):
+        """Expected action index for each head."""
+        ad_probs = self.ad_dist.probs
+        bb_probs = self.bb_dist.probs
+        ad_indices = torch.arange(ad_probs.shape[-1], device=ad_probs.device, dtype=ad_probs.dtype)
+        bb_indices = torch.arange(bb_probs.shape[-1], device=bb_probs.device, dtype=bb_probs.dtype)
+        ad_mean = (ad_probs * ad_indices).sum(-1)
+        bb_mean = (bb_probs * bb_indices).sum(-1)
+        return torch.stack([ad_mean, bb_mean], dim=-1)
+
+    @property
+    def variance(self):
+        """Variance of action indices for each head."""
+        def cat_variance(dist):
+            probs = dist.probs
+            indices = torch.arange(probs.shape[-1], device=probs.device, dtype=probs.dtype)
+            mean = (probs * indices).sum(-1, keepdim=True)
+            return (probs * (indices - mean) ** 2).sum(-1)
+
+        ad_var = cat_variance(self.ad_dist)
+        bb_var = cat_variance(self.bb_dist)
+        return torch.stack([ad_var, bb_var], dim=-1)
+
+    @property
+    def stddev(self):
+        """Standard deviation - REQUIRED by Tianshou collector."""
+        return self.variance.sqrt()
 
 
 def create_multi_head_dist_fn(max_ads: int):

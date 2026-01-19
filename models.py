@@ -873,8 +873,10 @@ class BillboardAllocatorGNN(nn.Module):
         # Head 1: Select ad - return LOGITS (scores), not probs
         ad_logits = self.ad_head(ad_embeds.view(-1, ad_embeds.shape[-1])).view(batch_size, self.max_ads)
 
-        # Create ad mask from the mask tensor
-        ad_mask = mask[:, :, 0]  # (batch_size, max_ads)
+        # Create ad mask: ad is valid if it has ANY available billboard
+        # Old: mask[:, :, 0] took first billboard column (wrong semantics)
+        # New: any(dim=-1) checks if any billboard is valid for each ad
+        ad_mask = mask.any(dim=-1).bool()  # (batch_size, max_ads)
         ad_logits[~ad_mask] = self.min_val
 
         # Sample or get ad selection for conditioning Head 2
@@ -899,7 +901,7 @@ class BillboardAllocatorGNN(nn.Module):
         billboard_logits = billboard_logits.view(batch_size, self.n_billboards)
 
         # Create billboard mask from the chosen ads
-        billboard_mask = mask[torch.arange(batch_size), chosen_ads]  # (batch_size, n_billboards)
+        billboard_mask = mask[torch.arange(batch_size), chosen_ads].bool()  # (batch_size, n_billboards)
         billboard_logits[~billboard_mask] = self.min_val
 
         # CRITICAL: Concatenate logits so Tianshou can batch them
