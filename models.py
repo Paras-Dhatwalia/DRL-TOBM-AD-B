@@ -857,25 +857,28 @@ class BillboardAllocatorGNN(nn.Module):
         
     def _forward_mh_fixed(self, billboard_embeds: torch.Tensor, observations: Dict[str, torch.Tensor],
                          mask: torch.Tensor, batch_size: int, state: Optional[torch.Tensor],
-                         info: Dict[str, Any]) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+                         info: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        FIXED: Multi-Head forward pass - no changes needed as it was already correct.
+        Multi-Head forward pass.
+
+        Returns concatenated logits: [ad_logits, billboard_logits] with shape (batch, max_ads + n_billboards)
+        This allows Tianshou to batch them properly. The distribution splits them back.
         """
-        
+
         # Get ad features
         ad_features = observations['ad_features']  # (batch_size, max_ads, ad_feat_dim)
         ad_embeds = self.ad_encoder(ad_features.view(-1, ad_features.shape[-1]))
         ad_embeds = ad_embeds.view(batch_size, self.max_ads, -1)
-        
-        # Head 1: Select ad
-        ad_scores = self.ad_head(ad_embeds.view(-1, ad_embeds.shape[-1])).view(batch_size, self.max_ads)
-        
+
+        # Head 1: Select ad - return LOGITS (scores), not probs
+        ad_logits = self.ad_head(ad_embeds.view(-1, ad_embeds.shape[-1])).view(batch_size, self.max_ads)
+
         # Create ad mask from the mask tensor
         ad_mask = mask[:, :, 0]  # (batch_size, max_ads)
-        ad_scores[~ad_mask] = self.min_val
-        ad_probs = F.softmax(ad_scores, dim=1)
-        
-        # Sample or get ad selection
+        ad_logits[~ad_mask] = self.min_val
+
+        # Sample or get ad selection for conditioning Head 2
+        ad_probs = F.softmax(ad_logits, dim=1)
         if self.training and state is not None and 'learn' in info:
             chosen_ads = state[:, 0].long()
         else:
@@ -883,24 +886,27 @@ class BillboardAllocatorGNN(nn.Module):
                 chosen_ads = Categorical(ad_probs).sample()
             else:
                 chosen_ads = ad_probs.argmax(dim=1)
-        
+
         # Head 2: Select billboard conditioned on chosen ad
         chosen_ad_embeds = ad_embeds[torch.arange(batch_size), chosen_ads]  # (batch_size, hidden_dim)
         chosen_ad_expanded = chosen_ad_embeds.unsqueeze(1).expand(-1, self.n_billboards, -1)
-        
+
         # Combine chosen ad with all billboards
         combined_features = torch.cat([billboard_embeds, chosen_ad_expanded], dim=-1)
-        
-        # Score billboards
-        billboard_scores = self.billboard_head(combined_features.view(-1, combined_features.shape[-1]))
-        billboard_scores = billboard_scores.view(batch_size, self.n_billboards)
-        
+
+        # Score billboards - return LOGITS (scores), not probs
+        billboard_logits = self.billboard_head(combined_features.view(-1, combined_features.shape[-1]))
+        billboard_logits = billboard_logits.view(batch_size, self.n_billboards)
+
         # Create billboard mask from the chosen ads
         billboard_mask = mask[torch.arange(batch_size), chosen_ads]  # (batch_size, n_billboards)
-        billboard_scores[~billboard_mask] = self.min_val
-        billboard_probs = F.softmax(billboard_scores, dim=1)
-        
-        return (ad_probs, billboard_probs), chosen_ads
+        billboard_logits[~billboard_mask] = self.min_val
+
+        # CRITICAL: Concatenate logits so Tianshou can batch them
+        # Shape: (batch, max_ads + n_billboards) = (batch, 20 + 444) = (batch, 464)
+        concatenated_logits = torch.cat([ad_logits, billboard_logits], dim=-1)
+
+        return concatenated_logits, chosen_ads
         
     def critic_forward(self, observations: Dict[str, torch.Tensor]) -> torch.Tensor:
         """

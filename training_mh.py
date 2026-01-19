@@ -296,11 +296,23 @@ def get_env():
 
 
 class MultiHeadCategorical:
-    """Custom distribution for multi-head action selection"""
+    """Custom distribution for multi-head action selection.
 
-    def __init__(self, logits: Tuple[torch.Tensor, torch.Tensor]):
-        self.ad_dist = torch.distributions.Categorical(logits=logits[0])
-        self.bb_dist = torch.distributions.Categorical(logits=logits[1])
+    Accepts CONCATENATED logits: [ad_logits, billboard_logits] with shape (batch, max_ads + n_billboards).
+    Splits them internally to create two Categorical distributions.
+    """
+
+    # Class-level split point (set by create_multi_head_dist_fn)
+    MAX_ADS = 20  # Default, will be overwritten
+
+    def __init__(self, logits: torch.Tensor):
+        # logits shape: (batch, max_ads + n_billboards)
+        # Split at MAX_ADS
+        ad_logits = logits[..., :self.MAX_ADS]
+        bb_logits = logits[..., self.MAX_ADS:]
+
+        self.ad_dist = torch.distributions.Categorical(logits=ad_logits)
+        self.bb_dist = torch.distributions.Categorical(logits=bb_logits)
 
     def sample(self):
         ad_action = self.ad_dist.sample()
@@ -308,8 +320,8 @@ class MultiHeadCategorical:
         return torch.stack([ad_action, bb_action], dim=-1)
 
     def log_prob(self, actions):
-        ad_action = actions[..., 0]
-        bb_action = actions[..., 1]
+        ad_action = actions[..., 0].long()
+        bb_action = actions[..., 1].long()
         ad_log_prob = self.ad_dist.log_prob(ad_action)
         bb_log_prob = self.bb_dist.log_prob(bb_action)
         return ad_log_prob + bb_log_prob
@@ -324,13 +336,27 @@ class MultiHeadCategorical:
         return torch.stack([ad_mode, bb_mode], dim=-1)
 
 
-def multi_head_dist_fn(logits):
-    """Distribution function for multi-head action selection"""
-    if isinstance(logits, tuple) and len(logits) == 2:
-        return MultiHeadCategorical(logits)
-    else:
-        # Fallback to standard categorical
-        return torch.distributions.Categorical(logits=logits)
+def create_multi_head_dist_fn(max_ads: int):
+    """Create a distribution function with the correct split point.
+
+    Args:
+        max_ads: Number of ads (split point for concatenated logits)
+
+    Returns:
+        Distribution function for Tianshou PPOPolicy
+    """
+    # Set class-level split point
+    MultiHeadCategorical.MAX_ADS = max_ads
+
+    def multi_head_dist_fn(logits):
+        """Distribution function for multi-head action selection"""
+        if isinstance(logits, torch.Tensor) and logits.dim() >= 1:
+            return MultiHeadCategorical(logits)
+        else:
+            # Fallback to standard categorical
+            return torch.distributions.Categorical(logits=logits)
+
+    return multi_head_dist_fn
 
 
 def main(use_test_config: bool = False):
@@ -418,7 +444,7 @@ def main(use_test_config: bool = False):
         actor=actor,
         critic=critic,
         optim=optimizer,
-        dist_fn=multi_head_dist_fn,  # Custom distribution for multi-head
+        dist_fn=create_multi_head_dist_fn(max_ads),  # Custom distribution for multi-head
         action_space=action_space,
         action_scaling=False,
         discount_factor=train_config["discount_factor"],
