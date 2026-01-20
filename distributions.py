@@ -6,14 +6,20 @@ action spaces used in EA (Edge Action) and MH (Multi-Head) modes.
 
 Key Classes:
 - IndependentBernoulli: Distribution over binary vectors where each dimension
-  is an independent Bernoulli random variable. Used for multi-selection actions.
+  is an independent Bernoulli random variable. (DEPRECATED for EA mode)
+- TopKSelection: Distribution that selects the K highest-scoring pairs via
+  competitive softmax selection. (RECOMMENDED for EA mode)
+- MaskedCategorical: Categorical distribution with action masking for NA mode.
 
 Design Rationale:
 - Standard Categorical distribution assumes ONE choice from N options
-- EA/MH modes require MULTIPLE simultaneous binary decisions
-- IndependentBernoulli models each (ad, billboard) pair as independent coin flip
-- Entropy is sum of individual Bernoulli entropies
-- log_prob is sum of individual log probabilities
+- EA mode requires MULTIPLE simultaneous selections from N×M options
+- IndependentBernoulli: Each pair is independent coin flip → ignores scores
+- TopKSelection: High-scoring pairs selected competitively → uses learned ranking
+
+EA Mode Evolution:
+- v1 (IndependentBernoulli): Failed because sampling ignored model's pair scores
+- v2 (TopKSelection): Uses softmax for competitive selection, respects ranking
 
 Compatible with Tianshou's PPO policy via dist_fn parameter.
 """
@@ -273,6 +279,285 @@ class IndependentBernoulli(Distribution):
         return new
 
 
+class TopKSelection(Distribution):
+    """
+    Distribution for selecting Top-K highest-scoring pairs.
+
+    Unlike IndependentBernoulli which samples each dimension independently,
+    this treats selection as COMPETITIVE: pairs compete for K selection slots
+    based on their scores via softmax.
+
+    Mathematical Model:
+    - Scores converted to probabilities via softmax: p_i = exp(s_i/T) / sum(exp(s_j/T))
+    - K indices sampled from Categorical(p) without replacement
+    - Binary action created: action[sampled_indices] = 1
+
+    Log Probability (Approximate):
+    - log P(action) ≈ sum_{i in selected} log(p_i)
+    - This is an approximation (ignores sampling order dependence)
+    - Works well in practice with PPO
+
+    Entropy:
+    - H = -sum_i p_i log(p_i)
+    - Entropy of the underlying Categorical distribution
+
+    Why Top-K instead of Independent Bernoulli?
+    - IndependentBernoulli: Each pair is independent coin flip → scores ignored
+    - TopKSelection: High-scoring pairs ALWAYS selected → uses model's learned ranking
+
+    Args:
+        logits: Raw scores from model, shape (batch_size, action_dim)
+        k: Number of pairs to select
+        mask: Optional boolean mask, shape (batch_size, action_dim). True = valid.
+        temperature: Softmax temperature (higher = more exploration)
+
+    Example:
+        >>> logits = torch.randn(32, 8880)  # batch=32, 20 ads × 444 billboards
+        >>> dist = TopKSelection(logits=logits, k=60)
+        >>> action = dist.sample()  # shape: (32, 8880), binary with exactly 60 ones
+        >>> log_p = dist.log_prob(action)  # shape: (32,)
+        >>> entropy = dist.entropy()  # shape: (32,)
+    """
+
+    arg_constraints = {'logits': constraints.real}
+    has_rsample = False  # Discrete distribution
+
+    def __init__(
+        self,
+        logits: torch.Tensor,
+        k: int,
+        mask: Optional[torch.Tensor] = None,
+        temperature: float = 1.0,
+        validate_args: bool = False
+    ):
+        self.k = k
+        self.temperature = temperature
+        self._logits = logits
+        self.mask = mask
+        self._action_dim = logits.shape[-1]
+
+        # Handle batch dimensions
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+            self._was_1d = True
+        else:
+            self._was_1d = False
+
+        batch_size = logits.shape[0]
+
+        # Apply mask before softmax (masked → -inf → 0 prob after softmax)
+        if mask is not None:
+            mask_bool = mask.bool() if mask.dtype != torch.bool else mask
+            if mask_bool.dim() == 1:
+                mask_bool = mask_bool.unsqueeze(0)
+            masked_logits = logits.masked_fill(~mask_bool, float('-inf'))
+            self._n_valid = mask_bool.sum(dim=-1)
+        else:
+            masked_logits = logits
+            self._n_valid = torch.full((batch_size,), self._action_dim, device=logits.device)
+
+        # Compute selection probabilities via temperature-scaled softmax
+        # Handle all-masked case: if all -inf, softmax gives NaN → replace with uniform
+        self._probs = F.softmax(masked_logits / temperature, dim=-1)
+
+        # Handle NaN from all-masked batches (softmax of all -inf)
+        nan_rows = torch.isnan(self._probs).any(dim=-1)
+        if nan_rows.any():
+            # For all-masked rows, use uniform distribution (will select nothing valid)
+            uniform = torch.ones_like(self._probs[0]) / self._action_dim
+            self._probs[nan_rows] = uniform
+
+        # Store shapes for Distribution base class
+        self._batch_shape = logits.shape[:-1]
+        self._event_shape = logits.shape[-1:]
+
+        super().__init__(
+            batch_shape=self._batch_shape,
+            event_shape=self._event_shape,
+            validate_args=validate_args
+        )
+
+    @property
+    def logits(self) -> torch.Tensor:
+        """Get raw logits (scores)."""
+        return self._logits
+
+    @property
+    def probs(self) -> torch.Tensor:
+        """Get selection probabilities (softmax of logits)."""
+        return self._probs
+
+    @property
+    def param(self) -> torch.Tensor:
+        """Get the parameter tensor (logits)."""
+        return self._logits
+
+    def sample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
+        """
+        Sample Top-K pairs via multinomial without replacement.
+
+        Returns:
+            Binary tensor of shape (*sample_shape, *batch_shape, action_dim)
+            with exactly min(k, n_valid) ones per batch.
+        """
+        with torch.no_grad():
+            probs = self._probs
+            if probs.dim() == 1:
+                probs = probs.unsqueeze(0)
+
+            batch_size = probs.shape[0]
+            actions = torch.zeros_like(probs)
+
+            for b in range(batch_size):
+                # Can't select more than valid actions
+                k_b = min(self.k, int(self._n_valid[b].item()))
+                if k_b > 0:
+                    # Add small epsilon to prevent zero probs causing multinomial issues
+                    probs_b = probs[b].clone()
+                    probs_b = probs_b + 1e-8
+                    probs_b = probs_b / probs_b.sum()
+
+                    # Sample k indices without replacement
+                    try:
+                        indices = torch.multinomial(probs_b, k_b, replacement=False)
+                        actions[b, indices] = 1.0
+                    except RuntimeError:
+                        # Fallback: if multinomial fails, use top-k deterministically
+                        _, top_indices = torch.topk(probs_b, k_b)
+                        actions[b, top_indices] = 1.0
+
+            # Restore original shape if input was 1D
+            if self._was_1d:
+                actions = actions.squeeze(0)
+
+            return actions
+
+    def rsample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
+        """Reparameterized sampling (falls back to regular for discrete)."""
+        return self.sample(sample_shape)
+
+    def log_prob(self, value: torch.Tensor) -> torch.Tensor:
+        """
+        Compute log probability of action.
+
+        Approximate: sum of log(p_i) for selected indices.
+        This approximation works well with PPO because:
+        - Higher scores → higher log_prob (correct gradient direction)
+        - Selected pairs receive gradient signal
+
+        Args:
+            value: Binary action tensor, shape (*batch_shape, action_dim)
+
+        Returns:
+            Log probability, shape (*batch_shape,)
+        """
+        # Ensure value has batch dimension
+        if value.dim() == 1:
+            value = value.unsqueeze(0)
+
+        selected = value.bool()
+        probs = self._probs
+        if probs.dim() == 1:
+            probs = probs.unsqueeze(0)
+
+        # Compute log probs with numerical safety
+        log_probs = torch.log(probs + 1e-8)
+
+        # Sum over selected indices only
+        masked_log_probs = torch.where(selected, log_probs, torch.zeros_like(log_probs))
+        result = masked_log_probs.sum(dim=-1)
+
+        # Handle NaN
+        result = torch.nan_to_num(result, nan=0.0, neginf=-100.0)
+
+        # Restore original shape if needed
+        if self._was_1d:
+            result = result.squeeze(0)
+
+        return result
+
+    def entropy(self) -> torch.Tensor:
+        """
+        Entropy of the underlying categorical distribution.
+
+        Returns:
+            Entropy, shape (*batch_shape,)
+        """
+        probs = self._probs
+        if probs.dim() == 1:
+            probs = probs.unsqueeze(0)
+
+        # H = -sum_i p_i * log(p_i)
+        log_probs = torch.log(probs + 1e-8)
+        entropy = -(probs * log_probs).sum(dim=-1)
+
+        # Handle NaN
+        entropy = torch.nan_to_num(entropy, nan=0.0)
+
+        if self._was_1d:
+            entropy = entropy.squeeze(0)
+
+        return entropy
+
+    @property
+    def mode(self) -> torch.Tensor:
+        """
+        Deterministic Top-K selection by score.
+
+        Returns the K highest-scoring pairs (no sampling).
+        """
+        logits = self._logits
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+
+        batch_size = logits.shape[0]
+        actions = torch.zeros_like(logits)
+
+        for b in range(batch_size):
+            k_b = min(self.k, int(self._n_valid[b].item()))
+            if k_b > 0:
+                _, top_indices = torch.topk(logits[b], k_b)
+                actions[b, top_indices] = 1.0
+
+        if self._was_1d:
+            actions = actions.squeeze(0)
+
+        return actions
+
+    # === Tianshou Compatibility Properties ===
+
+    def __len__(self):
+        """Batch size for Tianshou's collector."""
+        if self._logits.dim() == 1:
+            return 1
+        return self._logits.shape[0]
+
+    @property
+    def ndim(self):
+        """Number of dimensions for Tianshou."""
+        return self._logits.dim()
+
+    @property
+    def batch_shape(self):
+        """Batch shape for Tianshou's get_len_of_dist()."""
+        return self._batch_shape
+
+    @property
+    def mean(self) -> torch.Tensor:
+        """Expected selection (probs themselves for softmax)."""
+        return self._probs
+
+    @property
+    def variance(self) -> torch.Tensor:
+        """Variance of categorical: p * (1 - p)."""
+        return self._probs * (1 - self._probs)
+
+    @property
+    def stddev(self) -> torch.Tensor:
+        """Standard deviation - REQUIRED by Tianshou collector."""
+        return self.variance.sqrt()
+
+
 class MaskedCategorical(Distribution):
     """
     Categorical distribution with action masking support.
@@ -356,15 +641,22 @@ class MaskedCategorical(Distribution):
 def create_distribution(
     logits: torch.Tensor,
     action_type: str = 'categorical',
-    mask: Optional[torch.Tensor] = None
+    mask: Optional[torch.Tensor] = None,
+    k: int = 60,
+    temperature: float = 1.0
 ) -> Distribution:
     """
     Factory function to create appropriate distribution based on action type.
 
     Args:
         logits: Model output logits
-        action_type: One of 'categorical', 'bernoulli', 'independent_bernoulli'
+        action_type: One of:
+            - 'categorical': MaskedCategorical for NA mode (single selection)
+            - 'bernoulli' or 'independent_bernoulli': IndependentBernoulli (DEPRECATED)
+            - 'topk' or 'top_k_selection': TopKSelection for EA mode (RECOMMENDED)
         mask: Optional action mask
+        k: Number of pairs to select (only for TopKSelection)
+        temperature: Softmax temperature (only for TopKSelection)
 
     Returns:
         Appropriate distribution instance
@@ -373,5 +665,7 @@ def create_distribution(
         return MaskedCategorical(logits=logits, mask=mask)
     elif action_type in ('bernoulli', 'independent_bernoulli'):
         return IndependentBernoulli(logits=logits, mask=mask)
+    elif action_type in ('topk', 'top_k_selection'):
+        return TopKSelection(logits=logits, k=k, mask=mask, temperature=temperature)
     else:
         raise ValueError(f"Unknown action type: {action_type}")

@@ -594,12 +594,13 @@ class BillboardAllocatorGNN(nn.Module):
                 Linear(hidden_dim // 2, 1)
             )
 
-            # Sparse initialization: start with low selection probability
-            # sigmoid(-3) ≈ 0.05, so ~5% of valid pairs selected initially
-            # This provides cleaner gradient signal for learning which pairs matter
-            # Model learns to INCREASE logits for high-value (ad, billboard) pairs
+            # Neutral initialization for TopKSelection distribution
+            # With softmax-based TopKSelection, bias doesn't affect relative ranking
+            # (all logits shifted equally), so we use neutral initialization.
+            # The model learns to DIFFERENTIATE scores for high vs low value pairs.
+            # TopKSelection then selects the K highest-scoring pairs.
             with torch.no_grad():
-                self.pair_scorer[-1].bias.fill_(-3.0)
+                self.pair_scorer[-1].bias.fill_(0.0)
 
         elif self.mode == 'mh':
             # Multi-Head: Sequential ad selection then billboard selection

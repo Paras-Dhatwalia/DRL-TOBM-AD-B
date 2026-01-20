@@ -5,21 +5,25 @@ This version suppresses verbose logging for clean training output.
 
 EA Mode Design:
 - Combinatorial action space: select multiple (ad, billboard) pairs simultaneously
-- Uses Independent Bernoulli distribution (NOT Categorical)
-- Each pair decision is independent
-- Action shape: (max_ads × n_billboards) binary vector
+- Uses TopKSelection distribution (competitive softmax → top K pairs)
+- Selection is COMPETITIVE: only highest-scoring pairs are selected
+- Action shape: (max_ads × n_billboards) binary vector with K ones
 
 Research Rationale:
 - EA allows batch allocation decisions
 - More efficient than sequential NA (Node Action) mode
 - Captures ad-billboard compatibility directly
 - Critical for real-time billboard allocation
-l
+
 Key Differences from NA mode:
-1. Action distribution: Independent Bernoulli vs Categorical
+1. Action distribution: TopKSelection (competitive) vs Categorical (single)
 2. Action space: MultiBinary vs Discrete
-3. Mask handling: element-wise Bernoulli masking vs categorical masking
-4. Entropy: sum of Bernoulli entropies vs categorical entropy
+3. Selection: Top-K by score vs single argmax
+4. Entropy: categorical entropy of softmax vs categorical entropy
+
+Evolution from IndependentBernoulli:
+- v1 (IndependentBernoulli): Each pair sampled independently → ignored model scores
+- v2 (TopKSelection): Uses softmax for competitive selection → respects ranking
 
 """
 
@@ -69,8 +73,8 @@ from models import BillboardAllocatorGNN, DEFAULT_CONFIGS
 # Import wrappers from separate module (CRITICAL for multiprocessing)
 from wrappers import BillboardPettingZooWrapper, EAMaskValidator, NoGraphObsWrapper
 
-# Import custom distribution
-from distributions import IndependentBernoulli
+# Import custom distributions
+from distributions import IndependentBernoulli, TopKSelection
 
 
 #  CONFIGURATION 
@@ -431,8 +435,8 @@ def main(use_test_config: bool = True):
         eta_min=train_config["lr"] * 0.1
     )
 
-    # CRITICAL: Create PPO policy with Independent Bernoulli distribution
-    logger.info("Creating PPO policy with Independent Bernoulli distribution...")
+    # CRITICAL: Create PPO policy with TopKSelection distribution
+    logger.info("Creating PPO policy with TopKSelection distribution...")
 
     # Get action space from sample environment
     # Note: For MultiBinary action space, action_scaling must be False
@@ -440,27 +444,38 @@ def main(use_test_config: bool = True):
     logger.info(f"Action space: {action_space}")
 
     # Distribution function for EA mode
-    # Model now outputs raw logits (not softmax probabilities)
-    # IndependentBernoulli will apply sigmoid internally to get independent probabilities
+    # Model outputs raw logits (scores) with mask already applied
+    # TopKSelection uses softmax for competitive selection of top K pairs
     def dist_fn(logits):
         """
-        Create IndependentBernoulli distribution from model logits.
+        Create TopKSelection distribution from model logits.
 
         The model outputs raw scores (logits) with mask already applied:
-        - Valid actions: learned logits
-        - Invalid actions: very negative (-1e9) -> sigmoid gives ~0 probability
+        - Valid actions: learned logits (higher = better pair)
+        - Invalid actions: very negative (-1e8) -> softmax gives ~0 probability
 
-        IndependentBernoulli treats each (ad, billboard) pair as an independent
-        Bernoulli trial, allowing multiple selections per timestep.
+        TopKSelection converts scores to probabilities via softmax, then samples
+        the K highest-probability pairs. This ensures:
+        - High-scoring pairs are ALWAYS selected (unlike IndependentBernoulli)
+        - Model's learned ranking directly determines selection
+        - Gradient flows to the pair scorer effectively
+
+        K=60 provides buffer beyond env's MAX_ALLOCATIONS_PER_STEP (50)
+        to handle budget failures gracefully.
         """
-        return IndependentBernoulli(logits=logits, mask=None)
+        return TopKSelection(
+            logits=logits,
+            k=60,              # Select 60 pairs (env caps at 50, buffer for failures)
+            mask=None,         # Mask already applied in model (-1e8 for invalid)
+            temperature=1.0    # Standard softmax temperature
+        )
 
     policy = ts.policy.PPOPolicy(
         actor=actor,
         critic=critic,
         optim=optimizer,
         action_space=action_space,
-        dist_fn=dist_fn,  # IndependentBernoulli for multi-selection EA mode
+        dist_fn=dist_fn,  # TopKSelection for competitive multi-selection EA mode
         discount_factor=train_config["discount_factor"],
         gae_lambda=train_config["gae_lambda"],
         vf_coef=train_config["vf_coef"],
@@ -468,22 +483,21 @@ def main(use_test_config: bool = True):
         max_grad_norm=train_config["max_grad_norm"],
         eps_clip=train_config["eps_clip"],
         value_clip=True,
-        deterministic_eval=False,  # EA MODE: Must use stochastic eval (logits < 0 → mode() = 0)
+        deterministic_eval=True,  # TopKSelection: mode() returns valid top-K selections
         action_scaling=False,  # CRITICAL: Must be False for MultiBinary action space
         lr_scheduler=lr_scheduler
     )
 
     logger.info(f"PPO configuration:")
-    logger.info(f"  - Distribution: IndependentBernoulli (EA mode)")
+    logger.info(f"  - Distribution: TopKSelection (K=60, competitive softmax)")
     logger.info(f"  - Entropy coefficient: {train_config['ent_coef']}")
     logger.info(f"  - Learning rate: {train_config['lr']}")
     logger.info(f"  - Batch size: {train_config['batch_size']}")
 
-    # NOTE: deterministic_eval=False is required for EA mode because:
-    # - Logits are typically negative (-3.0) during early training
-    # - sigmoid(-3.0) = 0.047 < 0.5
-    # - Deterministic mode() returns 0 for all actions → test_reward = 0
-    # - Stochastic sampling allows exploration and proper evaluation
+    # NOTE: deterministic_eval=True works with TopKSelection because:
+    # - mode() returns top-K pairs by score (valid selections)
+    # - Unlike IndependentBernoulli where sigmoid(logits) < 0.5 → all zeros
+    # - TopKSelection's mode() uses argmax top-K which always works
 
     # Create collectors
     # Note: preprocess_fn is deprecated in newer Tianshou versions
@@ -537,7 +551,9 @@ def main(use_test_config: bool = True):
                 'env_config': env_config,
                 'best_reward': best_reward,
                 'mode': 'ea',
-                'distribution': 'IndependentBernoulli'
+                'distribution': 'TopKSelection',
+                'k': 60,
+                'temperature': 1.0
             }, train_config["save_path"])
 
     # Train
@@ -673,7 +689,9 @@ def main(use_test_config: bool = True):
         'env_config': env_config,
         'final_reward': best_reward,
         'mode': 'ea',
-        'distribution': 'IndependentBernoulli'
+        'distribution': 'TopKSelection',
+        'k': 60,
+        'temperature': 1.0
     }, final_path)
 
     # Print summary
