@@ -358,14 +358,21 @@ class TopKSelection(Distribution):
 
         # Compute selection probabilities via temperature-scaled softmax
         # Handle all-masked case: if all -inf, softmax gives NaN → replace with uniform
-        self._probs = F.softmax(masked_logits / temperature, dim=-1)
+        probs = F.softmax(masked_logits / temperature, dim=-1)
 
         # Handle NaN from all-masked batches (softmax of all -inf)
-        nan_rows = torch.isnan(self._probs).any(dim=-1)
+        # IMPORTANT: Use torch.where() to avoid in-place modification (breaks gradients)
+        nan_rows = torch.isnan(probs).any(dim=-1)
         if nan_rows.any():
             # For all-masked rows, use uniform distribution (will select nothing valid)
-            uniform = torch.ones_like(self._probs[0]) / self._action_dim
-            self._probs[nan_rows] = uniform
+            uniform = torch.ones(self._action_dim, device=logits.device, dtype=logits.dtype) / self._action_dim
+            # Expand for broadcasting: nan_rows (batch,) → (batch, 1), uniform (dim,) → (1, dim)
+            probs = torch.where(
+                nan_rows.unsqueeze(-1).expand_as(probs),
+                uniform.unsqueeze(0).expand_as(probs),
+                probs
+            )
+        self._probs = probs
 
         # Store shapes for Distribution base class
         self._batch_shape = logits.shape[:-1]
