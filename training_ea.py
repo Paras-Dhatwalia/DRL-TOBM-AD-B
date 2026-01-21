@@ -460,12 +460,14 @@ def main(use_test_config: bool = True):
         - Model's learned ranking directly determines selection
         - Gradient flows to the pair scorer effectively
 
-        K=60 provides buffer beyond env's MAX_ALLOCATIONS_PER_STEP (50)
-        to handle budget failures gracefully.
+        K=300 provides large candidate pool for env's influence-based refinement:
+        - Model pre-filters 8880 → 300 pairs (removes obviously bad pairs)
+        - Environment sorts by expected_influence, picks best ~50
+        - Gradient concentrated on top 300 (vs diluted across 8880 in Bernoulli)
         """
         return TopKSelection(
             logits=logits,
-            k=60,              # Select 60 pairs (env caps at 50, buffer for failures)
+            k=300,             # Large pool: model pre-filters, env refines by influence
             mask=None,         # Mask already applied in model (-1e8 for invalid)
             temperature=1.0    # Standard softmax temperature
         )
@@ -489,7 +491,7 @@ def main(use_test_config: bool = True):
     )
 
     logger.info(f"PPO configuration:")
-    logger.info(f"  - Distribution: TopKSelection (K=60, competitive softmax)")
+    logger.info(f"  - Distribution: TopKSelection (K=300, competitive softmax)")
     logger.info(f"  - Entropy coefficient: {train_config['ent_coef']}")
     logger.info(f"  - Learning rate: {train_config['lr']}")
     logger.info(f"  - Batch size: {train_config['batch_size']}")
@@ -552,7 +554,7 @@ def main(use_test_config: bool = True):
                 'best_reward': best_reward,
                 'mode': 'ea',
                 'distribution': 'TopKSelection',
-                'k': 60,
+                'k': 300,
                 'temperature': 1.0
             }, train_config["save_path"])
 
@@ -690,7 +692,7 @@ def main(use_test_config: bool = True):
         'final_reward': best_reward,
         'mode': 'ea',
         'distribution': 'TopKSelection',
-        'k': 60,
+        'k': 300,
         'temperature': 1.0
     }, final_path)
 
