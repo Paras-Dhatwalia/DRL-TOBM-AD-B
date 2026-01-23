@@ -505,7 +505,7 @@ class OptimizedBillboardEnv(gym.Env):
             Expected number of users that will see this billboard over the slot duration
         """
         slot_influence = self._precompute_slot_influence(self.current_step)
-        return float(slot_influence[bb_idx, duration - 1])  # duration is 1-indexed
+        return float(slot_influence[bb_idx, duration - 1])  
 
     def _create_billboard_graph(self) -> np.ndarray:
         """Create adjacency matrix for billboards using vectorized distance calculation."""

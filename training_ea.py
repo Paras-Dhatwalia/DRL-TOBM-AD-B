@@ -166,7 +166,7 @@ def get_full_config():
             "discount_factor": 0.995,  # 0.99 → 0.995: Better credit for longer episodes
             "gae_lambda": 0.95,
             "vf_coef": 0.5,
-            "ent_coef": 0.01,  # EA: 100x higher to force exploration (was 0.0001)
+            "ent_coef": 0.02,  # EA: prevent overconfidence, spread probability across viable pairs
             "max_grad_norm": 0.5,
             "eps_clip": 0.2,
             "batch_size": 64,  # Reduced from 128 for EA mode
@@ -485,7 +485,7 @@ def main(use_test_config: bool = True):
         max_grad_norm=train_config["max_grad_norm"],
         eps_clip=train_config["eps_clip"],
         value_clip=True,
-        deterministic_eval=True,  # TopKSelection: mode() returns valid top-K selections
+        deterministic_eval=False,  # Stochastic: allows exploration that leads to completions
         action_scaling=False,  # CRITICAL: Must be False for MultiBinary action space
         lr_scheduler=lr_scheduler
     )
@@ -496,10 +496,11 @@ def main(use_test_config: bool = True):
     logger.info(f"  - Learning rate: {train_config['lr']}")
     logger.info(f"  - Batch size: {train_config['batch_size']}")
 
-    # NOTE: deterministic_eval=True works with TopKSelection because:
-    # - mode() returns top-K pairs by score (valid selections)
-    # - Unlike IndependentBernoulli where sigmoid(logits) < 0.5 → all zeros
-    # - TopKSelection's mode() uses argmax top-K which always works
+    # NOTE: deterministic_eval=False for TopKSelection because:
+    # - Training achieves 1500+ reward via stochastic exploration (ad completions)
+    # - Deterministic mode() always picks same top-K, including overconfident bad pairs
+    # - Stochastic sampling allows the exploration that leads to completions
+    # - Test reward should approach training reward with this setting
 
     # Create collectors
     # Note: preprocess_fn is deprecated in newer Tianshou versions
