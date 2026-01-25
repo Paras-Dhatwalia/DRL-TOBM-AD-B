@@ -26,8 +26,8 @@ class EnvConfig:
     new_ads_per_step_range: Tuple[int, int] = (0, 3)  # Increased from (0,2) for more ad flow
     tardiness_cost: float = 50.0
     max_events: int = 1440  # Full day (1 minute per step, 1440 minutes = 24 hours)
-    max_active_ads: int = 20
-    ad_ttl: int = 600  # Ad time-to-live in timesteps (default: 600 = 10 hours)
+    max_active_ads: int = 8  # Reduced from 20 to allow concentration (50 allocs / 8 ads = 6+ billboards each)
+    ad_ttl: int = 720  # Ad time-to-live in timesteps (increased from 600 for more accumulation time)
     graph_connection_distance: float = 5000.0
     cache_ttl: int = 1  # Cache TTL in steps
     enable_profiling: bool = False
@@ -1032,8 +1032,9 @@ class OptimizedBillboardEnv(gym.Env):
         self.ads = [ad for ad in self.ads if ad.state == 0]
 
         # HYSTERESIS: Only spawn when below low threshold
-        LOW_THRESHOLD = 15
-        HIGH_THRESHOLD = self.config.max_active_ads  # 20
+        # LOW_THRESHOLD is 75% of max to ensure continuous ad flow
+        LOW_THRESHOLD = max(1, int(self.config.max_active_ads * 0.75))  # 6 when max=8
+        HIGH_THRESHOLD = self.config.max_active_ads  # 8
 
         active_count = len(self.ads)
         if active_count >= LOW_THRESHOLD:

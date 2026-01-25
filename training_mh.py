@@ -62,7 +62,7 @@ def get_test_config():
             "trajectory_csv": r"path/to/folder",
             "action_mode": "mh",
             "max_events": 1440,
-            "max_active_ads": 20,
+            "max_active_ads": 8,  # Reduced from 20: allows concentration
             "influence_radius": 100.0,
             "tardiness_cost": 50.0,
         },
@@ -98,7 +98,7 @@ def get_full_config():
             "trajectory_csv": r"C:\Coding Files\DRL-TOBM-AD-B\TJ_NYC.csv",
             "action_mode": "mh",
             "max_events": 1440,
-            "max_active_ads": 20,
+            "max_active_ads": 8,  # Reduced from 20: allows concentration
             "influence_radius": 100.0,
             "tardiness_cost": 50.0,
         },

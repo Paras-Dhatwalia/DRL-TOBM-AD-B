@@ -154,7 +154,7 @@ def get_full_config():
             "trajectory_csv": r"path\to\folder",
             "action_mode": "ea",
             "max_events": 1440,
-            "max_active_ads": 20,  # Full action space
+            "max_active_ads": 8,  # Reduced from 20: allows concentration (50 allocs / 8 ads = 6+ billboards each)
             "influence_radius": 100.0,
             "tardiness_cost": 50.0,
         },
