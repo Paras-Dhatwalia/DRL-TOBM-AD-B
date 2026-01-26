@@ -646,15 +646,14 @@ class OptimizedBillboardEnv(gym.Env):
         Get action mask based on current action mode with budget validation.
 
         OPTIMIZED: Uses NumPy vectorization instead of nested Python loops.
-        Now includes INFLUENCE MASKING: billboards with 0 expected influence are masked out.
         """
         # Precompute billboard properties once (used by all modes)
         free_mask = np.array([b.is_free() for b in self.billboards], dtype=bool)
         costs = np.array([b.b_cost for b in self.billboards], dtype=np.float32)
 
         # INFLUENCE MASKING: Mask out billboards with zero influence at current time
-        # This prevents wasting allocations/budget on "dead" billboards with no traffic
-        current_influence = self.get_expected_slot_influence()  # Shape: (n_nodes,), normalized [0,1]
+        # This prevents wasting allocations on "dead" billboards with no traffic
+        current_influence = self.get_expected_slot_influence()  # Shape: (n_nodes,), uses max duration
         has_influence = current_influence > 0.001  # Small threshold for float precision
 
         # Combine: billboard must be free AND have current traffic
@@ -1173,8 +1172,9 @@ class OptimizedBillboardEnv(gym.Env):
                     if len(selected_indices) > 0:
                         # PERFORMANCE: Compute once and reuse
                         cached_slot_influence = self._precompute_slot_influence(self.current_step)
-                        # Normalized scores for sorting (use avg duration col 2)
-                        influence_scores = np.clip(cached_slot_influence[:, 2] / 100.0, 0.0, 1.0)
+                        # Normalized scores for sorting (use max duration for consistency with masking)
+                        max_dur_idx = self.config.slot_duration_range[1] - 1  # 0-indexed
+                        influence_scores = np.clip(cached_slot_influence[:, max_dur_idx] / 100.0, 0.0, 1.0)
 
                         # Score each selected pair by billboard's expected influence
                         pair_scores = []
