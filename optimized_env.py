@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class EnvConfig:
     """Environment configuration parameters"""
     influence_radius_meters: float = 100.0
-    slot_duration_range: Tuple[int, int] = (1, 5)
+    slot_duration_range: Tuple[int, int] = (3, 7)  # Increased from (1,5): longer assignments capture more influence
     new_ads_per_step_range: Tuple[int, int] = (0, 3)  # Increased from (0,2) for more ad flow
     tardiness_cost: float = 50.0
     max_events: int = 1440  # Full day (1 minute per step, 1440 minutes = 24 hours)
@@ -1161,18 +1161,17 @@ class OptimizedBillboardEnv(gym.Env):
                     # CRITICAL FIX: Track used billboards to prevent multi-assign in same step
                     used_billboards = set()
 
-                    # TOP-K ALLOCATION: Prioritize selected pairs by expected influence
-                    # This ensures the agent learns that high-quality pairs matter,
-                    # not just random ones from stochastic sampling
-                    MAX_ALLOCATIONS_PER_STEP = 50
+                    # ALLOCATION: Process all selected pairs (no limit since influence masking
+                    # already filters out zero-influence billboards - all allocations are productive)
+                    # Prioritize by expected influence for best results
 
                     # Get all selected pair indices
                     selected_indices = np.where(action == 1)[0]
 
                     if len(selected_indices) > 0:
-                        # PERFORMANCE: Compute once and reuse (avoids 50x recomputation)
+                        # PERFORMANCE: Compute once and reuse
                         cached_slot_influence = self._precompute_slot_influence(self.current_step)
-                        # Normalized scores for Top-K sorting (use avg duration col 2)
+                        # Normalized scores for sorting (use avg duration col 2)
                         influence_scores = np.clip(cached_slot_influence[:, 2] / 100.0, 0.0, 1.0)
 
                         # Score each selected pair by billboard's expected influence
@@ -1185,11 +1184,8 @@ class OptimizedBillboardEnv(gym.Env):
                         # Sort by influence score descending (best billboards first)
                         pair_scores.sort(key=lambda x: x[1], reverse=True)
 
-                        # Process top-K pairs by priority
+                        # Process ALL valid pairs (no MAX limit - influence mask ensures quality)
                         for pair_idx, _ in pair_scores:
-                            if self.allocations_this_step >= MAX_ALLOCATIONS_PER_STEP:
-                                break
-
                             ad_idx = pair_idx // self.n_nodes
                             bb_idx = pair_idx % self.n_nodes
 
