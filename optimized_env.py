@@ -477,16 +477,18 @@ class OptimizedBillboardEnv(gym.Env):
         return slot_influence
 
     def get_expected_slot_influence(self) -> np.ndarray:
-        """Get expected influence for average slot duration (3 steps).
+        """Get expected influence for max slot duration (used for masking).
 
         Returns:
             expected_influence: (n_billboards,) array normalized to [0, 1]
         """
         slot_influence = self._precompute_slot_influence(self.current_step)
 
-        # Use average duration (3 steps) as representative
-        avg_duration_idx = 2  # 0-indexed, so 3rd column (duration=3)
-        raw_influence = slot_influence[:, avg_duration_idx]
+        # Use MAX duration for masking (conservative - don't mask billboards with delayed traffic)
+        # If a billboard has 0 influence over the full slot duration, it's truly dead
+        max_duration = self.config.slot_duration_range[1]  # 7 for (3,7)
+        max_duration_idx = max_duration - 1  # 0-indexed: duration 7 → index 6
+        raw_influence = slot_influence[:, max_duration_idx]
 
         # Normalize: typical range is 0-50 users, cap at 100
         MAX_USERS = 100.0
