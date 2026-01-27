@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class EnvConfig:
     """Environment configuration parameters"""
     influence_radius_meters: float = 100.0
-    slot_duration_range: Tuple[int, int] = (3, 7)  # Increased from (1,5): longer assignments capture more influence
+    slot_duration_range: Tuple[int, int] = (4, 5)  # Moderate duration with low variance
     new_ads_per_step_range: Tuple[int, int] = (0, 3)  # Increased from (0,2) for more ad flow
     tardiness_cost: float = 50.0
     max_events: int = 1440  # Full day (1 minute per step, 1440 minutes = 24 hours)
@@ -427,7 +427,7 @@ class OptimizedBillboardEnv(gym.Env):
     def _precompute_slot_influence(self, start_step: int) -> np.ndarray:
         """Compute expected influence for each billboard slot starting at current step.
 
-        For each billboard and each possible duration (1-5), compute how many
+        For each billboard and each possible duration (1 to max_duration), compute how many
         users will pass within influence_radius during that slot.
 
         This uses pre-loaded trajectory data to predict future influence,
@@ -435,13 +435,13 @@ class OptimizedBillboardEnv(gym.Env):
 
         Returns:
             slot_influence: (n_billboards, max_duration) array
-            slot_influence[b, d] = expected users within influence_radius of billboard over the next timesteps
+            slot_influence[b, d] = expected users within influence_radius of billboard over the next d+1 timesteps
         """
         # PER-STEP CACHE: Avoid recomputing multiple times per step
         if hasattr(self, '_slot_influence_cache_step') and self._slot_influence_cache_step == start_step:
             return self._slot_influence_cache_data
 
-        max_duration = self.config.slot_duration_range[1]  # 5
+        max_duration = self.config.slot_duration_range[1]  # From config
         slot_influence = np.zeros((self.n_nodes, max_duration), dtype=np.float32)
 
         for d in range(max_duration):
@@ -486,8 +486,8 @@ class OptimizedBillboardEnv(gym.Env):
 
         # Use MAX duration for masking (conservative - don't mask billboards with delayed traffic)
         # If a billboard has 0 influence over the full slot duration, it's truly dead
-        max_duration = self.config.slot_duration_range[1]  # 7 for (3,7)
-        max_duration_idx = max_duration - 1  # 0-indexed: duration 7 → index 6
+        max_duration = self.config.slot_duration_range[1]  # From config (e.g., 5 for (4,5))
+        max_duration_idx = max_duration - 1  # 0-indexed
         raw_influence = slot_influence[:, max_duration_idx]
 
         # Normalize: typical range is 0-50 users, cap at 100
