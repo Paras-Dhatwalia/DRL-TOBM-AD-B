@@ -369,11 +369,7 @@ class MHTestMetrics:
             advertiser_csv=env_config["advertiser_csv"],
             trajectory_csv=env_config["trajectory_csv"],
             action_mode="mh",
-            config=EnvConfig(
-                max_events=env_config.get("max_events", 1000),
-                influence_radius_meters=env_config.get("influence_radius", 500.0),
-                tardiness_cost=env_config.get("tardiness_cost", 50.0)
-            )
+            config=EnvConfig()
         )
         wrapped_env = MHWrapper(env)
 
@@ -591,9 +587,6 @@ class MHTestMetrics:
             "billboard_csv": args.billboards,
             "advertiser_csv": args.advertisers,
             "trajectory_csv": args.trajectories,
-            "max_events": 1000,
-            "influence_radius": 500.0,
-            "tardiness_cost": 50.0
         }
 
         # Run comprehensive MH testing

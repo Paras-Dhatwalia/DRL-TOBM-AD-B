@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class EnvConfig:
     """Environment configuration parameters"""
-    influence_radius_meters: float = 300.0
+    influence_radius_meters: float = 100.0
     slot_duration_range: Tuple[int, int] = (2, 3)
     new_ads_per_step_range: Tuple[int, int] = (0, 3)  # Increased from (0,2) for more ad flow
     tardiness_cost: float = 50.0

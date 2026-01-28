@@ -53,71 +53,34 @@ from tianshou.trainer import OnpolicyTrainer
 from optimized_env import OptimizedBillboardEnv, EnvConfig
 from models import BillboardAllocatorGNN
 
-def get_test_config():
-    """Test configuration for quick debugging."""
+def get_config():
+    """Training configuration for MH mode.
+
+    Environment parameters use EnvConfig defaults from optimized_env.py.
+    """
     return {
         "env": {
             "billboard_csv": r"path/to/folder",
             "advertiser_csv": r"path/to/folder",
             "trajectory_csv": r"path/to/folder",
             "action_mode": "mh",
-            "max_events": 1440,
-            "max_active_ads": 8,  # Reduced from 20: allows concentration
-            "influence_radius": 100.0,
-            "tardiness_cost": 50.0,
-        },
-        "train": {
-            "hidden_dim": 64,
-            "n_graph_layers": 2,
-            "lr": 1e-3,
-            "discount_factor": 0.99,
-            "gae_lambda": 0.95,
-            "vf_coef": 0.5,
-            "ent_coef": 0.01,
-            "max_grad_norm": 0.5,
-            "eps_clip": 0.2,
-            "batch_size": 16,
-            "nr_envs": 1,
-            "max_epoch": 3,
-            "step_per_collect": 64,
-            "step_per_epoch": 200,
-            "repeat_per_collect": 4,
-            "buffer_size": 5000,
-            "save_path": "models/test_ppo_billboard_mh.pt",
-            "log_path": "logs/test_ppo_billboard_mh",
-        }
-    }
-
-
-def get_full_config():
-    """Full configuration for production training."""
-    return {
-        "env": {
-            "billboard_csv": r"C:\Coding Files\DRL-TOBM-AD-B\BB_NYC.csv",
-            "advertiser_csv": r"C:\Coding Files\DRL-TOBM-AD-B\Advertiser_100.csv",
-            "trajectory_csv": r"C:\Coding Files\DRL-TOBM-AD-B\TJ_NYC.csv",
-            "action_mode": "mh",
-            "max_events": 1440,
-            "max_active_ads": 8,  # Reduced from 20: allows concentration
-            "influence_radius": 100.0,
-            "tardiness_cost": 50.0,
         },
         "train": {
             "hidden_dim": 160,
             "n_graph_layers": 4,
             "lr": 3e-4,
-            "discount_factor": 0.995,     # Synced with EA
+            "discount_factor": 0.995,
             "gae_lambda": 0.95,
             "vf_coef": 0.5,
-            "ent_coef": 0.01,             # Synced with EA
+            "ent_coef": 0.01,
             "max_grad_norm": 0.5,
             "eps_clip": 0.2,
             "batch_size": 64,
             "nr_envs": 4,
-            "max_epoch": 100,             # Synced with EA
-            "step_per_collect": 5760,     # Synced with EA
-            "step_per_epoch": 14400,      # Synced with EA
-            "repeat_per_collect": 15,     # Synced with EA
+            "max_epoch": 100,
+            "step_per_collect": 5760,
+            "step_per_epoch": 14400,
+            "repeat_per_collect": 15,
             "buffer_size": 30000,
             "save_path": "models/ppo_billboard_mh.pt",
             "log_path": "logs/ppo_billboard_mh",
@@ -286,11 +249,7 @@ def get_env():
         advertiser_csv=env_config["advertiser_csv"],
         trajectory_csv=env_config["trajectory_csv"],
         action_mode=env_config["action_mode"],
-        config=EnvConfig(
-            max_events=env_config["max_events"],
-            influence_radius_meters=env_config["influence_radius"],
-            tardiness_cost=env_config["tardiness_cost"]
-        )
+        config=EnvConfig()
     )
     return NoGraphObsWrapper(env)
 
@@ -427,16 +386,11 @@ def create_multi_head_dist_fn(max_ads: int):
     return multi_head_dist_fn
 
 
-def main(use_test_config: bool = False):
-    """Main training function for MH mode.
-
-    Args:
-        use_test_config: If True, use test config. If False, use full config.
-    """
+def main():
+    """Main training function for MH mode."""
     global env_config, train_config
 
-    # Select configuration
-    config = get_test_config() if use_test_config else get_full_config()
+    config = get_config()
     env_config = config["env"]
     train_config = config["train"]
 
@@ -445,7 +399,6 @@ def main(use_test_config: bool = False):
     logger.info("="*60)
     logger.info("MH MODE TRAINING - Billboard Allocation")
     logger.info("="*60)
-    logger.info(f"Configuration: {'TEST (correctness validation)' if use_test_config else 'FULL (production)'}")
     logger.info(f"Device: {device}")
 
     os.makedirs(os.path.dirname(train_config["save_path"]), exist_ok=True)
@@ -679,6 +632,5 @@ def main(use_test_config: bool = False):
 
 
 if __name__ == "__main__":
-    # Set to True for quick testing, False for full production training
-    main(use_test_config=False)
+    main()
 

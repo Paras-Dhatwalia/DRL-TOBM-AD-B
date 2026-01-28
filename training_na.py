@@ -215,9 +215,6 @@ env_config = {
     "advertiser_csv": r"path/to/folder",
     "trajectory_csv": r"path/to/folder",
     "action_mode": "na",
-    "max_events": 1440,
-    "influence_radius": 100.0,
-    "tardiness_cost": 50.0
 }
 
 train_config = {
@@ -249,11 +246,7 @@ def get_env():
         advertiser_csv=env_config["advertiser_csv"],
         trajectory_csv=env_config["trajectory_csv"],
         action_mode=env_config["action_mode"],
-        config=EnvConfig(
-            max_events=env_config["max_events"],
-            influence_radius_meters=env_config["influence_radius"],
-            tardiness_cost=env_config["tardiness_cost"]
-        )
+        config=EnvConfig()
     )
     return NoGraphObsWrapper(env)
 
