@@ -79,105 +79,43 @@ from distributions import IndependentBernoulli, TopKSelection
 
 #  CONFIGURATION 
 
-def get_test_config():
+def get_config():
     """
-    Small configuration for correctness validation.
+    Training configuration for EA mode.
 
-    This to:
-    - Verify code runs without errors
-    - Check gradient flow
-    - Validate mask handling
-    - Debug model architecture
-
-    NOT for actual experiments!
+    Environment parameters (influence_radius, slot_duration, etc.) are defined
+    in EnvConfig defaults in optimized_env.py. Only data paths and non-default
+    overrides belong here.
     """
     return {
-        # Environment config
+        # Environment config - paths and action mode only
+        # All other env params use EnvConfig defaults from optimized_env.py
         "env": {
             "billboard_csv": r"path\to\folder",
             "advertiser_csv": r"path\to\folder",
             "trajectory_csv": r"path\to\folder",
             "action_mode": "ea",
-            "max_events": 50,  # Very small for quick testing
-            "max_active_ads": 3,  # Reduced action space
-            "influence_radius": 100.0,
-            "tardiness_cost": 50.0,
         },
         # Training config
         "train": {
-            "hidden_dim": 64,  # Small model
-            "n_graph_layers": 2,
-            "lr": 1e-3,  # Higher LR for faster convergence in testing
-            "discount_factor": 0.99,
+            "hidden_dim": 128,
+            "n_graph_layers": 3,
+            "lr": 3e-4,
+            "discount_factor": 0.995,
             "gae_lambda": 0.95,
             "vf_coef": 0.5,
-            "ent_coef": 0.001,  # EA: reduced for 8880-dim action space (was 0.01)
+            "ent_coef": 0.02,
             "max_grad_norm": 0.5,
             "eps_clip": 0.2,
-            "batch_size": 16,  # Very small
-            "nr_envs": 1,  # Single env for debugging
-            "max_epoch": 3,  # Just test a few epochs
-            "step_per_collect": 64,  # Small
-            "step_per_epoch": 200,  # Small
-            "repeat_per_collect": 4,
-            "save_path": "models/test_ppo_billboard_ea.pt",
-            "log_path": "logs/test_ppo_billboard_ea",
-            "use_validation": True,  # Enable EA mask validation
-        }
-    }
-
-
-def get_full_config():
-    """
-    Full configuration for actual experiments.
-
-    This for:
-    - Production training runs
-    - Publishable results
-    - Hyperparameter tuning
-
-    EA-specific tuning:
-    - Lower entropy coefficient (EA has high dimensionality)
-    - Smaller learning rate (Bernoulli PPO is noisier)
-    - Moderate batch size (helps with sparse rewards)
-
-    Memory-optimized for 16GB GPU:
-    - Smaller batch size (32) for EA's large action space
-    - Fewer parallel envs (4) to reduce buffer memory
-    - Reduced hidden_dim (128) for efficiency
-    """
-    return {
-        # Environment config
-        "env": {
-            "billboard_csv": r"path\to\folder",
-            "advertiser_csv": r"path\to\folder",
-            "trajectory_csv": r"path\to\folder",
-            "action_mode": "ea",
-            "max_events": 1440,
-            "max_active_ads": 8,  # Reduced from 20: allows concentration (50 allocs / 8 ads = 6+ billboards each)
-            "influence_radius": 100.0,
-            "tardiness_cost": 50.0,
-        },
-        # Training config
-        "train": {
-            "hidden_dim": 128,  # Full capacity - chunked processing prevents OOM
-            "n_graph_layers": 3,  # Full capacity - chunked processing handles large batches
-            "lr": 3e-4,  # EA: 3x higher to capture sparse rewards (was 1e-4)
-            "discount_factor": 0.995,  # 0.99 → 0.995: Better credit for longer episodes
-            "gae_lambda": 0.95,
-            "vf_coef": 0.5,
-            "ent_coef": 0.02,  # EA: prevent overconfidence, spread probability across viable pairs
-            "max_grad_norm": 0.5,
-            "eps_clip": 0.2,
-            "batch_size": 64,  # Reduced from 128 for EA mode
-            "nr_envs": 4,  # Reduced from 8 for memory
+            "batch_size": 64,
+            "nr_envs": 4,
             "max_epoch": 100,
-            "step_per_collect": 5760,  # 4 episodes x 1440 steps (full day)
+            "step_per_collect": 5760,  # 4 episodes x 1440 steps
             "step_per_epoch": 14400,  # 10 episodes worth per epoch
             "repeat_per_collect": 15,
             "save_path": "models/ppo_billboard_ea.pt",
             "log_path": "logs/ppo_billboard_ea",
-            "use_validation": False,  # Disable validation in production for speed
+            "use_validation": False,
         }
     }
 
@@ -195,18 +133,13 @@ def create_single_env(env_config: Dict[str, Any], use_validation: bool = False):
     Returns:
         Wrapped environment ready for Tianshou
     """
-    # Create base environment
+    # Create base environment using EnvConfig defaults from optimized_env.py
     base_env = OptimizedBillboardEnv(
         billboard_csv=env_config["billboard_csv"],
         advertiser_csv=env_config["advertiser_csv"],
         trajectory_csv=env_config["trajectory_csv"],
         action_mode=env_config["action_mode"],
-        config=EnvConfig(
-            max_events=env_config["max_events"],
-            max_active_ads=env_config.get("max_active_ads", 20),
-            influence_radius_meters=env_config["influence_radius"],
-            tardiness_cost=env_config["tardiness_cost"]
-        )
+        config=EnvConfig()
     )
 
     # Wrap for PettingZoo -> Gymnasium conversion
@@ -274,31 +207,30 @@ def create_vectorized_envs(env_config: Dict[str, Any], n_envs: int, use_validati
 
 #  MAIN TRAINING
 
-def main(use_test_config: bool = True):
+def main():
     """
     Main training function for EA mode.
-
-    Args:
-        use_test_config: If True, use test config. If False, use full config.
 
     Returns:
         Training result dictionary
     """
-    # Select configuration
-    config = get_test_config() if use_test_config else get_full_config()
+    config = get_config()
     env_config = config["env"]
     train_config = config["train"]
+
+    env_defaults = EnvConfig()
 
     # Log configuration
     logger.info("="*60)
     logger.info("EA MODE TRAINING - Billboard Allocation")
     logger.info("="*60)
-    logger.info(f"Configuration: {'TEST (correctness validation)' if use_test_config else 'FULL (production)'}")
     logger.info(f"Device: {torch.device('cuda' if torch.cuda.is_available() else 'cpu')}")
     logger.info(f"OS: {platform.system()}")
     logger.info(f"Action mode: {env_config['action_mode']}")
-    logger.info(f"Max events: {env_config['max_events']}")
-    logger.info(f"Max active ads: {env_config.get('max_active_ads', 20)}")
+    logger.info(f"Max events: {env_defaults.max_events}")
+    logger.info(f"Max active ads: {env_defaults.max_active_ads}")
+    logger.info(f"Influence radius: {env_defaults.influence_radius_meters}m")
+    logger.info(f"Slot duration: {env_defaults.slot_duration_range}")
     logger.info("="*60)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -712,15 +644,4 @@ def main(use_test_config: bool = True):
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description='Train EA mode PPO agent')
-    parser.add_argument('--test', action='store_true',
-                       help='Use test config instead of full config (for quick debugging)')
-    args = parser.parse_args()
-
-    # Run training
-    use_test = args.test
-    result = main(use_test_config=use_test)
-
-
+    result = main()
