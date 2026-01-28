@@ -673,7 +673,10 @@ class OptimizedBillboardEnv(gym.Env):
                 mask = free_mask.astype(np.int8)
 
             if mask.sum() == 0:
-                logger.warning("No affordable free billboards available for 'na' mode")
+                n_free = free_mask.sum()
+                n_has_inf = has_influence.sum()
+                logger.debug(f"Zero valid BBs for 'na' mode: "
+                             f"{n_free} free+influenced, {n_has_inf} with influence")
             return mask
 
         elif self.action_mode == 'ea':
@@ -682,7 +685,7 @@ class OptimizedBillboardEnv(gym.Env):
             n_active = min(len(active_ads), self.config.max_active_ads)
 
             if n_active == 0:
-                logger.warning("No affordable ad-billboard pairs for 'ea' mode")
+                logger.warning("No active ads for 'ea' mode")
                 return np.zeros(self.config.max_active_ads * self.n_nodes, dtype=np.int8)
 
             # Vectorized budget check: (n_active,) budgets vs (n_nodes,) total_costs
@@ -699,7 +702,12 @@ class OptimizedBillboardEnv(gym.Env):
 
             mask = full_mask.flatten()
             if mask.sum() == 0:
-                logger.warning("No affordable ad-billboard pairs for 'ea' mode")
+                n_free = free_mask.sum()
+                n_has_inf = has_influence.sum()
+                n_afford = (affordable.any(axis=0)).sum() if n_active > 0 else 0
+                logger.debug(f"Zero valid pairs for 'ea' mode: "
+                             f"{n_active} active ads, {n_free} free+influenced BBs, "
+                             f"{n_has_inf} with influence, {n_afford} affordable")
             return mask
 
         elif self.action_mode == 'mh':
@@ -708,7 +716,7 @@ class OptimizedBillboardEnv(gym.Env):
             n_active = min(len(active_ads), self.config.max_active_ads)
 
             if n_active == 0:
-                logger.warning("No affordable ad-billboard pairs for 'mh' mode")
+                logger.warning("No active ads for 'mh' mode")
                 return np.zeros((self.config.max_active_ads, self.n_nodes), dtype=np.int8)
 
             # Vectorized budget check (cost × max_duration)
@@ -721,7 +729,12 @@ class OptimizedBillboardEnv(gym.Env):
             pair_mask[:n_active, :] = valid_pairs.astype(np.int8)
 
             if pair_mask.sum() == 0:
-                logger.warning("No affordable ad-billboard pairs for 'mh' mode")
+                n_free = free_mask.sum()
+                n_has_inf = has_influence.sum()
+                n_afford = (affordable.any(axis=0)).sum() if n_active > 0 else 0
+                logger.debug(f"Zero valid pairs for 'mh' mode: "
+                             f"{n_active} active ads, {n_free} free+influenced BBs, "
+                             f"{n_has_inf} with influence, {n_afford} affordable")
             return pair_mask
 
         return np.array([1], dtype=np.int8)
