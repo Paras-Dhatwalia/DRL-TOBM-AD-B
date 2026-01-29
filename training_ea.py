@@ -113,7 +113,7 @@ def get_config():
             "step_per_collect": 5760,  # 4 episodes x 1440 steps
             "step_per_epoch": 14400,  # 10 episodes worth per epoch
             "repeat_per_collect": 10,
-            "buffer_size": 23040,
+            "buffer_size": 5760,  # = step_per_collect (on-policy PPO needs 1 cycle)
             "save_path": "models/ppo_billboard_ea.pt",
             "log_path": "logs/ppo_billboard_ea",
             "use_validation": False,
@@ -145,6 +145,12 @@ def create_single_env(env_config: Dict[str, Any], use_validation: bool = False):
 
     # Wrap for PettingZoo -> Gymnasium conversion
     env = BillboardPettingZooWrapper(base_env)
+
+    # Strip graph_edge_links from observations to save buffer memory.
+    # Static graph (~142KB/entry) was stored redundantly per buffer entry,
+    # causing OOM (60GB). Graph is stored once in the model and injected
+    # during forward pass via GraphAwareActor/GraphAwareCritic.
+    env = NoGraphObsWrapper(env)
 
     # Optionally add validation wrapper (for testing/debugging)
     if use_validation:
@@ -243,6 +249,12 @@ def main():
     max_ads = sample_env.env.config.max_active_ads
     action_space_size = n_billboards * max_ads
 
+    # Get graph structure (stored once in model, not in replay buffer)
+    obs, _ = sample_env.reset()
+    assert 'graph_edge_links' not in obs, "Graph should not be in observations!"
+    graph_numpy = sample_env.get_graph()
+    logger.info(f"Graph structure: {graph_numpy.shape} (stored once in model, not in buffer)")
+
     logger.info(f"Environment dimensions:")
     logger.info(f"  - Billboards: {n_billboards}")
     logger.info(f"  - Max active ads: {max_ads}")
@@ -280,71 +292,67 @@ def main():
     actor_base = BillboardAllocatorGNN(**model_config).to(device)
     critic_base = BillboardAllocatorGNN(**model_config).to(device)
 
-    # Wrap models to match Tianshou's expected interface
-    # Tianshou expects: actor(obs) -> logits (single tensor)
-    # Our model returns: (logits, state) tuple
-    # We need to unwrap this
-    class TianshouActorWrapper(torch.nn.Module):
-        """Wrapper to make BillboardAllocatorGNN compatible with Tianshou for ACTOR"""
-        def __init__(self, model):
+    # Graph-aware wrappers: store graph once, inject into obs during forward pass.
+    # This avoids storing static graph_edge_links in every replay buffer entry.
+
+    def _add_graph_to_batch(obs, graph):
+        """Inject graph_edge_links into observation batch."""
+        def get(obj, key):
+            if isinstance(obj, dict):
+                return obj.get(key)
+            return getattr(obj, key, None)
+
+        if get(obs, 'graph_edge_links') is not None:
+            return obs
+
+        nodes = get(obs, 'graph_nodes')
+        if nodes is None:
+            return obs
+
+        if isinstance(nodes, np.ndarray):
+            nodes = torch.from_numpy(nodes).float()
+
+        batch_size = nodes.shape[0] if len(nodes.shape) == 3 else 1
+        device = nodes.device
+        graph_batch = graph.unsqueeze(0).expand(batch_size, -1, -1).to(device)
+
+        if isinstance(obs, dict):
+            new_obs = obs.copy()
+            new_obs['graph_edge_links'] = graph_batch
+            return new_obs
+        else:
+            new_obs = ts.data.Batch(obs)
+            new_obs.graph_edge_links = graph_batch
+            return new_obs
+
+    class GraphAwareActor(torch.nn.Module):
+        """Actor that stores graph as buffer and injects it during forward pass."""
+        def __init__(self, model, graph):
             super().__init__()
             self.model = model
+            self.register_buffer('graph', torch.from_numpy(graph).long())
 
         def forward(self, obs, state=None, info={}):
-            """
-            Forward pass compatible with Tianshou.
-
-            Args:
-                obs: Observations (dict or batch)
-                state: Optional recurrent state
-                info: Optional info dict (defaults to empty dict)
-
-            Returns:
-                logits: Action logits (single tensor)
-                state: Updated state (for recurrent models)
-            """
-            # Handle info parameter - Tianshou might pass None or dict
             if info is None:
                 info = {}
+            obs_with_graph = _add_graph_to_batch(obs, self.graph)
+            return self.model(obs_with_graph, state, info)
 
-            # Call base model
-            logits, new_state = self.model(obs, state, info)
-            # Return tuple: (logits, state)
-            # Tianshou's PPOPolicy will handle this correctly
-            return logits, new_state
-
-    class TianshouCriticWrapper(torch.nn.Module):
-        """Wrapper to make BillboardAllocatorGNN compatible with Tianshou for CRITIC.
-
-        CRITICAL: Critic must return only the value tensor, NOT a tuple!
-        Tianshou's PPO expects critic(obs) -> value_tensor
-        """
-        def __init__(self, model):
+    class GraphAwareCritic(torch.nn.Module):
+        """Critic that stores graph as buffer and injects it during forward pass."""
+        def __init__(self, model, graph):
             super().__init__()
             self.model = model
+            self.register_buffer('graph', torch.from_numpy(graph).long())
 
         def forward(self, obs, state=None, info={}):
-            """
-            Forward pass for critic - returns ONLY value tensor.
-
-            Args:
-                obs: Observations (dict or batch)
-                state: Optional recurrent state
-                info: Optional info dict
-
-            Returns:
-                value: Value tensor (NOT a tuple!)
-            """
             if info is None:
                 info = {}
+            obs_with_graph = _add_graph_to_batch(obs, self.graph)
+            return self.model.critic_forward(obs_with_graph)
 
-            # Call base model - it returns (value, state)
-            value = self.model.critic_forward(obs)
-            # Return ONLY the value tensor for Tianshou compatibility
-            return value
-
-    actor = TianshouActorWrapper(actor_base)
-    critic = TianshouCriticWrapper(critic_base)  # Use critic-specific wrapper
+    actor = GraphAwareActor(actor_base, graph_numpy)
+    critic = GraphAwareCritic(critic_base, graph_numpy)
 
     # Log model parameters
     actor_params = sum(p.numel() for p in actor.parameters())
@@ -468,29 +476,25 @@ def main():
     best_reward = -float('inf')
 
     def save_best_fn(policy):
+        """Save model when trainer reports a new best test reward.
+        Note: The trainer already runs test episodes (episode_per_test=10).
+        This function only saves — no redundant test collection."""
         nonlocal best_reward
-        test_result = test_collector.collect(n_episode=10)
-
-        # New Tianshou API: test_result is CollectStats object
-        # Access returns attribute instead of subscripting
-        current_reward = test_result.returns.mean() if hasattr(test_result, 'returns') else test_result.rews_mean
-
-        if current_reward > best_reward:
-            best_reward = current_reward
-            logger.info(f"New best reward: {best_reward:.2f}, saving model...")
-            torch.save({
-                'actor_state_dict': actor.state_dict(),
-                'critic_state_dict': critic.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'model_config': model_config,
-                'train_config': train_config,
-                'env_config': env_config,
-                'best_reward': best_reward,
-                'mode': 'ea',
-                'distribution': 'TopKSelection',
-                'k': 16,
-                'temperature': 1.0
-            }, train_config["save_path"])
+        logger.info(f"Saving best model...")
+        best_reward_snapshot = best_reward  # Will be updated by trainer
+        torch.save({
+            'actor_state_dict': actor.state_dict(),
+            'critic_state_dict': critic.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'model_config': model_config,
+            'train_config': train_config,
+            'env_config': env_config,
+            'best_reward': best_reward_snapshot,
+            'mode': 'ea',
+            'distribution': 'TopKSelection',
+            'k': 16,
+            'temperature': 1.0
+        }, train_config["save_path"])
 
     # Train
     logger.info("="*60)
@@ -626,7 +630,7 @@ def main():
         'final_reward': best_reward,
         'mode': 'ea',
         'distribution': 'TopKSelection',
-        'k': 300,
+        'k': 16,
         'temperature': 1.0
     }, final_path)
 
