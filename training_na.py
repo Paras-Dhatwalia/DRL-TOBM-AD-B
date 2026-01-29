@@ -11,7 +11,7 @@ import tianshou as ts
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
 from tianshou.utils import TensorboardLogger
-from torch.optim.lr_scheduler import ExponentialLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from typing import Dict, Any, Optional, Tuple, Union
 import platform
 import gymnasium as gym
@@ -218,25 +218,24 @@ env_config = {
 }
 
 train_config = {
-    "nr_envs": 4,               # Reduced for VRAM safety with larger buffer
-    "hidden_dim": 160,          # 128 → 160: 30% more capacity for complex problem
-    "n_graph_layers": 4,        # 3 → 4: Deeper spatial reasoning
-    "lr": 3e-4,                 # KEEP: Works well
-    "lr_decay": 0.97,           # NEW: Slower LR decay (was 0.95)
-    "discount_factor": 0.995,   # 0.99 → 0.995: Better credit assignment for longer episodes
-    "gae_lambda": 0.95,         # KEEP
-    "vf_coef": 0.5,             # KEEP
-    "ent_coef": 0.015,          # 0.01 → 0.015: More exploration
-    "max_grad_norm": 0.5,       # KEEP
-    "eps_clip": 0.2,            # KEEP
-    "batch_size": 96,           # 64 → 96: Better gradient estimates
-    "max_epoch": 60,            # 20 → 60: 3x longer training (600K samples)
-    "step_per_collect": 5760,   # 4 episodes x 1440 steps (full day per episode)
+    "nr_envs": 4,
+    "hidden_dim": 128,
+    "n_graph_layers": 3,
+    "lr": 3e-4,
+    "discount_factor": 0.995,
+    "gae_lambda": 0.95,
+    "vf_coef": 0.5,
+    "ent_coef": 0.01,
+    "max_grad_norm": 0.5,
+    "eps_clip": 0.2,
+    "batch_size": 64,
+    "max_epoch": 100,
+    "step_per_collect": 5760,   # 4 episodes x 1440 steps
     "step_per_epoch": 14400,    # 10 episodes worth per epoch
-    "repeat_per_collect": 6,    # 4 → 6: More gradient updates per collection
+    "repeat_per_collect": 10,
     "save_path": "models/ppo_billboard_na.pt",
     "log_path": "logs/ppo_billboard_na",
-    "buffer_size": 30000        # 20000 → 30000: Larger replay buffer
+    "buffer_size": 23040,
 }
 
 def get_env():
@@ -310,7 +309,11 @@ def main():
         lr=train_config["lr"],
         eps=1e-5
     )
-    lr_scheduler = ExponentialLR(optimizer, gamma=train_config.get("lr_decay", 0.97))
+    lr_scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=train_config["max_epoch"],
+        eta_min=train_config["lr"] * 0.1
+    )
 
     # Create PPO policy
     policy = ts.policy.PPOPolicy(

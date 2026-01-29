@@ -66,8 +66,8 @@ def get_config():
             "action_mode": "mh",
         },
         "train": {
-            "hidden_dim": 160,
-            "n_graph_layers": 4,
+            "hidden_dim": 128,
+            "n_graph_layers": 3,
             "lr": 3e-4,
             "discount_factor": 0.995,
             "gae_lambda": 0.95,
@@ -78,10 +78,10 @@ def get_config():
             "batch_size": 64,
             "nr_envs": 4,
             "max_epoch": 100,
-            "step_per_collect": 5760,
-            "step_per_epoch": 14400,
-            "repeat_per_collect": 15,
-            "buffer_size": 30000,
+            "step_per_collect": 5760,   # 4 episodes x 1440 steps
+            "step_per_epoch": 14400,    # 10 episodes worth per epoch
+            "repeat_per_collect": 10,
+            "buffer_size": 23040,
             "save_path": "models/ppo_billboard_mh.pt",
             "log_path": "logs/ppo_billboard_mh",
         }

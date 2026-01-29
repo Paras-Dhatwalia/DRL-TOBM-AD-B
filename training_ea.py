@@ -104,7 +104,7 @@ def get_config():
             "discount_factor": 0.995,
             "gae_lambda": 0.95,
             "vf_coef": 0.5,
-            "ent_coef": 0.02,
+            "ent_coef": 0.01,
             "max_grad_norm": 0.5,
             "eps_clip": 0.2,
             "batch_size": 64,
@@ -112,7 +112,8 @@ def get_config():
             "max_epoch": 100,
             "step_per_collect": 5760,  # 4 episodes x 1440 steps
             "step_per_epoch": 14400,  # 10 episodes worth per epoch
-            "repeat_per_collect": 15,
+            "repeat_per_collect": 10,
+            "buffer_size": 23040,
             "save_path": "models/ppo_billboard_ea.pt",
             "log_path": "logs/ppo_billboard_ea",
             "use_validation": False,
@@ -392,14 +393,15 @@ def main():
         - Model's learned ranking directly determines selection
         - Gradient flows to the pair scorer effectively
 
-        K=300 provides large candidate pool for env's influence-based refinement:
-        - Model pre-filters 8880 → 300 pairs (removes obviously bad pairs)
-        - Environment sorts by expected_influence, picks best ~50
-        - Gradient concentrated on top 300 (vs diluted across 8880 in Bernoulli)
+        K=16 gives ~2 allocations per active ad per step:
+        - Creates real selection pressure (16 out of ~3500 valid = 0.5%)
+        - Model must learn WHICH pairs are valuable
+        - log_prob sum over 16 items keeps PPO ratio stable
+        - Preserves EA's multi-allocation advantage over MH/NA (1 per step)
         """
         return TopKSelection(
             logits=logits,
-            k=300,             # Large pool: model pre-filters, env refines by influence
+            k=16,              # ~2 per active ad: selective, stable gradients
             mask=None,         # Mask already applied in model (-1e8 for invalid)
             temperature=1.0    # Standard softmax temperature
         )
@@ -423,7 +425,7 @@ def main():
     )
 
     logger.info(f"PPO configuration:")
-    logger.info(f"  - Distribution: TopKSelection (K=300, competitive softmax)")
+    logger.info(f"  - Distribution: TopKSelection (K=16, competitive softmax)")
     logger.info(f"  - Entropy coefficient: {train_config['ent_coef']}")
     logger.info(f"  - Learning rate: {train_config['lr']}")
     logger.info(f"  - Batch size: {train_config['batch_size']}")
@@ -439,12 +441,11 @@ def main():
     # Preprocessing should happen in the model's forward pass
     # For EA mode, observations include large graph structure
     # Use smaller buffer to avoid memory issues
-    buffer_size = max(500, train_config["step_per_collect"] * 2)  # Reduced for memory
-    logger.info(f"Buffer size: {buffer_size}")
+    logger.info(f"Buffer size: {train_config['buffer_size']}")
 
     train_collector = ts.data.Collector(
         policy, train_envs,
-        ts.data.VectorReplayBuffer(buffer_size, train_config["nr_envs"]),
+        ts.data.VectorReplayBuffer(train_config["buffer_size"], train_config["nr_envs"]),
         exploration_noise=True
     )
 
@@ -487,7 +488,7 @@ def main():
                 'best_reward': best_reward,
                 'mode': 'ea',
                 'distribution': 'TopKSelection',
-                'k': 300,
+                'k': 16,
                 'temperature': 1.0
             }, train_config["save_path"])
 
