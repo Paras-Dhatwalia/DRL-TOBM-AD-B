@@ -1,282 +1,17 @@
 """
 Custom Distributions for Billboard Allocation RL
 
-This module implements custom probability distributions for combinatorial
-action spaces used in EA (Edge Action) and MH (Multi-Head) modes.
-
-Key Classes:
-- IndependentBernoulli: Distribution over binary vectors where each dimension
-  is an independent Bernoulli random variable. (DEPRECATED for EA mode)
-- TopKSelection: Distribution that selects the K highest-scoring pairs via
-  competitive softmax selection. (RECOMMENDED for EA mode)
-- MaskedCategorical: Categorical distribution with action masking for NA mode.
-
-Design Rationale:
-- Standard Categorical distribution assumes ONE choice from N options
-- EA mode requires MULTIPLE simultaneous selections from N×M options
-- IndependentBernoulli: Each pair is independent coin flip → ignores scores
-- TopKSelection: High-scoring pairs selected competitively → uses learned ranking
-
-EA Mode Evolution:
-- v1 (IndependentBernoulli): Failed because sampling ignored model's pair scores
-- v2 (TopKSelection): Uses softmax for competitive selection, respects ranking
+- TopKSelection: Selects K highest-scoring pairs via competitive softmax (EA mode).
+- MaskedCategorical: Categorical with action masking (NA mode).
+- MultiHeadCategorical: Two-head categorical for ad + billboard selection (MH mode).
 
 Compatible with Tianshou's PPO policy via dist_fn parameter.
 """
 
 import torch
 import torch.nn.functional as F
-from torch.distributions import Distribution, Bernoulli, constraints
+from torch.distributions import Distribution, constraints
 from typing import Optional, Union
-import numpy as np
-
-
-class IndependentBernoulli(Distribution):
-    """
-    Distribution over binary vectors with independent Bernoulli dimensions.
-
-    Each dimension i has probability p[i] of being 1, independent of other dims.
-    Used for combinatorial action spaces like EA mode in billboard allocation.
-
-    NUMERICAL STABILITY (Critical for 8880-dim action spaces):
-    - Logits are clamped to [-20, 20] to prevent sigmoid overflow
-    - Probabilities are clamped to [eps, 1-eps] to prevent log(0)
-    - Safe log_prob computation that never produces -inf or NaN
-    - Safe entropy computation with clamped probabilities
-
-    Args:
-        logits: Unnormalized log probabilities, shape (batch_size, action_dim)
-        probs: Probabilities, shape (batch_size, action_dim). Mutually exclusive with logits.
-        mask: Optional boolean mask, shape (batch_size, action_dim).
-              If provided, masked dimensions are forced to 0.
-        eps: Small constant for numerical stability (default: 1e-7)
-
-    Example:
-        >>> logits = torch.randn(32, 8880)  # batch=32, 20 ads × 444 billboards
-        >>> dist = IndependentBernoulli(logits=logits)
-        >>> action = dist.sample()  # shape: (32, 8880), binary
-        >>> log_p = dist.log_prob(action)  # shape: (32,)
-        >>> entropy = dist.entropy()  # shape: (32,)
-    """
-
-    arg_constraints = {
-        'logits': constraints.real,
-        'probs': constraints.unit_interval
-    }
-    support = constraints.boolean
-    has_rsample = False  # Bernoulli doesn't support reparameterized sampling
-
-    # Numerical stability constants
-    LOGIT_CLAMP_MIN = -20.0  # sigmoid(-20) ≈ 2e-9
-    LOGIT_CLAMP_MAX = 20.0   # sigmoid(20) ≈ 1 - 2e-9
-    MASKED_LOGIT = -20.0     # Logit value for masked (invalid) actions
-
-    def __init__(
-        self,
-        logits: Optional[torch.Tensor] = None,
-        probs: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None,
-        eps: float = 1e-7,
-        validate_args: bool = False
-    ):
-        if (logits is None) == (probs is None):
-            raise ValueError("Exactly one of 'logits' or 'probs' must be specified")
-
-        self.eps = eps
-        self.mask = mask
-
-        if logits is not None:
-            # NUMERICAL STABILITY: Clamp logits to prevent extreme probabilities
-            logits = torch.clamp(logits, min=self.LOGIT_CLAMP_MIN, max=self.LOGIT_CLAMP_MAX)
-
-            # Handle NaN in input logits (defensive)
-            logits = torch.nan_to_num(logits, nan=0.0, posinf=self.LOGIT_CLAMP_MAX, neginf=self.LOGIT_CLAMP_MIN)
-
-            # Apply mask to logits if provided
-            if mask is not None:
-                mask_bool = mask.bool() if mask.dtype != torch.bool else mask
-                logits = torch.where(mask_bool, logits, torch.full_like(logits, self.MASKED_LOGIT))
-
-            self._logits = logits
-            # Compute probabilities with clamping for numerical safety
-            self._probs = torch.clamp(torch.sigmoid(logits), self.eps, 1.0 - self.eps)
-            param = logits
-        else:
-            # NUMERICAL STABILITY: Clamp probabilities
-            probs = torch.clamp(probs, self.eps, 1.0 - self.eps)
-
-            # Handle NaN in input probs (defensive)
-            probs = torch.nan_to_num(probs, nan=0.5)
-
-            # Apply mask to probs if provided
-            if mask is not None:
-                mask_bool = mask.bool() if mask.dtype != torch.bool else mask
-                probs = torch.where(mask_bool, probs, torch.full_like(probs, self.eps))
-
-            self._probs = probs
-            self._logits = None
-            param = probs
-
-        self._batch_shape = param.shape[:-1]
-        self._event_shape = param.shape[-1:]
-
-        # Create underlying Bernoulli with CLAMPED probabilities (not logits)
-        # This ensures the Bernoulli never sees extreme values
-        self._bernoulli = Bernoulli(probs=self._probs, validate_args=False)
-
-        super().__init__(
-            batch_shape=self._batch_shape,
-            event_shape=self._event_shape,
-            validate_args=validate_args
-        )
-
-    @property
-    def logits(self) -> torch.Tensor:
-        """Get logits (compute from probs if needed)."""
-        if self._logits is not None:
-            return self._logits
-        # Safe logit computation from clamped probs
-        return torch.log(self._probs / (1.0 - self._probs))
-
-    @property
-    def probs(self) -> torch.Tensor:
-        """Get clamped probabilities."""
-        return self._probs
-
-    @property
-    def param(self) -> torch.Tensor:
-        """Get the parameter tensor (logits or probs)."""
-        return self._logits if self._logits is not None else self._probs
-
-    def sample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
-        """
-        Sample binary actions from the distribution.
-
-        Args:
-            sample_shape: Additional sample dimensions
-
-        Returns:
-            Binary tensor of shape (*sample_shape, *batch_shape, action_dim)
-        """
-        with torch.no_grad():
-            samples = self._bernoulli.sample(sample_shape)
-
-            # Apply mask if provided (redundant safety - mask already applied to probs)
-            if self.mask is not None:
-                mask_bool = self.mask.bool() if self.mask.dtype != torch.bool else self.mask
-                samples = samples * mask_bool.float()
-
-            return samples
-
-    def rsample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
-        """
-        Reparameterized sampling (not supported for Bernoulli).
-        Falls back to regular sampling.
-        """
-        return self.sample(sample_shape)
-
-    def log_prob(self, value: torch.Tensor) -> torch.Tensor:
-        """
-        Compute log probability of a binary action vector.
-
-        NUMERICAL STABILITY: Uses clamped probabilities to prevent log(0).
-
-        For independent Bernoulli, log_prob is sum of individual log probs:
-        log P(a) = sum_i [a_i * log(p_i) + (1-a_i) * log(1-p_i)]
-
-        Args:
-            value: Binary action tensor, shape (*batch_shape, action_dim)
-
-        Returns:
-            Log probability, shape (*batch_shape,)
-        """
-        # SAFE log_prob computation using clamped probabilities
-        # This guarantees no -inf or NaN since eps <= p <= 1-eps
-        p = self._probs
-        log_p = value * torch.log(p) + (1.0 - value) * torch.log(1.0 - p)
-
-        # Extra safety: handle any residual NaN (should never happen with clamped probs)
-        log_p = torch.nan_to_num(log_p, nan=0.0, neginf=-100.0)
-
-        # If mask is provided, only sum over valid (unmasked) dimensions
-        if self.mask is not None:
-            mask_bool = self.mask.bool() if self.mask.dtype != torch.bool else self.mask
-            log_p = log_p * mask_bool.float()
-
-        # Sum over action dimensions to get total log_prob per batch
-        return log_p.sum(dim=-1)
-
-    def entropy(self) -> torch.Tensor:
-        """
-        Compute entropy of the distribution.
-
-        NUMERICAL STABILITY: Uses clamped probabilities to prevent log(0).
-
-        For independent Bernoulli, entropy is sum of individual entropies:
-        H = sum_i [-p_i * log(p_i) - (1-p_i) * log(1-p_i)]
-
-        Returns:
-            Entropy, shape (*batch_shape,)
-        """
-        # SAFE entropy computation using clamped probabilities
-        p = self._probs
-        entropy_per_dim = -p * torch.log(p) - (1.0 - p) * torch.log(1.0 - p)
-
-        # Extra safety: handle any residual NaN
-        entropy_per_dim = torch.nan_to_num(entropy_per_dim, nan=0.0)
-
-        # If mask is provided, only sum over valid dimensions
-        if self.mask is not None:
-            mask_bool = self.mask.bool() if self.mask.dtype != torch.bool else self.mask
-            entropy_per_dim = entropy_per_dim * mask_bool.float()
-
-        return entropy_per_dim.sum(dim=-1)
-
-    @property
-    def mean(self) -> torch.Tensor:
-        """Expected value (same as probs for Bernoulli)."""
-        return self.probs
-
-    @property
-    def variance(self) -> torch.Tensor:
-        """Variance: p * (1 - p) for each dimension."""
-        p = self.probs
-        return p * (1 - p)
-
-    @property
-    def mode(self) -> torch.Tensor:
-        """Most likely action (threshold at 0.5)."""
-        mode = (self.probs > 0.5).float()
-        if self.mask is not None:
-            mask_bool = self.mask.bool() if self.mask.dtype != torch.bool else self.mask
-            mode = mode * mask_bool.float()
-        return mode
-
-    def expand(self, batch_shape, _instance=None):
-        """Expand distribution to new batch shape."""
-        new = self._get_checked_instance(IndependentBernoulli, _instance)
-        batch_shape = torch.Size(batch_shape)
-
-        if self.logits is not None:
-            new.logits = self.logits.expand(batch_shape + self._event_shape)
-            new._probs = None
-        else:
-            new._probs = self._probs.expand(batch_shape + self._event_shape)
-            new.logits = None
-
-        if self.mask is not None:
-            new.mask = self.mask.expand(batch_shape + self._event_shape)
-        else:
-            new.mask = None
-
-        new._bernoulli = self._bernoulli.expand(batch_shape + self._event_shape)
-        super(IndependentBernoulli, new).__init__(
-            batch_shape=batch_shape,
-            event_shape=self._event_shape,
-            validate_args=False
-        )
-        new._validate_args = self._validate_args
-        return new
 
 
 class TopKSelection(Distribution):
@@ -356,8 +91,6 @@ class TopKSelection(Distribution):
             masked_logits = logits
             self._n_valid = torch.full((batch_size,), self._action_dim, device=logits.device)
 
-        # Compute selection probabilities via temperature-scaled softmax
-        # Handle all-masked case: if all -inf, softmax gives NaN → replace with uniform
         probs = F.softmax(masked_logits / temperature, dim=-1)
 
         # Handle NaN from all-masked batches (softmax of all -inf)
@@ -419,17 +152,14 @@ class TopKSelection(Distribution):
                 # Can't select more than valid actions
                 k_b = min(self.k, int(self._n_valid[b].item()))
                 if k_b > 0:
-                    # Add small epsilon to prevent zero probs causing multinomial issues
                     probs_b = probs[b].clone()
                     probs_b = probs_b + 1e-8
                     probs_b = probs_b / probs_b.sum()
 
-                    # Sample k indices without replacement
                     try:
                         indices = torch.multinomial(probs_b, k_b, replacement=False)
                         actions[b, indices] = 1.0
                     except RuntimeError:
-                        # Fallback: if multinomial fails, use top-k deterministically
                         _, top_indices = torch.topk(probs_b, k_b)
                         actions[b, top_indices] = 1.0
 
@@ -645,34 +375,101 @@ class MaskedCategorical(Distribution):
         return self.probs.argmax(dim=-1)
 
 
-def create_distribution(
-    logits: torch.Tensor,
-    action_type: str = 'categorical',
-    mask: Optional[torch.Tensor] = None,
-    k: int = 60,
-    temperature: float = 1.0
-) -> Distribution:
-    """
-    Factory function to create appropriate distribution based on action type.
+class MultiHeadCategorical:
+    """Custom distribution for multi-head action selection (MH mode).
 
-    Args:
-        logits: Model output logits
-        action_type: One of:
-            - 'categorical': MaskedCategorical for NA mode (single selection)
-            - 'bernoulli' or 'independent_bernoulli': IndependentBernoulli (DEPRECATED)
-            - 'topk' or 'top_k_selection': TopKSelection for EA mode (RECOMMENDED)
-        mask: Optional action mask
-        k: Number of pairs to select (only for TopKSelection)
-        temperature: Softmax temperature (only for TopKSelection)
+    Accepts CONCATENATED logits: [ad_logits, billboard_logits] with shape
+    (batch, max_ads + n_billboards). Splits them internally to create two
+    independent Categorical distributions.
 
-    Returns:
-        Appropriate distribution instance
+    Implements all Tianshou-required attributes/methods:
+    - sample(), log_prob(), entropy(), mode (core methods)
+    - probs, stddev, variance, mean, batch_shape (required properties)
+    - __len__, ndim (batch size detection)
     """
-    if action_type == 'categorical':
-        return MaskedCategorical(logits=logits, mask=mask)
-    elif action_type in ('bernoulli', 'independent_bernoulli'):
-        return IndependentBernoulli(logits=logits, mask=mask)
-    elif action_type in ('topk', 'top_k_selection'):
-        return TopKSelection(logits=logits, k=k, mask=mask, temperature=temperature)
-    else:
-        raise ValueError(f"Unknown action type: {action_type}")
+
+    MAX_ADS = 20  # Default, overwritten by create_multi_head_dist_fn
+
+    def __init__(self, logits: torch.Tensor):
+        self._logits = logits
+        ad_logits = logits[..., :self.MAX_ADS]
+        bb_logits = logits[..., self.MAX_ADS:]
+        self.ad_dist = torch.distributions.Categorical(logits=ad_logits)
+        self.bb_dist = torch.distributions.Categorical(logits=bb_logits)
+        self._batch_shape = logits.shape[:-1]
+
+    def __len__(self):
+        if self._logits.dim() == 1:
+            return 1
+        return self._logits.shape[0]
+
+    @property
+    def ndim(self):
+        return self._logits.dim()
+
+    @property
+    def batch_shape(self):
+        return self._batch_shape
+
+    def sample(self):
+        ad_action = self.ad_dist.sample()
+        bb_action = self.bb_dist.sample()
+        return torch.stack([ad_action, bb_action], dim=-1)
+
+    def rsample(self, sample_shape=torch.Size()):
+        return self.sample()
+
+    def log_prob(self, actions):
+        ad_action = actions[..., 0].long()
+        bb_action = actions[..., 1].long()
+        return self.ad_dist.log_prob(ad_action) + self.bb_dist.log_prob(bb_action)
+
+    def entropy(self):
+        return self.ad_dist.entropy() + self.bb_dist.entropy()
+
+    @property
+    def mode(self):
+        ad_mode = self.ad_dist.probs.argmax(dim=-1)
+        bb_mode = self.bb_dist.probs.argmax(dim=-1)
+        return torch.stack([ad_mode, bb_mode], dim=-1)
+
+    @property
+    def probs(self):
+        return torch.cat([self.ad_dist.probs, self.bb_dist.probs], dim=-1)
+
+    @property
+    def mean(self):
+        ad_probs = self.ad_dist.probs
+        bb_probs = self.bb_dist.probs
+        ad_indices = torch.arange(ad_probs.shape[-1], device=ad_probs.device, dtype=ad_probs.dtype)
+        bb_indices = torch.arange(bb_probs.shape[-1], device=bb_probs.device, dtype=bb_probs.dtype)
+        ad_mean = (ad_probs * ad_indices).sum(-1)
+        bb_mean = (bb_probs * bb_indices).sum(-1)
+        return torch.stack([ad_mean, bb_mean], dim=-1)
+
+    @property
+    def variance(self):
+        def cat_variance(dist):
+            probs = dist.probs
+            indices = torch.arange(probs.shape[-1], device=probs.device, dtype=probs.dtype)
+            mean = (probs * indices).sum(-1, keepdim=True)
+            return (probs * (indices - mean) ** 2).sum(-1)
+        ad_var = cat_variance(self.ad_dist)
+        bb_var = cat_variance(self.bb_dist)
+        return torch.stack([ad_var, bb_var], dim=-1)
+
+    @property
+    def stddev(self):
+        return self.variance.sqrt()
+
+
+def create_multi_head_dist_fn(max_ads: int):
+    """Create a distribution function for MH mode with the correct split point."""
+    MultiHeadCategorical.MAX_ADS = max_ads
+
+    def multi_head_dist_fn(logits):
+        if isinstance(logits, torch.Tensor) and logits.dim() >= 1:
+            return MultiHeadCategorical(logits)
+        return torch.distributions.Categorical(logits=logits)
+
+    return multi_head_dist_fn

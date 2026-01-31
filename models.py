@@ -1,63 +1,20 @@
 """
-Advanced GNN Models for Dynamic Billboard Allocation - FIXED VERSION
+GNN Models for Dynamic Billboard Allocation
 
-This module implements a comprehensive Graph Neural Network architecture 
-specifically designed for the dynamic billboard allocation problem within 
-the BillboardEnv environment. This version addresses critical training bugs 
-identified in the original implementation.
-
-CRITICAL FIXES IMPLEMENTED:
-1. Fixed Parameter creation during forward pass (lines 406, 444) 
-2. Moved all learnable parameters to __init__ to ensure proper gradient tracking
-3. Enhanced attention mechanisms with proper layer initialization
-4. Added comprehensive validation and error handling
-5. Improved documentation for maintainability
-
-FEATURES:
-1. Multi-modal action support:
-   - NA (Node Action): Environment selects ad, agent selects billboard(s)
-   - EA (Edge Action): Agent selects ad-billboard pairs directly  
-   - MH (Multi-Head): Agent selects ad, then billboard sequentially
-
-2. Proper input handling:
-   - Batched observations with shape validation
-   - Mode-specific mask handling and action space conformity
-   - Robust feature preprocessing and normalization
-
-3. Architecture specifications:
-   - Graph encoder with skip connections (GIN/GAT)
-   - Multi-head attention for ad-billboard matching with proper parameter management
-   - Mode-specific policy heads with proper masking
-   - Shared critic network for value estimation
-
-4. Training and stability features:
-   - All learnable parameters properly initialized in __init__
-   - Gradient-friendly normalization layers
-   - Dropout for regularization
-   - Proper logit masking for invalid actions
-   - Batch processing support
-
-TECHNICAL IMPROVEMENTS:
-- Eliminated dynamic parameter/layer creation during forward pass
-- Ensured all parameters are registered with the model for proper optimization
-- Added detailed parameter counting and gradient flow debugging
-- Enhanced error messages and validation
-- Comprehensive documentation for each critical component
+Multi-modal action support (NA/EA/MH), graph encoding with skip connections,
+multi-head attention for ad-billboard matching, mode-specific policy heads,
+and shared critic network.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
-from torch_geometric.data import Data, Batch
-from torch_geometric.nn import GINConv, GATConv, global_mean_pool, global_max_pool
-from torch.nn import Sequential, Linear, ReLU, LayerNorm, BatchNorm1d, Dropout
+from torch_geometric.nn import GINConv, GATConv
+from torch.nn import Sequential, Linear, ReLU, LayerNorm, Dropout
 import numpy as np
 from typing import Dict, Tuple, Optional, Any, Union, List
 import logging
-import warnings
-import matplotlib.pyplot as plt
-import seaborn as sns
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +41,6 @@ def validate_observations(observations: Dict[str, torch.Tensor], mode: str,
     training. Each validation provides specific error messages to aid debugging.
     """
     
-    # Core validation: check for required keys
     required_keys = ['graph_nodes', 'graph_edge_links', 'mask']
     missing_keys = [key for key in required_keys if key not in observations]
     if missing_keys:
@@ -93,7 +49,6 @@ def validate_observations(observations: Dict[str, torch.Tensor], mode: str,
     
     batch_size = observations['graph_nodes'].shape[0]
     
-    # Validate graph_nodes structure
     expected_node_shape = (batch_size, n_billboards, node_feat_dim)
     actual_node_shape = observations['graph_nodes'].shape
     if actual_node_shape != expected_node_shape:
@@ -101,7 +56,6 @@ def validate_observations(observations: Dict[str, torch.Tensor], mode: str,
                         f"got {actual_node_shape}. This typically indicates a mismatch "
                         f"between environment configuration and model configuration.")
     
-    # Validate graph_edge_links structure  
     edge_shape = observations['graph_edge_links'].shape
     if len(edge_shape) != 3:
         raise ValueError(f"graph_edge_links must have 3 dimensions (batch_size, 2, num_edges), "
@@ -113,7 +67,6 @@ def validate_observations(observations: Dict[str, torch.Tensor], mode: str,
         raise ValueError(f"graph_edge_links must have 2 node indices per edge, "
                         f"got {edge_shape[1]}")
     
-    # Mode-specific validation with detailed error messages
     if mode == 'na':
         # Node Action mode validation
         if 'current_ad' not in observations:
@@ -181,16 +134,13 @@ def log_input_statistics(observations: Dict[str, torch.Tensor], mode: str) -> No
     
     logger.debug("=== Input Statistics ===")
     
-    # Log basic tensor statistics for each observation component
     for key, tensor in observations.items():
         if isinstance(tensor, torch.Tensor):
-            # Compute comprehensive statistics
             min_val = tensor.min().item()
             max_val = tensor.max().item()
             mean_val = tensor.mean().item()
             std_val = tensor.std().item()
             
-            # Check for potential issues
             has_nan = torch.isnan(tensor).any().item()
             has_inf = torch.isinf(tensor).any().item()
             
@@ -201,11 +151,9 @@ def log_input_statistics(observations: Dict[str, torch.Tensor], mode: str) -> No
             if has_nan or has_inf:
                 logger.warning(f"  WARNING: {key} contains NaN={has_nan}, Inf={has_inf}")
     
-    # Mode-specific mask analysis
     mask = observations['mask']
     
     if mode == 'na':
-        # Node Action: analyze billboard availability
         coverage = mask.float().mean().item()
         per_batch_coverage = mask.float().mean(dim=1)
         min_coverage = per_batch_coverage.min().item()
@@ -218,7 +166,6 @@ def log_input_statistics(observations: Dict[str, torch.Tensor], mode: str) -> No
             logger.warning("Very low billboard availability may limit learning")
             
     elif mode == 'ea':
-        # Edge Action: analyze ad-billboard pair availability
         coverage = mask.float().mean().item()
         logger.debug(f"EA mask coverage: {coverage:.2%} of ad-billboard pairs available")
         
@@ -226,48 +173,21 @@ def log_input_statistics(observations: Dict[str, torch.Tensor], mode: str) -> No
             logger.warning("Very low pair availability may cause training instability")
             
     elif mode == 'mh':
-        # Multi-Head: analyze both ad and billboard availability separately
         ad_coverage = mask[:, :, 0].float().mean().item()
         bb_coverage = mask[:, 0, :].float().mean().item()
         
         logger.debug(f"MH mask coverage: {ad_coverage:.2%} ads, {bb_coverage:.2%} billboards available")
         
-        # Check for potential action space issues
         if ad_coverage < 0.1 or bb_coverage < 0.1:
             logger.warning("Low availability in MH mode may cause sequential selection issues")
 
 def preprocess_observations(observations: Dict[str, torch.Tensor],
                            device: Optional[torch.device] = None) -> Dict[str, torch.Tensor]:
-    """
-    Convert observations to tensors and move to device.
-
-    FIXED: No more batch-dependent normalization.
-
-    The "Inference Blindness" Bug (RESOLVED):
-    Previously, this function computed mean/std across the batch dimension, which caused
-    the model to receive "blank" inputs during inference (batch_size=1). The statistics
-    were computed over a single sample, making mean ≈ sample itself and std → 0.
-
-    The Fix:
-    1. Raw features are now pre-normalized in the environment using fixed scaling constants
-       (see Ad.get_feature_vector() and Billboard.get_feature_vector() in optimized_env.py)
-    2. Learnable LayerNorm is applied INSIDE the model after projection to latent space
-    3. This function is now just a simple tensor conversion + device placement
-
-    This ensures identical behavior for batch_size=1 (inference) and batch_size=64 (training).
-
-    Args:
-        observations: Raw observations dictionary (already normalized in environment)
-        device: Optional device to move tensors to
-
-    Returns:
-        Dictionary with tensor observations on the specified device
-    """
+    """Convert observations to tensors. Features are pre-normalized using fixed scaling constants."""
     processed = {}
 
     for key, value in observations.items():
         if isinstance(value, np.ndarray):
-            # Convert numpy to tensor with appropriate dtype
             if key == 'graph_edge_links':
                 tensor = torch.from_numpy(value).long()
             elif key == 'mask':
@@ -280,7 +200,6 @@ def preprocess_observations(observations: Dict[str, torch.Tensor],
         else:
             processed[key] = value
 
-        # Move to device if specified
         if device is not None and isinstance(processed[key], torch.Tensor):
             processed[key] = processed[key].to(device)
 
@@ -305,14 +224,12 @@ class AttentionModule(nn.Module):
     def __init__(self, embed_dim: int, num_heads: int = 4):
         super().__init__()
         
-        # Validate input parameters
         if embed_dim % num_heads != 0:
             raise ValueError(f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})")
         
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         
-        # Core attention mechanism
         self.attention = nn.MultiheadAttention(
             embed_dim=embed_dim, 
             num_heads=num_heads, 
@@ -320,7 +237,6 @@ class AttentionModule(nn.Module):
             dropout=0.1  # Slight regularization
         )
         
-        # Normalization for residual connection
         self.norm = LayerNorm(embed_dim)
         
         logger.debug(f"Initialized AttentionModule: embed_dim={embed_dim}, num_heads={num_heads}")
@@ -340,11 +256,9 @@ class AttentionModule(nn.Module):
             Attended features with residual connection and normalization
         """
         
-        # Apply multi-head attention
         attn_out, attn_weights = self.attention(query, key, value, key_padding_mask=mask)
         
         # Apply residual connection and layer normalization
-        # This is crucial for gradient flow in deep networks
         output = self.norm(query + attn_out)
         
         return output
@@ -370,7 +284,6 @@ class GraphEncoder(nn.Module):
                  conv_type: str = 'gin', dropout: float = 0.1):
         super().__init__()
         
-        # Validate parameters
         if n_layers < 1:
             raise ValueError(f"n_layers must be at least 1, got {n_layers}")
         if conv_type not in ['gin', 'gat']:
@@ -380,22 +293,18 @@ class GraphEncoder(nn.Module):
         self.conv_type = conv_type
         self.convs = nn.ModuleList()
         
-        # Build graph convolution layers
         curr_dim = input_dim
         for i in range(n_layers):
             if conv_type == 'gin':
-                # GIN (Graph Isomorphism Network) convolution
                 mlp = Sequential(
                     Linear(curr_dim, hidden_dim),
                     LayerNorm(hidden_dim),
                     ReLU(),
                     Dropout(dropout)
                 )
-                # eps=0.0 for exact GIN behavior
                 self.convs.append(GINConv(mlp, eps=0.0))
                 
             elif conv_type == 'gat':
-                # GAT (Graph Attention Network) convolution
                 self.convs.append(GATConv(
                     in_channels=curr_dim, 
                     out_channels=hidden_dim, 
@@ -404,7 +313,6 @@ class GraphEncoder(nn.Module):
                 
             curr_dim = hidden_dim
             
-        # Output dimension includes skip connections from all layers
         self.output_dim = input_dim + n_layers * hidden_dim
         
         logger.info(f"Initialized GraphEncoder: {conv_type.upper()}, {n_layers} layers, "
@@ -422,39 +330,29 @@ class GraphEncoder(nn.Module):
             Enhanced node features with skip connections
         """
         
-        # Store all layer outputs for skip connections
         outputs = [x]
         
-        # Apply graph convolutions
         current_x = x
         for i, conv in enumerate(self.convs):
             current_x = conv(current_x, edge_index)
             current_x = F.relu(current_x)
             outputs.append(current_x)
             
-        # Concatenate all outputs (input + all layer outputs)
-        # This preserves information from all representation levels
         final_output = torch.cat(outputs, dim=1)
         
         return final_output
 
 class BillboardAllocatorGNN(nn.Module):
     """
-    FIXED: Unified Billboard Allocation GNN supporting multiple action modes.
-    
-    CRITICAL FIXES IMPLEMENTED:
-    1. All learnable parameters now initialized in __init__ (no dynamic creation)
-    2. Proper parameter registration for gradient tracking
-    3. Fixed attention projection layers
-    4. Enhanced error handling and validation
-    
+    Unified Billboard Allocation GNN supporting multiple action modes.
+
     This model addresses the multi-agent billboard allocation problem with three
     different action modes, each requiring different input/output structures and
     attention mechanisms.
-    
+
     Architecture features:
     - Shared graph encoder for spatial billboard relationships
-    - Mode-specific attention and projection layers (FIXED)
+    - Mode-specific attention and projection layers
     - Proper parameter management for all learnable components
     - Comprehensive validation and debugging capabilities
     """
@@ -474,7 +372,6 @@ class BillboardAllocatorGNN(nn.Module):
         
         super().__init__()
         
-        # Validate and store configuration
         self.mode = mode.lower()
         if self.mode not in ['na', 'ea', 'mh']:
             raise ValueError(f"Unsupported mode: {self.mode}. Must be 'na', 'ea', or 'mh'")
@@ -485,15 +382,11 @@ class BillboardAllocatorGNN(nn.Module):
         self.use_attention = use_attention
         self.hidden_dim = hidden_dim
 
-        # PERFORMANCE: Skip validation after first successful forward pass
-        # Validation is expensive (CPU-bound shape checks) and unnecessary after
-        # confirming dimensions are correct on the first pass
         self._validation_done = False
 
         logger.info(f"Initializing BillboardAllocatorGNN: mode={self.mode}, "
                    f"n_billboards={n_billboards}, max_ads={max_ads}")
         
-        # Shared graph encoder for billboard spatial relationships
         self.graph_encoder = GraphEncoder(
             input_dim=node_feat_dim,
             hidden_dim=hidden_dim,
@@ -508,8 +401,6 @@ class BillboardAllocatorGNN(nn.Module):
         # that works identically for batch_size=1 (inference) and batch_size=64 (training)
         self.billboard_norm = LayerNorm(self.billboard_embed_dim)
 
-        # Ad feature encoder with integrated normalization
-        # Projects raw features → latent space → LayerNorm (the "Pro" pattern)
         self.ad_encoder = nn.Sequential(
             Linear(ad_feat_dim, hidden_dim),
             ReLU(),
@@ -518,11 +409,11 @@ class BillboardAllocatorGNN(nn.Module):
             Linear(hidden_dim, hidden_dim)
         )
         
-        # FIXED: Initialize all attention and projection layers in __init__
+        # Initialize all attention and projection layers in __init__
         if use_attention:
             self.attention = AttentionModule(hidden_dim, num_heads=4)
             
-            # CRITICAL FIX: Pre-initialize projection layers for each mode
+            # Pre-initialize projection layers for each mode
             if self.mode == 'na':
                 # Project billboard features to ad embedding dimension for attention
                 self.na_billboard_proj = Linear(self.billboard_embed_dim, hidden_dim)
@@ -531,10 +422,8 @@ class BillboardAllocatorGNN(nn.Module):
                 # Project billboard features to ad embedding dimension for attention
                 self.ea_billboard_proj = Linear(self.billboard_embed_dim, hidden_dim)
                 
-        # Build mode-specific components
         self._build_mode_specific_layers(hidden_dim, dropout)
         
-        # Log parameter counts for debugging
         total_params = sum(p.numel() for p in self.parameters())
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         logger.info(f"Model initialized: {total_params} total parameters, "
@@ -550,18 +439,18 @@ class BillboardAllocatorGNN(nn.Module):
         
         if self.mode == 'na':
             # Node Action: Score individual billboards for a given ad
-            # INFERENCE-STABLE: Use LayerNorm instead of BatchNorm1d
+
             input_dim = self.billboard_embed_dim + hidden_dim
             self.actor_head = nn.Sequential(
                 Linear(input_dim, 2 * hidden_dim),
-                LayerNorm(2 * hidden_dim),  # Was BatchNorm1d - caused train/eval gap
+                LayerNorm(2 * hidden_dim),
                 ReLU(),
                 Dropout(dropout),
                 Linear(2 * hidden_dim, hidden_dim),
                 ReLU(),
                 Linear(hidden_dim, 1)
             )
-            
+
         elif self.mode == 'ea':
             # Edge Action: Score ad-billboard pairs directly
             # SEMANTIC FEATURES: Edge features (budget_ratio, influence, is_free)
@@ -581,24 +470,16 @@ class BillboardAllocatorGNN(nn.Module):
             else:
                 pair_dim = self.billboard_embed_dim + hidden_dim + projected_edge_feat_dim
 
-            # INFERENCE-STABLE: Use LayerNorm instead of BatchNorm1d
-            # BatchNorm uses different statistics in train vs eval mode, causing
-            # the model to output zeros during evaluation (test_reward=0)
+
             self.pair_scorer = nn.Sequential(
                 Linear(pair_dim, hidden_dim),
-                LayerNorm(hidden_dim),  # Was BatchNorm1d - caused train/eval gap
+                LayerNorm(hidden_dim),
                 ReLU(),
                 Dropout(dropout),
                 Linear(hidden_dim, hidden_dim // 2),
                 ReLU(),
                 Linear(hidden_dim // 2, 1)
             )
-
-            # Neutral initialization for TopKSelection distribution
-            # With softmax-based TopKSelection, bias doesn't affect relative ranking
-            # (all logits shifted equally), so we use neutral initialization.
-            # The model learns to DIFFERENTIATE scores for high vs low value pairs.
-            # TopKSelection then selects the K highest-scoring pairs.
             with torch.no_grad():
                 self.pair_scorer[-1].bias.fill_(0.0)
 
@@ -617,11 +498,11 @@ class BillboardAllocatorGNN(nn.Module):
             )
             
             # Head 2: Billboard selection network (conditioned on chosen ad)
-            # INFERENCE-STABLE: Use LayerNorm instead of BatchNorm1d
+
             billboard_input_dim = self.billboard_embed_dim + hidden_dim
             self.billboard_head = nn.Sequential(
                 Linear(billboard_input_dim, 2 * hidden_dim),
-                LayerNorm(2 * hidden_dim),  # Was BatchNorm1d - caused train/eval gap
+                LayerNorm(2 * hidden_dim),
                 ReLU(),
                 Dropout(dropout),
                 Linear(2 * hidden_dim, hidden_dim),
@@ -630,24 +511,63 @@ class BillboardAllocatorGNN(nn.Module):
             )
 
         # Critic network (shared across all modes)
-        # INFERENCE-STABLE: Use LayerNorm instead of BatchNorm1d
         self.critic = nn.Sequential(
             Linear(self.billboard_embed_dim, 2 * hidden_dim),
-            LayerNorm(2 * hidden_dim),  # Was BatchNorm1d - caused train/eval gap
+            LayerNorm(2 * hidden_dim),
             ReLU(),
             Dropout(dropout),
             Linear(2 * hidden_dim, hidden_dim),
             ReLU(),
             Linear(hidden_dim, 1)
         )
-        
+
         logger.debug(f"Built {self.mode.upper()} mode-specific layers")
-        
+
+    def _batch_gnn_encode(self, nodes: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        """
+        Batched GNN encoding via super-graph construction.
+
+        Instead of looping over batch samples, constructs a single disconnected
+        super-graph where each sample's nodes are offset so they don't interact.
+        Mathematically identical to per-sample encoding but eliminates the Python loop.
+
+        Args:
+            nodes: (B, N, F) batched node features
+            edge_index: (2, E) shared edge index (same topology for all samples)
+
+        Returns:
+            (B, N, output_dim) normalized batched node embeddings
+        """
+        batch_size, n_nodes, _ = nodes.shape
+
+        # Single-sample path (no super-graph needed)
+        if batch_size == 1:
+            flat_out = self.graph_encoder(nodes.squeeze(0), edge_index)
+            flat_out = self.billboard_norm(flat_out)
+            return flat_out.unsqueeze(0)
+
+        # 1. Flatten nodes: (B, N, F) -> (B*N, F)
+        x_flat = nodes.reshape(batch_size * n_nodes, -1)
+
+        # 2. Build batched edge_index with offsets
+        n_edges = edge_index.shape[1]
+        edge_batch = edge_index.repeat(1, batch_size)  # (2, E*B)
+        offsets = torch.arange(batch_size, device=nodes.device).repeat_interleave(n_edges) * n_nodes
+        edge_batch = edge_batch + offsets.unsqueeze(0)
+
+        # 3. Single GNN forward pass on super-graph
+        out_flat = self.graph_encoder(x_flat, edge_batch)  # (B*N, D)
+
+        out_flat = self.billboard_norm(out_flat)
+
+        # 5. Reshape back: (B*N, D) -> (B, N, D)
+        return out_flat.reshape(batch_size, n_nodes, -1)
+
     def forward(self, observations: Dict[str, torch.Tensor], 
                 state: Optional[torch.Tensor] = None, 
                 info: Dict[str, Any] = {}) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        FIXED: Forward pass with comprehensive validation and proper parameter usage.
+        Forward pass with comprehensive validation and proper parameter usage.
         
         This method now uses only pre-initialized parameters and layers, ensuring
         proper gradient flow and optimization.
@@ -671,35 +591,21 @@ class BillboardAllocatorGNN(nn.Module):
         
         batch_size = observations['graph_nodes'].shape[0]
         
-        # Preprocess observations for numerical stability
         if info.get('preprocess', True):
             observations = preprocess_observations(observations)
 
         observations = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                         for k,v in observations.items()}
 
-        # Memory-efficient processing: process samples individually
-        # All samples share the same graph topology, so we reuse edge structure
+        # All samples share the same graph topology
         edge_index = observations['graph_edge_links'][0].to(device).long()
 
-        # Process samples one at a time to completely avoid graph batching OOM
-        billboard_embeds_list = []
-        for b in range(batch_size):
-            sample_nodes = observations['graph_nodes'][b].float()
-            sample_embeds = self.graph_encoder(sample_nodes, edge_index)
-            billboard_embeds_list.append(sample_embeds.unsqueeze(0))
+        billboard_embeds = self._batch_gnn_encode(
+            observations['graph_nodes'].float(), edge_index
+        )
 
-        # Stack all samples
-        billboard_embeds = torch.cat(billboard_embeds_list, dim=0)
-
-        # INFERENCE-STABLE: Apply LayerNorm to embeddings (not raw features)
-        # This is sample-independent normalization - works for batch_size=1
-        billboard_embeds = self.billboard_norm(billboard_embeds)
-        
-        # Get action mask
         mask = observations['mask'].bool()
         
-        # FIXED: Mode-specific forward pass using pre-initialized layers
         if self.mode == 'na':
             probs, new_state = self._forward_na_fixed(billboard_embeds, observations, mask, batch_size, state, info)
         elif self.mode == 'ea':
@@ -719,35 +625,28 @@ class BillboardAllocatorGNN(nn.Module):
                          mask: torch.Tensor, batch_size: int, state: Optional[torch.Tensor],
                          info: Dict[str, Any]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        FIXED: Node Action forward pass using pre-initialized parameters.
+        Node Action forward pass using pre-initialized parameters.
         """
         
-        # Get current ad features
         current_ad = observations['current_ad']  # (batch_size, ad_feat_dim)
         ad_embed = self.ad_encoder(current_ad)  # (batch_size, hidden_dim)
-        
-        # Expand ad embedding to match billboards
+
         ad_embed_expanded = ad_embed.unsqueeze(1).expand(-1, self.n_billboards, -1)
-        
-        # Combine billboard and ad features
+
         combined_features = torch.cat([billboard_embeds, ad_embed_expanded], dim=-1)
         
-        # FIXED: Apply attention using pre-initialized layers
         if self.use_attention:
             # Use ad as query, projected billboards as key/value
             ad_query = ad_embed.unsqueeze(1)  # (batch_size, 1, hidden_dim)
             
-            # FIXED: Use pre-initialized projection layer instead of creating new one
             billboard_key_value = self.na_billboard_proj(billboard_embeds)
             
             attended_features = self.attention(ad_query, billboard_key_value, billboard_key_value)
             combined_features = torch.cat([billboard_embeds, attended_features.expand(-1, self.n_billboards, -1)], dim=-1)
         
-        # Score billboards
         combined_flat = combined_features.view(-1, combined_features.shape[-1])
         scores = self.actor_head(combined_flat).view(batch_size, self.n_billboards)
-        
-        # Apply mask and softmax
+
         scores[~mask] = self.min_val
         probs = F.softmax(scores, dim=1)
         
@@ -808,12 +707,11 @@ class BillboardAllocatorGNN(nn.Module):
 
         Extracted from _forward_ea_fixed to enable chunked processing for large batches.
         """
-        # Get ad features
         ad_features = observations['ad_features']  # (batch_size, max_ads, ad_feat_dim)
         ad_embeds = self.ad_encoder(ad_features.view(-1, ad_features.shape[-1]))
         ad_embeds = ad_embeds.view(batch_size, self.max_ads, -1)
 
-        # Get edge features (semantic signals for matching)
+        # Edge features for matching
         edge_features = observations.get('edge_features')  # (batch_size, max_ads, n_billboards, 3)
         if edge_features is None:
             # Fallback for backwards compatibility
@@ -822,12 +720,10 @@ class BillboardAllocatorGNN(nn.Module):
                 device=ad_embeds.device, dtype=ad_embeds.dtype
             )
 
-        # Create all ad-billboard pairs
         ad_expanded = ad_embeds.unsqueeze(2).expand(-1, -1, self.n_billboards, -1)
         billboard_expanded = billboard_embeds.unsqueeze(1).expand(-1, self.max_ads, -1, -1)
 
         if self.use_attention:
-            # Apply attention using pre-initialized projection layer
             ad_query = ad_expanded.reshape(-1, self.n_billboards, ad_expanded.shape[-1])
             billboard_kv = billboard_expanded.reshape(-1, self.n_billboards, billboard_expanded.shape[-1])
 
@@ -839,12 +735,10 @@ class BillboardAllocatorGNN(nn.Module):
             # Simple concatenation fallback
             pair_features = torch.cat([ad_expanded, billboard_expanded], dim=-1)
 
-        # SEMANTIC FEATURES: Project edge features to prevent scale drowning (3d → 16d)
-        # Then concatenate to pair representation for explicit matching quality signals
+        # Project edge features
         edge_features_proj = self.edge_feat_proj(edge_features)
         pair_features = torch.cat([pair_features, edge_features_proj], dim=-1)
 
-        # Score pairs
         pair_flat = pair_features.reshape(-1, pair_features.shape[-1])
         scores = self.pair_scorer(pair_flat).reshape(batch_size, self.max_ads * self.n_billboards)
 
@@ -866,7 +760,6 @@ class BillboardAllocatorGNN(nn.Module):
         This allows Tianshou to batch them properly. The distribution splits them back.
         """
 
-        # Get ad features
         ad_features = observations['ad_features']  # (batch_size, max_ads, ad_feat_dim)
         ad_embeds = self.ad_encoder(ad_features.view(-1, ad_features.shape[-1]))
         ad_embeds = ad_embeds.view(batch_size, self.max_ads, -1)
@@ -875,8 +768,7 @@ class BillboardAllocatorGNN(nn.Module):
         ad_logits = self.ad_head(ad_embeds.view(-1, ad_embeds.shape[-1])).view(batch_size, self.max_ads)
 
         # Create ad mask: ad is valid if it has ANY available billboard
-        # Old: mask[:, :, 0] took first billboard column (wrong semantics)
-        # New: any(dim=-1) checks if any billboard is valid for each ad
+        # ad is valid if ANY billboard is valid
         ad_mask = mask.any(dim=-1).bool()  # (batch_size, max_ads)
         ad_logits[~ad_mask] = self.min_val
 
@@ -918,32 +810,21 @@ class BillboardAllocatorGNN(nn.Module):
         device = next(self.parameters()).device
         observations = preprocess_observations(observations)
 
-        # Move observations to the correct device
         observations = {k: v.to(device) if isinstance(v, torch.Tensor) else v
                         for k, v in observations.items()}
 
         batch_size = observations['graph_nodes'].shape[0]
 
-        # Use the first graph structure (all samples share the same graph topology)
+        # All samples share the same graph topology
         edge_index = observations['graph_edge_links'][0].to(device).long()
 
-        # Process samples one at a time to avoid OOM
-        all_pooled = []
-        for b in range(batch_size):
-            # Get single sample nodes
-            sample_nodes = observations['graph_nodes'][b].float()
+        billboard_embeds = self._batch_gnn_encode(
+            observations['graph_nodes'].float(), edge_index
+        )
 
-            # Encode billboard features for this sample
-            sample_embeds = self.graph_encoder(sample_nodes, edge_index)
+        # Mean pool per sample: (B, N, D) -> (B, D)
+        pooled = billboard_embeds.mean(dim=1)
 
-            # Pool for this sample
-            sample_pooled = torch.mean(sample_embeds, dim=0, keepdim=True)
-            all_pooled.append(sample_pooled)
-
-        # Concatenate all samples
-        pooled = torch.cat(all_pooled, dim=0)
-
-        # Compute state values
         values = self.critic(pooled).squeeze(-1)
 
         return values
@@ -964,14 +845,12 @@ class BillboardAllocatorGNN(nn.Module):
         if isinstance(probs, tuple):  # MH mode
             ad_probs, bb_probs = probs
             
-            # Compute entropy (measure of randomness)
             ad_entropy = (-ad_probs * torch.log(ad_probs + 1e-8)).sum(dim=1).mean().item()
             bb_entropy = (-bb_probs * torch.log(bb_probs + 1e-8)).sum(dim=1).mean().item()
             
             logger.debug(f"Ad probabilities: shape={ad_probs.shape}, entropy={ad_entropy:.4f}")
             logger.debug(f"Billboard probabilities: shape={bb_probs.shape}, entropy={bb_entropy:.4f}")
             
-            # Check for probability concentration
             ad_max_prob = ad_probs.max(dim=1)[0].mean().item()
             bb_max_prob = bb_probs.max(dim=1)[0].mean().item()
             
@@ -1105,208 +984,3 @@ class BillboardAllocatorGNN(nn.Module):
         }
         
         return grad_info
-
-def create_model(config: Dict[str, Any]) -> BillboardAllocatorGNN:
-    """
-    Factory function to create GNN model with comprehensive validation.
-    
-    Args:
-        config: Dictionary containing model configuration
-        
-    Returns:
-        Initialized model with validated configuration
-        
-    Raises:
-        ValueError: If configuration is invalid
-    """
-    
-    # Validate required configuration keys
-    required_keys = ['node_feat_dim', 'ad_feat_dim', 'hidden_dim', 'n_graph_layers', 'mode']
-    missing_keys = [key for key in required_keys if key not in config]
-    if missing_keys:
-        raise ValueError(f"Missing required configuration keys: {missing_keys}")
-    
-    # Validate configuration values
-    if config['hidden_dim'] <= 0:
-        raise ValueError(f"hidden_dim must be positive, got {config['hidden_dim']}")
-    if config['n_graph_layers'] <= 0:
-        raise ValueError(f"n_graph_layers must be positive, got {config['n_graph_layers']}")
-    
-    logger.info(f"Creating model with config: {config}")
-    
-    return BillboardAllocatorGNN(**config)
-
-# FIXED: Example configurations with proper parameter settings
-DEFAULT_CONFIGS = {
-    'na_billboard_nyc': {
-        'node_feat_dim': 10,  # Billboard feature vector size from environment
-        'ad_feat_dim': 8,     # Ad feature vector size from environment
-        'hidden_dim': 128,
-        'n_graph_layers': 3,
-        'mode': 'na',
-        'n_billboards': 444,  # Actual NYC billboards
-        'max_ads': 20,
-        'use_attention': True,
-        'conv_type': 'gin',
-        'dropout': 0.1,
-        'min_val': -1e8
-    },
-    'ea_billboard_nyc': {
-        'node_feat_dim': 10,
-        'ad_feat_dim': 8,
-        'hidden_dim': 128,    # Full capacity - chunked processing prevents OOM
-        'n_graph_layers': 3,  # Full capacity - chunked processing handles large batches
-        'mode': 'ea',
-        'n_billboards': 444,
-        'max_ads': 20,
-        'use_attention': False,  # Disabled - attention causes OOM with large EA action space
-        'conv_type': 'gin',   # GIN instead of GAT - GAT uses attention which causes OOM
-        'dropout': 0.15,
-        'min_val': -1e8
-    },
-    'mh_billboard_nyc': {
-        'node_feat_dim': 10,
-        'ad_feat_dim': 8,
-        'hidden_dim': 256,
-        'n_graph_layers': 4,
-        'mode': 'mh',
-        'n_billboards': 444,
-        'max_ads': 20,
-        'use_attention': True,
-        'conv_type': 'gin',
-        'dropout': 0.1,
-        'min_val': -1e8
-    },
-    # Test configurations for development and validation
-    'na_test': {
-        'node_feat_dim': 10,
-        'ad_feat_dim': 8,
-        'hidden_dim': 64,
-        'n_graph_layers': 2,
-        'mode': 'na',
-        'n_billboards': 50,   # Subset for testing
-        'max_ads': 10,
-        'use_attention': True,
-        'conv_type': 'gin',
-        'dropout': 0.1
-    },
-    'ea_test': {
-        'node_feat_dim': 10,
-        'ad_feat_dim': 8,
-        'hidden_dim': 128,
-        'n_graph_layers': 2,
-        'mode': 'ea',
-        'n_billboards': 50,
-        'max_ads': 10,
-        'use_attention': False,  # Disabled for EA mode to avoid OOM
-        'conv_type': 'gin',
-        'dropout': 0.1
-    },
-    'mh_test': {
-        'node_feat_dim': 10,
-        'ad_feat_dim': 8,
-        'hidden_dim': 128,
-        'n_graph_layers': 2,
-        'mode': 'mh',
-        'n_billboards': 50,
-        'max_ads': 10,
-        'use_attention': True,
-        'conv_type': 'gin',
-        'dropout': 0.1
-    }
-}
-
-if __name__ == "__main__":
-    # Test model creation and validation with comprehensive error checking
-    print("Testing FIXED GNN Billboard Allocator Models...")
-    
-    # Test each configuration
-    for config_name in ['na_test', 'ea_test', 'mh_test']:
-        print(f"\n=== Testing {config_name} ===")
-        
-        try:
-            config = DEFAULT_CONFIGS[config_name]
-            model = create_model(config)
-            
-            # Get parameter summary
-            param_summary = model.get_parameter_summary()
-            print(f"Created {config['mode'].upper()} model:")
-            print(f"  - Total parameters: {param_summary['total_parameters']:,}")
-            print(f"  - Model size: {param_summary['model_size_mb']:.2f} MB")
-            
-            # Test forward pass with proper error handling
-            batch_size = 2
-            
-            # Create appropriate test observations for each mode
-            if config['mode'] == 'na':
-                observations = {
-                    'graph_nodes': torch.randn(batch_size, config['n_billboards'], config['node_feat_dim']),
-                    'graph_edge_links': torch.randint(0, config['n_billboards'], (batch_size, 2, 20)),
-                    'mask': torch.ones(batch_size, config['n_billboards']).bool(),
-                    'current_ad': torch.randn(batch_size, config['ad_feat_dim'])
-                }
-            else:  # EA or MH modes
-                observations = {
-                    'graph_nodes': torch.randn(batch_size, config['n_billboards'], config['node_feat_dim']),
-                    'graph_edge_links': torch.randint(0, config['n_billboards'], (batch_size, 2, 20)),
-                    'ad_features': torch.randn(batch_size, config['max_ads'], config['ad_feat_dim'])
-                }
-                
-                if config['mode'] == 'ea':
-                    observations['mask'] = torch.ones(batch_size, config['max_ads'] * config['n_billboards']).bool()
-                else:  # MH mode
-                    observations['mask'] = torch.ones(batch_size, config['max_ads'], config['n_billboards']).bool()
-            
-            # Test forward passes (first without gradients for validation)
-            with torch.no_grad():
-                # Actor forward pass
-                actor_output, state = model(observations)
-                
-                # Critic forward pass
-                critic_output = model.critic_forward(observations)
-                
-                # Validate outputs
-                if isinstance(actor_output, tuple):
-                    print(f"  - Actor output shapes: {[o.shape for o in actor_output]}")
-                    # Verify probabilities sum to 1
-                    for i, probs in enumerate(actor_output):
-                        prob_sums = probs.sum(dim=1)
-                        if not torch.allclose(prob_sums, torch.ones_like(prob_sums), atol=1e-6):
-                            print(f"    WARNING: Head {i} probabilities don't sum to 1")
-                else:
-                    print(f"  - Actor output shape: {actor_output.shape}")
-                    # Verify probabilities sum to 1
-                    prob_sums = actor_output.sum(dim=1)
-                    if not torch.allclose(prob_sums, torch.ones_like(prob_sums), atol=1e-6):
-                        print(f"    WARNING: Probabilities don't sum to 1")
-                
-                print(f"  - Critic output shape: {critic_output.shape}")
-            
-            # Test gradient flow by running a backward pass WITH gradients enabled
-            critic_output = model.critic_forward(observations)
-            dummy_loss = critic_output.mean()
-            dummy_loss.backward()
-            
-            # Check gradients
-            grad_info = model.check_gradient_flow()
-            params_with_grads = grad_info['grad_statistics']['parameters_with_gradients']
-            total_params = len(list(model.parameters()))
-            print(f"  - Gradient flow: {params_with_grads}/{total_params} parameters have gradients")
-            
-            if params_with_grads < total_params:
-                print(f"    WARNING: {total_params - params_with_grads} parameters missing gradients")
-                
-                print(f"âœ… {config_name} test PASSED!")
-                
-        except Exception as e:
-            print(f" {config_name} test FAILED: {str(e)}")
-            import traceback
-            traceback.print_exc()
-    
-    print("\n All FIXED model tests completed!")
-    print("\n CRITICAL FIXES VERIFIED:")
-    print("… No dynamic Parameter creation during forward pass")
-    print("… No dynamic Linear layer creation during forward pass") 
-    print("… All learnable parameters properly initialized in __init__")
-    print("… Proper gradient flow to all parameters")
-    print("… Enhanced validation and error handling")

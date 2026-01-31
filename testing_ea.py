@@ -5,17 +5,14 @@ Efficient testing for ad-billboard pair selection with minimal redundancy
 
 import torch
 import numpy as np
-import pandas as pd
 from pathlib import Path
 import json
 from collections import defaultdict
 import matplotlib.pyplot as plt
-import seaborn as sns
 from typing import Dict, List, Tuple, Optional
 import time
 from datetime import datetime
 
-# Import environment and model
 from optimized_env import OptimizedBillboardEnv, EnvConfig
 from models import BillboardAllocatorGNN
 from pettingzoo.utils import BaseWrapper
@@ -177,21 +174,22 @@ def load_ea_model(model_path: str, device: torch.device, n_billboards: int, max_
     else:
         config = {
             'node_feat_dim': 10,
-            'ad_feat_dim': 8,
-            'hidden_dim': 256,
-            'n_graph_layers': 4,
+            'ad_feat_dim': 12,
+            'hidden_dim': 128,
+            'n_graph_layers': 3,
             'mode': 'ea',
             'n_billboards': n_billboards,
             'max_ads': max_ads,
-            'use_attention': True,
-            'conv_type': 'gat',
-            'dropout': 0.0  # No dropout during testing
+            'use_attention': False,
+            'conv_type': 'gin',
+            'dropout': 0.0
         }
 
     model = BillboardAllocatorGNN(**config).to(device)
 
-    # Load weights
-    if 'actor_state_dict' in checkpoint:
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    elif 'actor_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['actor_state_dict'])
     else:
         model.load_state_dict(checkpoint)

@@ -9,12 +9,10 @@ import pandas as pd
 from pathlib import Path
 import json
 import matplotlib.pyplot as plt
-import seaborn as sns
 from typing import Dict, List, Tuple
 import time
 from datetime import datetime
 
-# Import environment and model
 from optimized_env import OptimizedBillboardEnv, EnvConfig
 from models import BillboardAllocatorGNN
 from pettingzoo.utils import BaseWrapper
@@ -105,21 +103,22 @@ def load_model(model_path: str, device: torch.device, n_billboards: int) -> Bill
     else:
         config = {
             'node_feat_dim': 10,
-            'ad_feat_dim': 8,
+            'ad_feat_dim': 12,
             'hidden_dim': 128,
             'n_graph_layers': 3,
             'mode': 'na',
             'n_billboards': n_billboards,
-            'max_ads': 20,
+            'max_ads': 8,
             'use_attention': True,
             'conv_type': 'gin',
-            'dropout': 0.0  # No dropout during testing
+            'dropout': 0.0
         }
 
     model = BillboardAllocatorGNN(**config).to(device)
 
-    # Load weights
-    if 'actor_state_dict' in checkpoint:
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    elif 'actor_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['actor_state_dict'])
     else:
         model.load_state_dict(checkpoint)

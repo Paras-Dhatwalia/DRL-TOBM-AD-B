@@ -1,0 +1,7 @@
+/venv
+__pychache__/
+*.pyc
+tmpclaude-*
+nul
+.claude/
+events.out.tfevents.*

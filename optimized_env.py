@@ -13,27 +13,24 @@ import gymnasium as gym
 from gymnasium import spaces
 import torch
 
-# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-#  CONFIGURATION 
 @dataclass
 class EnvConfig:
     """Environment configuration parameters"""
     influence_radius_meters: float = 100.0
     slot_duration_range: Tuple[int, int] = (2, 3)
-    new_ads_per_step_range: Tuple[int, int] = (0, 3)  # Increased from (0,2) for more ad flow
+    new_ads_per_step_range: Tuple[int, int] = (0, 3)
     tardiness_cost: float = 50.0
-    max_events: int = 1440  # Full day (1 minute per step, 1440 minutes = 24 hours)
-    max_active_ads: int = 8  # Reduced from 20 to allow concentration (50 allocs / 8 ads = 6+ billboards each)
-    ad_ttl: int = 720  # Ad time-to-live in timesteps (increased from 600 for more accumulation time)
+    max_events: int = 1440  # 1 minute per step, 1440 minutes = 24 hours
+    max_active_ads: int = 8
+    ad_ttl: int = 720  # Ad time-to-live in timesteps
     graph_connection_distance: float = 5000.0
-    cache_ttl: int = 1  # Cache TTL in steps
+    cache_ttl: int = 1
     enable_profiling: bool = False
     debug: bool = False
 
-#  PERFORMANCE MONITORING 
 class PerformanceMonitor:
     """Track performance metrics and timing"""
     def __init__(self):
@@ -87,7 +84,6 @@ class PerformanceMonitor:
             hit_rate = self.cache_hits / (self.cache_hits + self.cache_misses)
             logger.info(f"Cache hit rate: {hit_rate:.2%}")
 
-#  HELPER FUNCTIONS 
 def time_str_to_minutes(v: Any) -> int:
     """Convert time string to minutes since midnight."""
     if isinstance(v, str) and ":" in v:
@@ -125,7 +121,6 @@ def validate_csv(df: pd.DataFrame, required_columns: List[str], csv_name: str):
     if missing:
         raise ValueError(f"{csv_name} missing required columns: {missing}")
 
-#  DATA CLASSES 
 class Ad:
     """Represents an advertisement with demand and payment attributes."""
 
@@ -134,8 +129,8 @@ class Ad:
         self.aid = aid
         self.demand = float(demand)
         self.payment = float(payment)  # Total budget available
-        self.remaining_budget = float(payment)  # BUDGET TRACKING: Money left to spend
-        self.total_cost_spent = 0.0  # BUDGET TRACKING: Total spent on billboards
+        self.remaining_budget = float(payment)
+        self.total_cost_spent = 0.0
         self.payment_demand_ratio = float(payment_demand_ratio)
         self.ttl = ttl
         self.original_ttl = ttl
@@ -164,9 +159,9 @@ class Ad:
         """
         if self.remaining_budget >= billboard_cost:
             self.assigned_billboards.add(b_id)
-            self.remaining_budget -= billboard_cost  # BUDGET TRACKING: Deduct cost
-            self.total_cost_spent += billboard_cost  # BUDGET TRACKING: Track spending
-            self._cached_influence = None  # Invalidate cache
+            self.remaining_budget -= billboard_cost
+            self.total_cost_spent += billboard_cost
+            self._cached_influence = None
             return True
         else:
             return False  # Can't afford this billboard
@@ -174,13 +169,13 @@ class Ad:
     def release_billboard(self, b_id: int):
         """Release a billboard from this ad."""
         self.assigned_billboards.discard(b_id)
-        self._cached_influence = None  # Invalidate cache
+        self._cached_influence = None
 
     def norm_payment_ratio(self) -> float:
         """Normalized payment ratio using sigmoid function."""
         return 1.0 / (1.0 + math.exp(-(self.payment_demand_ratio - 1.0)))
 
-    # FIXED SCALING CONSTANTS for inference-stable normalization
+    # Scaling constants for inference-stable normalization
     # These ensure all features are in [0, 1] regardless of batch size
     # Values from Advertiser_100.csv: Demand=100-149, Payment=90k-161k, Ratio=902-1099
     MAX_DEMAND = 200.0         # Demand range: 100-149, buffer to 200
@@ -246,7 +241,7 @@ class Billboard:
         self.occupied_until = 0
         return ad_id
 
-    # FIXED SCALING CONSTANTS for inference-stable normalization
+    # Scaling constants for inference-stable normalization
     # These ensure all features are in [0, 1] regardless of batch size
     # Values from BB_NYC.csv: B_Size=80-670, B_Cost=0.25-104.5, Influence=0.4-149.8
     MAX_COST = 150.0         # Cost range: 0.25-104.5, buffer to 150
@@ -267,7 +262,7 @@ class Billboard:
             0.0 if self.is_free() else 1.0,  # is_occupied [0, 1]
             min(self.b_cost / self.MAX_COST, 1.0),      # [0, 1]
             min(self.b_size / self.MAX_SIZE, 1.0),      # [0, 1]
-            min(self.influence / self.MAX_INFLUENCE, 1.0),  # [0, 1] - was raw value!
+            min(self.influence / self.MAX_INFLUENCE, 1.0),  # [0, 1]
             self.p_size,                                 # Already normalized [0, 1]
             min(self.occupied_until / self.MAX_DURATION, 1.0),  # [0, 1]
             min(self.total_usage / self.MAX_USAGE, 1.0),        # [0, 1]
@@ -276,11 +271,8 @@ class Billboard:
         ], dtype=np.float32)
 
 
-#  OPTIMIZED ENVIRONMENT 
 class OptimizedBillboardEnv(gym.Env):
     """
-    FIXED: Changed from AECEnv to gym.Env (single-agent, synchronous).
-
     Optimized Dynamic Billboard Allocation Environment with vectorized operations.
 
     Key optimizations:
@@ -299,7 +291,6 @@ class OptimizedBillboardEnv(gym.Env):
         
         super().__init__()
         
-        # Use provided config or default
         self.config = config or EnvConfig()
         
         if seed is not None:
@@ -314,13 +305,10 @@ class OptimizedBillboardEnv(gym.Env):
         
         logger.info(f"Initializing OptimizedBillboardEnv with action_mode={self.action_mode}")
         
-        # Performance monitoring
         self.perf_monitor = PerformanceMonitor() if self.config.enable_profiling else None
 
-        # Load and process data
         self._load_data(billboard_csv, advertiser_csv, trajectory_csv, start_time_min)
         
-        # Precompute billboard properties
         self._precompute_billboard_properties()
         
         # Create graph structure
@@ -330,14 +318,12 @@ class OptimizedBillboardEnv(gym.Env):
         # Gym-style action/observation spaces
         self._setup_action_observation_spaces()
 
-        # Runtime state
         self._initialize_state()
     
     def _load_data(self, billboard_csv: str, advertiser_csv: str, 
                    trajectory_csv: str, start_time_min: Optional[int]):
         """Load and preprocess all data files with validation."""
         
-        # Load and validate billboard data
         bb_df = pd.read_csv(billboard_csv)
         validate_csv(bb_df, ['B_id', 'Latitude', 'Longitude', 'B_Size', 'B_Cost', 'Influence'], 
                     "Billboard CSV")
@@ -360,7 +346,6 @@ class OptimizedBillboardEnv(gym.Env):
         self.billboard_map = {b.b_id: b for b in self.billboards}
         self.billboard_id_to_node_idx = {b.b_id: i for i, b in enumerate(self.billboards)}
         
-        # Load and validate advertiser data
         adv_df = pd.read_csv(advertiser_csv)
         adv_df.columns = adv_df.columns.str.strip().str.replace('\ufeff', '')
         validate_csv(adv_df, ['Id', 'Demand', 'Payment', 'Payment_Demand_Ratio'],
@@ -379,7 +364,6 @@ class OptimizedBillboardEnv(gym.Env):
                    payment_demand_ratio=float(ratio), ttl=self.config.ad_ttl)
             )
         
-        # Load and validate trajectory data
         traj_df = pd.read_csv(trajectory_csv)
         validate_csv(traj_df, ['Time', 'Latitude', 'Longitude'], "Trajectory CSV")
         
@@ -618,12 +602,19 @@ class OptimizedBillboardEnv(gym.Env):
             'billboard_utilization': 0.0
         }
 
-        # CANONICAL REWARD: Event-based tracking
+        # Running average utilization
+        self.utilization_sum: float = 0.0
+
         self.ads_completed_this_step: List[int] = []
         self.ads_failed_this_step: List[int] = []  # Track new failures
-        self.allocations_this_step: int = 0  # Track successful allocations for reward shaping
 
-        # ADVERTISER TRACKING: Track used advertiser IDs within current episode
+        # SUB-STEP STATE: For NA/MH modes, each real timestep has K sub-steps
+        # (one per active ad).
+        self.sub_step_counter: int = 0
+        self.sub_step_ads_served: set = set()
+        self.in_sub_step_sequence: bool = False
+
+        # Track used advertiser IDs within current episode.
         # This set acts as a "discard pile" - once an advertiser is used, they
         # cannot be used again until reset() is called (new episode/game)
         self.used_advertiser_ids: set = set()
@@ -634,18 +625,13 @@ class OptimizedBillboardEnv(gym.Env):
     def distance_factor(self, dist_meters: np.ndarray) -> np.ndarray:
         """Vectorized distance effect on billboard influence.
 
-        SIMPLIFIED: All users within influence radius are equally influenced.
-        Previously used linear decay which reduced influence at distance.
-        Distance threshold already handled by influence_radius_meters (100m).
+        All users within radius contribute equally.
         """
-        # All users within radius contribute equally (no distance decay)
         return np.ones_like(dist_meters)
     
     def get_mask(self) -> np.ndarray:
         """
         Get action mask based on current action mode with budget validation.
-
-        OPTIMIZED: Uses NumPy vectorization instead of nested Python loops.
         """
         # Precompute billboard properties once (used by all modes)
         free_mask = np.array([b.is_free() for b in self.billboards], dtype=bool)
@@ -724,6 +710,11 @@ class OptimizedBillboardEnv(gym.Env):
             affordable = budgets[:, None] >= total_costs[None, :]
             valid_pairs = affordable & free_mask
 
+            # SUB-STEP MASKING: zero out rows for already-served ads
+            for i in range(n_active):
+                if active_ads[i].aid in self.sub_step_ads_served:
+                    valid_pairs[i, :] = False
+
             # Create full mask with zero-padding
             pair_mask = np.zeros((self.config.max_active_ads, self.n_nodes), dtype=np.int8)
             pair_mask[:n_active, :] = valid_pairs.astype(np.int8)
@@ -797,8 +788,7 @@ class OptimizedBillboardEnv(gym.Env):
         nodes = np.zeros((self.n_nodes, self.n_node_features), dtype=np.float32)
         for i, b in enumerate(self.billboards):
             feat = b.get_feature_vector()
-            # CRITICAL FIX: Overwrite static influence (index 4) with dynamic influence
-            # This gives the agent "vision" of current traffic patterns
+            # Overwrite static influence with dynamic traffic data
             feat[4] = dynamic_influence[i]
             nodes[i] = feat
         
@@ -823,12 +813,13 @@ class OptimizedBillboardEnv(gym.Env):
             if self.action_mode == 'ea':
                 obs['edge_features'] = self.get_edge_features()
         
-        # Add current ad for NA mode
+        # Add current ad for NA mode (cycles through unserved ads in sub-step mode)
         elif self.action_mode == 'na':
-            active_ads = [ad for ad in self.ads if ad.state == 0]
+            # Get active ads NOT YET SERVED this timestep
+            active_ads = [ad for ad in self.ads if ad.state == 0
+                          and ad.aid not in self.sub_step_ads_served]
             if active_ads:
-                # DETERMINISTIC: Select most urgent ad (lowest TTL ratio) for Markov property
-                # This fixes the non-Markovian behavior from random selection
+                # DETERMINISTIC: Select most urgent unserved ad (lowest TTL ratio)
                 self.current_ad_for_na_mode = min(active_ads,
                                                   key=lambda ad: ad.ttl / max(ad.original_ttl, 1))
                 obs['current_ad'] = self.current_ad_for_na_mode.get_feature_vector()
@@ -840,72 +831,40 @@ class OptimizedBillboardEnv(gym.Env):
 
     def _compute_reward(self) -> float:
         """
-        SEMANTIC LEARNING REWARD FUNCTION (v3.0) - Expected Influence Edition
+        Cost-based reward function (Begnardi-style) with mild progress shaping.
 
-        Design principles:
-        1. Expected influence bonus: Reward based on PREDICTED allocation value
-        2. Strong progress signal: High coefficient for credit assignment
-        3. High completion jackpot: Dominates any spam strategy
-        4. Minimal failure penalty: Don't discourage exploration
-
-        Key changes from v2:
-        - Replaced unconditional allocation bonus with expected influence bonus
-        - Completion jackpot: 20.0 → 100.0 (dominates spam)
-        - Reward clip: 25.0 → 150.0 (let big wins show)
+        4 components:
+        1. Ongoing penalty: -C_ONGOING per active ad per step (very small)
+        2. Tardy penalty: -C_TARDY per newly-failed ad
+        3. Completion bonus: +C_COMPLETION per completed ad
+        4. Progress shaping: +C_PROGRESS * (influence_delta / demand) per active ad
+           Guides exploration by rewarding actual influence accumulation,
+           ~100x weaker than completion bonus.
         """
+        C_ONGOING = 0.001
+        C_TARDY = 1.0
+        C_COMPLETION = 10.0
+        C_PROGRESS = 0.1
 
         reward = 0.0
 
-        # === 1. COMPLETION REWARDS (profit + efficiency bonus) ===
-        for ad_id in self.ads_completed_this_step:
-            ad = next((a for a in self.ads if a.aid == ad_id), None)
-            if ad:
-                # Base profit reward
-                profit = ad.payment - ad.total_cost_spent
-                reward += profit / 100.0  # Scale down for stability
+        # 1. Small ongoing penalty per active ad
+        n_active = sum(1 for ad in self.ads if ad.state == 0)
+        reward -= n_active * C_ONGOING
 
-                # Efficiency bonus: Reward high profit margins
-                efficiency = profit / max(ad.payment, 1e-6)
-                reward += efficiency * 2.0  # Bonus for cost-effective completion
+        # 2. Tardy penalty per newly-failed ad
+        reward -= len(self.ads_failed_this_step) * C_TARDY
 
-                # COMPLETION JACKPOT - high enough to dominate spam strategy
-                # With gamma=0.995, 30-step delay → 0.86 discount → 86 effective value
-                reward += 100.0
-            else:
-                if self.config.debug:
-                    logger.warning(f"Completion reward: Ad {ad_id} not found")
+        # 3. Completion bonus per completed ad
+        reward += len(self.ads_completed_this_step) * C_COMPLETION
 
-        # === 2. PROGRESS REWARDS (STRONGER shaping for credit assignment) ===
+        # 4. Mild progress shaping: reward actual influence toward demand
         for ad in self.ads:
-            if ad.state == 0:  # Active ads only
+            if ad.state == 0:
                 delta = getattr(ad, '_step_delta', 0.0)
-                progress_ratio = delta / max(ad.demand, 1e-6)
-                reward += progress_ratio * 2.0  # 4x stronger than before
+                reward += (delta / max(ad.demand, 1e-6)) * C_PROGRESS
 
-        # === 3. SNIPER APPROACH: Reward quality, not quantity ===
-        # Problem: -0.5 penalty was too harsh → agent paralyzed (-650/episode)
-        # Problem: +0.05 baseline would bring back lazy spammer
-        # Solution: Strong HIT bonus, tiny MISS penalty → 100x contrast
-        # Math: Spam 1000 empty = -10, Pick 1 good (10 users) = +1.0
-        if self.allocations_this_step > 0:
-            if self.expected_influence_this_step > 0.001:  # HIT: Billboard has traffic
-                # Strong positive reinforcement based on quality
-                # Scale: 10 users = +1.0 reward, capped at +5.0
-                reward += min(self.expected_influence_this_step * 0.1, 5.0)
-            else:  # MISS: Billboard is empty
-                # Tiny "transaction cost" - discourages spam without paralysis
-                reward -= 0.01
-
-        # === 4. FAILURE PENALTIES (minimal to encourage exploration) ===
-        for ad_id in self.ads_failed_this_step:
-            ad = next((a for a in self.ads if a.aid == ad_id), None)
-            if ad:
-                waste_ratio = ad.total_cost_spent / max(ad.payment, 1e-6)
-                reward -= waste_ratio * 0.1  # Low penalty
-
-        # === 5. WIDER CLIP (preserve completion jackpot signal) ===
-        # Completion can now give 100+ reward, don't clip it away
-        return np.clip(reward, -10.0, 150.0)   
+        return reward   
     
     def _apply_influence_for_current_minute(self):
         """
@@ -918,7 +877,7 @@ class OptimizedBillboardEnv(gym.Env):
         This eliminates Python dispatch overhead by calling NumPy C-API once
         instead of N_ads times per timestep.
 
-        CANONICAL REWARD: Track per-step delta for progress shaping.
+        Track per-step delta for progress shaping.
         """
         minute_key = (self.start_time_min + self.current_step) % 1440
 
@@ -994,15 +953,15 @@ class OptimizedBillboardEnv(gym.Env):
             ad._step_delta = total_influence
             ad.cumulative_influence += total_influence
 
-            if self.config.debug and delta > 0:
-                logger.debug(f"Ad {ad.aid} gained {delta:.4f} influence")
+            if self.config.debug and ad._step_delta > 0:
+                logger.debug(f"Ad {ad.aid} gained {ad._step_delta:.4f} influence")
 
             # Complete ad if demand is satisfied
             if ad.cumulative_influence >= ad.demand:
                 ad.state = 1  # completed
                 self.performance_metrics['total_ads_completed'] += 1
 
-                # CANONICAL REWARD: Track completion event
+                # Track completion event
                 self.ads_completed_this_step.append(ad.aid)
 
                 # Release billboards and generate revenue
@@ -1069,8 +1028,7 @@ class OptimizedBillboardEnv(gym.Env):
         # Get currently active advertiser IDs
         current_ad_ids = {ad.aid for ad in self.ads}
 
-        # CRITICAL FIX: Exclude both active AND previously used advertiser IDs
-        # This ensures each advertiser is used only once per episode (like drawing from a deck)
+        # Exclude active and previously used advertiser IDs
         excluded_ids = current_ad_ids | self.used_advertiser_ids  # Union of both sets
         available_templates = [a for a in self.ads_db if a.aid not in excluded_ids]
 
@@ -1097,8 +1055,7 @@ class OptimizedBillboardEnv(gym.Env):
                 new_ad.spawn_step = self.current_step
                 self.ads.append(new_ad)
 
-                # CRITICAL: Add to "discard pile" - this advertiser cannot be used again
-                # until reset() is called (new episode starts)
+                # Add to discard pile
                 self.used_advertiser_ids.add(template.aid)
 
                 self.performance_metrics['total_ads_processed'] += 1
@@ -1121,14 +1078,10 @@ class OptimizedBillboardEnv(gym.Env):
                     if 0 <= bb_idx < self.n_nodes and self.billboards[bb_idx].is_free():
                         billboard = self.billboards[bb_idx]
 
-                        # BUDGET TRACKING: Charge cost × duration (per-timestep cost)
                         duration = random.randint(*self.config.slot_duration_range)
                         total_cost = billboard.b_cost * duration
                         if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
                             billboard.assign(ad_to_assign.aid, duration)
-                            self.allocations_this_step += 1  # Track for reward shaping
-                            # Track expected influence for immediate reward
-                            self.expected_influence_this_step += self._get_allocation_expected_influence(bb_idx, duration)
 
                             self.placement_history.append({
                                 'spawn_step': ad_to_assign.spawn_step,
@@ -1137,7 +1090,7 @@ class OptimizedBillboardEnv(gym.Env):
                                 'billboard_id': billboard.b_id,
                                 'duration': duration,
                                 'demand': ad_to_assign.demand,
-                                'cost': total_cost  # Total cost (per-timestep cost × duration)
+                                'cost': total_cost
                             })
 
                             if self.config.debug:
@@ -1172,7 +1125,7 @@ class OptimizedBillboardEnv(gym.Env):
 
                     active_ads = [ad for ad in self.ads if ad.state == 0]
 
-                    # CRITICAL FIX: Track used billboards to prevent multi-assign in same step
+                    # Track used billboards to prevent multi-assign in same step
                     used_billboards = set()
 
                     # ALLOCATION: Process all selected pairs (no limit since influence masking
@@ -1211,15 +1164,10 @@ class OptimizedBillboardEnv(gym.Env):
                                 ad_to_assign = active_ads[ad_idx]
                                 billboard = self.billboards[bb_idx]
 
-                                # BUDGET TRACKING: Charge cost × duration (per-timestep cost)
                                 duration = random.randint(*self.config.slot_duration_range)
                                 total_cost = billboard.b_cost * duration
                                 if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
                                     billboard.assign(ad_to_assign.aid, duration)
-                                    self.allocations_this_step += 1
-                                    # Use cached value instead of recomputing
-                                    self.expected_influence_this_step += float(cached_slot_influence[bb_idx, duration - 1])
-
                                     used_billboards.add(bb_idx)
 
                                     self.placement_history.append({
@@ -1266,18 +1214,11 @@ class OptimizedBillboardEnv(gym.Env):
                             logger.debug(f"Billboard {bb_idx} is occupied")
                         return
 
-                    # BUDGET TRACKING: Charge cost × duration
                     duration = random.randint(*self.config.slot_duration_range)
                     total_cost = billboard.b_cost * duration
 
                     if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
                         billboard.assign(ad_to_assign.aid, duration)
-                        self.allocations_this_step += 1
-
-                        # Use cached slot influence
-                        cached_slot_influence = self._precompute_slot_influence(self.current_step)
-                        self.expected_influence_this_step += float(cached_slot_influence[bb_idx, duration - 1])
-
                         self.placement_history.append({
                             'spawn_step': ad_to_assign.spawn_step,
                             'allocated_step': self.current_step,
@@ -1327,14 +1268,17 @@ class OptimizedBillboardEnv(gym.Env):
             'billboard_utilization': 0.0
         }
 
-        # CANONICAL REWARD: Clear event tracking
         self.ads_completed_this_step.clear()
         self.ads_failed_this_step.clear()
-        self.allocations_this_step = 0
-        self.expected_influence_this_step = 0.0  # Track expected influence from allocations
 
-        # ADVERTISER TRACKING: Shuffle deck - all advertisers become available again
-        # This is the "new game" reset - the discard pile is cleared
+        self.utilization_sum = 0.0
+
+        # SUB-STEP STATE
+        self.sub_step_counter = 0
+        self.sub_step_ads_served = set()
+        self.in_sub_step_sequence = False
+
+        # All advertisers become available again
         self.used_advertiser_ids.clear()
 
         if self.perf_monitor:
@@ -1353,14 +1297,24 @@ class OptimizedBillboardEnv(gym.Env):
     
     
     def _step_internal(self, action):
-        """Internal step implementation (Gym-style)."""
-        # CANONICAL REWARD: Clear events from previous step
+        """Internal step with sub-step support for NA/MH modes.
+
+        EA mode: single full step per call (unchanged behavior).
+        NA/MH mode: each call is one sub-step. A real timestep consists of
+        K sub-steps (one per active ad). Time only advances after all
+        active ads are served.
+        """
+        if self.action_mode == 'ea':
+            return self._full_step(action)
+        else:
+            return self._sub_step(action)
+
+    def _full_step(self, action):
+        """Full-step logic for EA mode (unchanged behavior)."""
         self.ads_completed_this_step.clear()
         self.ads_failed_this_step.clear()
-        self.allocations_this_step = 0
-        self.expected_influence_this_step = 0.0  # Track expected influence from allocations
 
-        # 1. Apply influence for current minute
+        # 1. Apply influence
         self._apply_influence_for_current_minute()
 
         # 2. Tick and release expired billboards
@@ -1370,9 +1324,8 @@ class OptimizedBillboardEnv(gym.Env):
         for ad in self.ads:
             prev_state = ad.state
             ad.step_time()
-            if ad.state == 2 and prev_state != 2:  # became tardy
+            if ad.state == 2 and prev_state != 2:
                 self.performance_metrics['total_ads_tardy'] += 1
-                # CANONICAL REWARD: Track new failures for event-based penalty
                 self.ads_failed_this_step.append(ad.aid)
 
         # 4. Execute agent action
@@ -1381,38 +1334,129 @@ class OptimizedBillboardEnv(gym.Env):
         # 5. Compute reward
         reward = self._compute_reward()
 
-        # 6. Update performance metrics
-        self.performance_metrics['total_revenue'] = sum(b.revenue_generated for b in self.billboards)
+        # 6. Update metrics
+        self.performance_metrics['total_revenue'] = sum(
+            b.revenue_generated for b in self.billboards
+        )
         occupied_count = sum(1 for b in self.billboards if not b.is_free())
-        self.performance_metrics['billboard_utilization'] = occupied_count / max(1, self.n_nodes) * 100
+        self.utilization_sum += occupied_count / max(1, self.n_nodes)
 
         # 7. Spawn new ads
         self._spawn_ads()
 
-        # 8. Update termination conditions
+        # 8. Advance step
         self.current_step += 1
         terminated = (self.current_step >= self.config.max_events)
-        truncated = False
 
-        # Build info dict
-        info = {
+        info = self._build_info_dict()
+        if terminated:
+            self._log_episode_end()
+
+        return self._get_obs(), reward, terminated, False, info
+
+    def _sub_step(self, action):
+        """Sub-step logic for NA/MH modes (Begnardi-style sequential decisions).
+
+        Each real timestep has K sub-steps where K = number of active ads.
+        Sub-step 0: advance time (influence, tick, release).
+        Each sub-step: agent makes one allocation decision.
+        Last sub-step: compute reward, spawn ads, increment real step.
+        """
+        # --- Start of new real timestep ---
+        if not self.in_sub_step_sequence:
+            self.in_sub_step_sequence = True
+            self.sub_step_counter = 0
+            self.sub_step_ads_served = set()
+
+            # Clear events from previous timestep
+            self.ads_completed_this_step.clear()
+            self.ads_failed_this_step.clear()
+
+            # Advance time: influence, tick, release
+            self._apply_influence_for_current_minute()
+            self._tick_and_release_boards()
+
+            for ad in self.ads:
+                prev_state = ad.state
+                ad.step_time()
+                if ad.state == 2 and prev_state != 2:
+                    self.performance_metrics['total_ads_tardy'] += 1
+                    self.ads_failed_this_step.append(ad.aid)
+
+        # --- Execute one allocation ---
+        active_ads = [ad for ad in self.ads if ad.state == 0]
+        n_active = len(active_ads)
+
+        if n_active > 0:
+            self._execute_action(action)
+
+            # Mark ad as served this sub-step
+            if self.action_mode == 'na':
+                if self.current_ad_for_na_mode is not None:
+                    self.sub_step_ads_served.add(self.current_ad_for_na_mode.aid)
+            elif self.action_mode == 'mh':
+                if isinstance(action, (list, np.ndarray, torch.Tensor)):
+                    action_arr = np.asarray(action).flatten()
+                    if len(action_arr) >= 1:
+                        ad_idx = int(action_arr[0])
+                        if 0 <= ad_idx < len(active_ads):
+                            self.sub_step_ads_served.add(active_ads[ad_idx].aid)
+
+        self.sub_step_counter += 1
+
+        # --- Check if all active ads served or safety cap reached ---
+        unserved = [ad for ad in self.ads if ad.state == 0
+                    and ad.aid not in self.sub_step_ads_served]
+        all_served = (len(unserved) == 0)
+        # Safety cap: max sub-steps = max_active_ads (prevents infinite loop
+        # if MH agent repeatedly picks already-served ads despite masking)
+        cap_reached = (self.sub_step_counter >= self.config.max_active_ads)
+
+        if all_served or n_active == 0 or cap_reached:
+            # End of real timestep
+            self.in_sub_step_sequence = False
+
+            reward = self._compute_reward()
+
+            # Update metrics
+            self.performance_metrics['total_revenue'] = sum(
+                b.revenue_generated for b in self.billboards
+            )
+            occupied_count = sum(1 for b in self.billboards if not b.is_free())
+            self.utilization_sum += occupied_count / max(1, self.n_nodes)
+
+            self._spawn_ads()
+
+            self.current_step += 1
+            terminated = (self.current_step >= self.config.max_events)
+
+            info = self._build_info_dict()
+            if terminated:
+                self._log_episode_end()
+
+            return self._get_obs(), reward, terminated, False, info
+        else:
+            # Mid-timestep: return updated obs for next sub-step
+            return self._get_obs(), 0.0, False, False, {'sub_step': True}
+
+    def _build_info_dict(self) -> dict:
+        """Build the info dictionary returned at end of real timestep."""
+        return {
             'total_revenue': self.performance_metrics['total_revenue'],
-            'utilization': self.performance_metrics['billboard_utilization'],
+            'utilization': self.utilization_sum / max(1, self.current_step) * 100,
             'ads_completed': self.performance_metrics['total_ads_completed'],
             'ads_processed': self.performance_metrics['total_ads_processed'],
             'ads_tardy': self.performance_metrics['total_ads_tardy'],
             'current_minute': (self.start_time_min + self.current_step) % 1440
         }
 
-        # Episode-end summary (always logged, not controlled by debug flag)
-        if terminated:
-            c = self.performance_metrics['total_ads_completed']
-            t = self.performance_metrics['total_ads_tardy']
-            p = self.performance_metrics['total_ads_processed']
-            r = self.performance_metrics['total_revenue']
-            logger.info(f"[{self.action_mode.upper()}] {c}/{p} completed, {t} tardy, ${r:.0f}")
-
-        return self._get_obs(), reward, terminated, truncated, info
+    def _log_episode_end(self):
+        """Log episode-end summary."""
+        c = self.performance_metrics['total_ads_completed']
+        t = self.performance_metrics['total_ads_tardy']
+        p = self.performance_metrics['total_ads_processed']
+        r = self.performance_metrics['total_revenue']
+        logger.info(f"[{self.action_mode.upper()}] {c}/{p} completed, {t} tardy, ${r:.0f}")
     
     def render(self, mode="human"):
         """Render current environment state."""
@@ -1473,7 +1517,8 @@ class OptimizedBillboardEnv(gym.Env):
         success_rate = (metrics['total_ads_completed'] / max(1, metrics['total_ads_processed'])) * 100.0
         print(f"Success Rate: {success_rate:.1f}%")
         print(f"Total Revenue Generated: ${metrics['total_revenue']:.2f}")
-        print(f"Average Billboard Utilization: {metrics['billboard_utilization']:.1f}%")
+        avg_util = self.utilization_sum / max(1, self.current_step) * 100
+        print(f"Average Billboard Utilization: {avg_util:.1f}%")
         print(f"Total Placements: {len(self.placement_history)}")
         
         # Performance stats if profiling enabled
