@@ -46,9 +46,9 @@ def setup_logging():
 
 # These paths must be set by each training script before calling train()
 DATA_PATHS = {
-    "billboard_csv": r"path/to/folder",
-    "advertiser_csv": r"path/to/folder",
-    "trajectory_csv": r"path/to/folder",
+    "billboard_csv": r"C:\Coding Files\DRL-TOBM-AD-B\bb_nyc_updated2.csv",
+    "advertiser_csv": r"C:\Coding Files\DRL-TOBM-AD-B\Advertiser_U100.csv",
+    "trajectory_csv": r"C:\Coding Files\DRL-TOBM-AD-B\trajectory_augmented.csv",
 }
 
 # Shared hyperparameters (mode-specific overrides in each script)
@@ -219,7 +219,7 @@ def eval_business_metrics(policy, env_factory, epoch, step_idx,
             action = result_batch.act[0]
             if hasattr(action, 'cpu'):
                 action = action.cpu().numpy()
-            if hasattr(action, 'item'):
+            if hasattr(action, 'item') and action.size == 1:
                 action = action.item()
 
         obs, reward, terminated, truncated, info = eval_env.step(action)
@@ -267,7 +267,7 @@ def run_post_training_eval(policy, env_factory, mode_name):
                 action = result_batch.act[0]
                 if hasattr(action, 'cpu'):
                     action = action.cpu().numpy()
-                if hasattr(action, 'item'):
+                if hasattr(action, 'item') and action.size == 1:
                     action = action.item()
 
             obs, reward, terminated, truncated, info = eval_env.step(action)
