@@ -788,6 +788,18 @@ class BillboardAllocatorGNN(nn.Module):
 
         # Sample or get ad selection for conditioning Head 2
         ad_probs = F.softmax(ad_logits, dim=1)
+
+        # When no ads are valid, softmax of all -1e8 produces NaN (0/0).
+        # Replace NaN rows with uniform so Categorical doesn't crash.
+        nan_rows = torch.isnan(ad_probs).any(dim=-1)
+        if nan_rows.any():
+            uniform = torch.ones(self.max_ads, device=ad_probs.device, dtype=ad_probs.dtype) / self.max_ads
+            ad_probs = torch.where(
+                nan_rows.unsqueeze(-1).expand_as(ad_probs),
+                uniform.unsqueeze(0).expand_as(ad_probs),
+                ad_probs
+            )
+
         if self.training and state is not None and 'learn' in info:
             chosen_ads = state[:, 0].long()
         else:
