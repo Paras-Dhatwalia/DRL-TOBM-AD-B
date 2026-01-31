@@ -9,7 +9,6 @@ and shared critic network.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Categorical
 from torch_geometric.nn import GINConv, GATConv
 from torch.nn import Sequential, Linear, ReLU, LayerNorm, Dropout
 import numpy as np
@@ -762,38 +761,36 @@ class BillboardAllocatorGNN(nn.Module):
         pair_flat = pair_features.reshape(-1, pair_features.shape[-1])
         scores = self.pair_scorer(pair_flat).reshape(batch_size, self.max_ads * self.n_billboards)
 
-        # Apply mask to logits (invalid actions get very negative logits -> ~0 prob after sigmoid)
-        # EA mode uses IndependentBernoulli which applies sigmoid internally
         mask_flat = mask.reshape(batch_size, -1)
         scores[~mask_flat] = self.min_val
 
-        # Return raw logits for IndependentBernoulli distribution
         return scores
         
     def _forward_mh_fixed(self, billboard_embeds: torch.Tensor, observations: Dict[str, torch.Tensor],
                          mask: torch.Tensor, batch_size: int, state: Optional[torch.Tensor],
-                         info: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+                         info: Dict[str, Any]) -> Tuple[torch.Tensor, None]:
         """
-        Multi-Head forward pass.
+        Autoregressive Multi-Head forward pass.
 
-        Returns concatenated logits: [ad_logits, billboard_logits] with shape (batch, max_ads + n_billboards)
-        This allows Tianshou to batch them properly. The distribution splits them back.
+        Computes billboard logits for ALL ads so the distribution can properly
+        handle the sequential (ad → billboard|ad) sampling and log_prob.
+
+        Returns concatenated logits: [ad_logits, all_bb_logits_flat]
+        Shape: (batch, max_ads + max_ads * n_billboards)
         """
 
         ad_features = observations['ad_features']  # (batch_size, max_ads, ad_feat_dim)
         ad_embeds = self.ad_encoder(ad_features.view(-1, ad_features.shape[-1]))
         ad_embeds = ad_embeds.view(batch_size, self.max_ads, -1)
 
-        # Head 1: Select ad - return LOGITS (scores), not probs
+        # Head 1: Ad selection logits
         ad_logits = self.ad_head(ad_embeds.view(-1, ad_embeds.shape[-1])).view(batch_size, self.max_ads)
 
-        # Create ad mask: ad is valid if it has ANY available billboard
-        ad_mask = mask.any(dim=-1).bool()  # (batch_size, max_ads)
+        ad_mask = mask.any(dim=-1).bool()  # ad is valid if ANY billboard is available
         ad_logits[~ad_mask] = self.min_val
 
-        # When ALL ads are masked, all logits are -1e8 → softmax gives NaN.
-        # Replace with 0 (uniform) for both internal sampling AND output logits.
-        no_valid_ads = ~ad_mask.any(dim=-1)  # (batch_size,)
+        # When ALL ads are masked, replace with uniform to prevent NaN
+        no_valid_ads = ~ad_mask.any(dim=-1)
         if no_valid_ads.any():
             ad_logits = torch.where(
                 no_valid_ads.unsqueeze(-1).expand_as(ad_logits),
@@ -801,58 +798,42 @@ class BillboardAllocatorGNN(nn.Module):
                 ad_logits
             )
 
-        # Sample or get ad selection for conditioning Head 2
-        ad_probs = F.softmax(ad_logits, dim=1)
+        # Head 2: Billboard logits for EVERY ad (autoregressive)
+        # Loop to avoid OOM from materializing (B, max_ads, N_bb, 2*hidden)
+        all_bb_logits = []
+        for ad_idx in range(self.max_ads):
+            ad_embed = ad_embeds[:, ad_idx]  # (batch, hidden)
+            ad_expanded = ad_embed.unsqueeze(1).expand(-1, self.n_billboards, -1)
+            combined = torch.cat([billboard_embeds, ad_expanded], dim=-1)
 
-        # Replace NaN probs from any source (all-masked, weight divergence, etc.)
-        nan_rows = torch.isnan(ad_probs).any(dim=-1)
-        if nan_rows.any():
-            uniform = torch.ones(self.max_ads, device=ad_probs.device, dtype=ad_probs.dtype) / self.max_ads
-            ad_probs = torch.where(
-                nan_rows.unsqueeze(-1).expand_as(ad_probs),
-                uniform.unsqueeze(0).expand_as(ad_probs),
-                ad_probs
-            )
+            bb_logits = self.billboard_head(combined.view(-1, combined.shape[-1]))
+            bb_logits = bb_logits.view(batch_size, self.n_billboards)
 
-        if self.training and state is not None and 'learn' in info:
-            chosen_ads = state[:, 0].long()
-        else:
-            if self.training:
-                chosen_ads = Categorical(ad_probs).sample()
-            else:
-                chosen_ads = ad_probs.argmax(dim=1)
+            # Per-ad billboard mask
+            bb_mask = mask[:, ad_idx].bool()
+            bb_logits[~bb_mask] = self.min_val
 
-        # Head 2: Select billboard conditioned on chosen ad
-        chosen_ad_embeds = ad_embeds[torch.arange(batch_size), chosen_ads]  # (batch_size, hidden_dim)
-        chosen_ad_expanded = chosen_ad_embeds.unsqueeze(1).expand(-1, self.n_billboards, -1)
+            # Handle all-masked or NaN rows
+            fix_rows = ~bb_mask.any(dim=-1) | torch.isnan(bb_logits).any(dim=-1)
+            if fix_rows.any():
+                bb_logits = torch.where(
+                    fix_rows.unsqueeze(-1).expand_as(bb_logits),
+                    torch.zeros_like(bb_logits),
+                    bb_logits
+                )
 
-        combined_features = torch.cat([billboard_embeds, chosen_ad_expanded], dim=-1)
+            all_bb_logits.append(bb_logits)
 
-        billboard_logits = self.billboard_head(combined_features.view(-1, combined_features.shape[-1]))
-        billboard_logits = billboard_logits.view(batch_size, self.n_billboards)
+        all_bb_logits = torch.stack(all_bb_logits, dim=1)  # (batch, max_ads, n_billboards)
 
-        billboard_mask = mask[torch.arange(batch_size), chosen_ads].bool()  # (batch_size, n_billboards)
-        billboard_logits[~billboard_mask] = self.min_val
-
-        # Replace all-masked or NaN billboard logits with uniform
-        no_valid_bbs = ~billboard_mask.any(dim=-1)
-        bb_nan = torch.isnan(billboard_logits).any(dim=-1)
-        fix_bb = no_valid_bbs | bb_nan
-        if fix_bb.any():
-            billboard_logits = torch.where(
-                fix_bb.unsqueeze(-1).expand_as(billboard_logits),
-                torch.zeros_like(billboard_logits),
-                billboard_logits
-            )
-
-        # Replace any remaining NaN in logits before output
+        # NaN safety
         ad_logits = torch.nan_to_num(ad_logits, nan=0.0)
-        billboard_logits = torch.nan_to_num(billboard_logits, nan=0.0)
+        all_bb_logits = torch.nan_to_num(all_bb_logits, nan=0.0)
 
-        # Concatenate logits: (batch, max_ads + n_billboards)
-        concatenated_logits = torch.cat([ad_logits, billboard_logits], dim=-1)
+        # Concatenate: [ad_logits, all_bb_logits_flat]
+        concatenated = torch.cat([ad_logits, all_bb_logits.view(batch_size, -1)], dim=-1)
 
-        return concatenated_logits, chosen_ads
+        return concatenated, None
         
     def critic_forward(self, observations: Dict[str, torch.Tensor]) -> torch.Tensor:
         """

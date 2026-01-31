@@ -134,25 +134,18 @@ def create_vectorized_envs(env_config: dict, n_envs: int):
 
 
 
-def get_dist_fn(mode: str, max_ads: int):
+def get_dist_fn(mode: str, max_ads: int, n_billboards: int = 0):
     """Get the distribution function for a given mode."""
     if mode == 'na':
         return torch.distributions.Categorical
 
     elif mode == 'mh':
         from distributions import create_multi_head_dist_fn
-        return create_multi_head_dist_fn(max_ads)
+        return create_multi_head_dist_fn(max_ads, n_billboards)
 
     elif mode == 'ea':
-        from distributions import TopKSelection
-        def dist_fn(logits):
-            return TopKSelection(
-                logits=logits,
-                k=16,
-                mask=None,
-                temperature=1.0
-            )
-        return dist_fn
+        from distributions import create_per_ad_dist_fn
+        return create_per_ad_dist_fn(max_ads, n_billboards)
 
     raise ValueError(f"Unknown mode: {mode}")
 
@@ -338,7 +331,7 @@ def train(mode: str, env_config: dict = None, train_config: dict = None):
     shared_model, actor, critic, optimizer, lr_scheduler, model_config = \
         create_model(mode, train_config, n_billboards, max_ads, graph_numpy, device)
 
-    dist_fn = get_dist_fn(mode, max_ads)
+    dist_fn = get_dist_fn(mode, max_ads, n_billboards)
 
     policy = ts.policy.PPOPolicy(
         actor=actor,

@@ -287,45 +287,33 @@ def run_mh_episode(env, model, device, metrics: MHTestMetrics,
         # Preprocess observation
         obs_torch = preprocess_mh_observation(obs, device)
 
-        # Get sequential actions from model
+        # Get concatenated logits from model: [ad_logits, all_bb_logits_flat]
+        max_ads = env.env.config.max_active_ads
+        n_bb = env.env.n_nodes
+
         with torch.no_grad():
-            output, state = model(obs_torch)
+            logits, _ = model(obs_torch)
 
-            # MH mode returns tuple: (ad_probs, billboard_probs)
-            if isinstance(output, tuple):
-                ad_probs, billboard_probs = output
-            else:
-                # Fallback if model structure is different
-                ad_probs = output
-                billboard_probs = None
+            ad_logits = logits[0, :max_ads]
+            all_bb_logits = logits[0, max_ads:].view(max_ads, n_bb)
 
-        # Sequential decision: First select ad
-        if deterministic:
-            ad_action = ad_probs.argmax(dim=1).item()
-        else:
-            ad_action = torch.multinomial(ad_probs[0], 1).item()
-
-        # Then select billboard (already conditioned on chosen ad in the model)
-        if billboard_probs is not None:
+            # Select ad
+            ad_probs = torch.softmax(ad_logits, dim=0)
             if deterministic:
-                billboard_action = billboard_probs.argmax(dim=1).item()
+                ad_action = ad_probs.argmax().item()
             else:
-                billboard_action = torch.multinomial(billboard_probs[0], 1).item()
-        else:
-            # Fallback: select first valid billboard
-            mask_np = obs['mask']
-            if len(mask_np.shape) == 3:
-                valid_billboards = np.where(mask_np[ad_action, :])[0]
+                ad_action = torch.multinomial(ad_probs.unsqueeze(0), 1).item()
+
+            # Select billboard conditioned on chosen ad
+            bb_logits = all_bb_logits[ad_action]
+            billboard_probs = torch.softmax(bb_logits, dim=0)
+            if deterministic:
+                billboard_action = billboard_probs.argmax().item()
             else:
-                valid_billboards = np.where(mask_np[ad_action * env.env.n_nodes:(ad_action + 1) * env.env.n_nodes])[
-                    0]
+                billboard_action = torch.multinomial(billboard_probs.unsqueeze(0), 1).item()
 
-            billboard_action = valid_billboards[0] if len(valid_billboards) > 0 else 0
-
-        # Create MH action format (2D array)
-        action = np.zeros((env.env.config.max_active_ads, env.env.n_nodes), dtype=np.int8)
-        if ad_action < env.env.config.max_active_ads and billboard_action < env.env.n_nodes:
-            action[ad_action, billboard_action] = 1
+        # MH action: [ad_idx, billboard_idx]
+        action = np.array([ad_action, billboard_action])
 
         decision_time = time.time() - decision_start
 
@@ -337,8 +325,7 @@ def run_mh_episode(env, model, device, metrics: MHTestMetrics,
         step_time = time.time() - start_time
         metrics.record_step(
             reward, ad_action, billboard_action,
-            ad_probs[0] if ad_probs is not None else None,
-            billboard_probs[0] if billboard_probs is not None else None,
+            ad_probs, billboard_probs,
             obs['mask'], info, step_time, decision_time
         )
 

@@ -30,39 +30,33 @@ class EATestMetrics:
     def start_episode(self):
         self.current = {
             'rewards': [],
-            'selected_pairs': [],  # (ad_idx, billboard_idx) tuples
-            'pair_scores': [],  # Probability scores for selected pairs
-            'valid_pairs_available': [],  # Number of valid pairs per step
-            'ads_active': [],  # Number of active ads per step
+            'selected_pairs': [],  # (ad_idx, billboard_idx) tuples per step
+            'valid_pairs_available': [],
+            'ads_active': [],
             'billboard_utilization': [],
             'step_times': [],
             'start_time': time.time()
         }
 
-    def record_step(self, reward: float, action: np.ndarray, probs: torch.Tensor,
-                    mask: np.ndarray, info: Dict, step_time: float):
+    def record_step(self, reward: float, action: np.ndarray, mask: np.ndarray,
+                    info: Dict, step_time: float):
         if self.current is None:
             return
 
         self.current['rewards'].append(reward)
 
-        # Decode EA action (flattened ad-billboard pairs)
+        # Decode EA action: (max_ads,) integer array — one billboard per ad
         selected_pairs = []
-        for idx in np.where(action == 1)[0]:
-            ad_idx = idx // self.n_billboards
-            bb_idx = idx % self.n_billboards
-            selected_pairs.append((ad_idx, bb_idx))
-
-            # Store probability of selected pair
-            if probs is not None:
-                self.current['pair_scores'].append(probs[0, idx].item())
+        for ad_idx, bb_idx in enumerate(action):
+            bb_idx = int(bb_idx)
+            if ad_idx < self.max_ads and 0 <= bb_idx < self.n_billboards:
+                selected_pairs.append((ad_idx, bb_idx))
 
         self.current['selected_pairs'].append(selected_pairs)
         self.current['valid_pairs_available'].append(mask.sum())
         self.current['billboard_utilization'].append(info.get('utilization', 0))
         self.current['step_times'].append(step_time)
 
-        # Track active ads
         active_ads = len(set(pair[0] for pair in selected_pairs))
         self.current['ads_active'].append(active_ads)
 
@@ -209,11 +203,14 @@ def preprocess_ea_observation(obs: Dict, device: torch.device) -> Dict:
 
 
 def run_ea_episode(env, model, device, metrics: EATestMetrics,
-                   deterministic: bool = True, threshold: float = 0.5,
+                   deterministic: bool = True,
                    render: bool = False) -> EATestMetrics:
-    """Run single EA test episode with pair selection"""
+    """Run single EA test episode — one billboard per ad."""
     obs, info = env.reset()
     metrics.start_episode()
+
+    max_ads = env.env.config.max_active_ads
+    n_bb = env.env.n_nodes
 
     done = False
     step_count = 0
@@ -221,51 +218,24 @@ def run_ea_episode(env, model, device, metrics: EATestMetrics,
     while not done:
         start_time = time.time()
 
-        # Preprocess observation
         obs_torch = preprocess_ea_observation(obs, device)
 
-        # Get action probabilities from model
         with torch.no_grad():
-            probs, _ = model(obs_torch)
-
-        # EA mode: Select multiple ad-billboard pairs
-        action = np.zeros(env.env.config.max_active_ads * env.env.n_nodes, dtype=np.int8)
+            logits, _ = model(obs_torch)
+            # logits shape: (1, max_ads * n_bb) — reshape to per-ad
+            per_ad_logits = logits[0].view(max_ads, n_bb)
 
         if deterministic:
-            # Select pairs with probability above threshold
-            valid_mask = obs['mask'].astype(bool)
-            pair_probs = probs[0].cpu().numpy()
-
-            # Select top-k valid pairs or all above threshold
-            valid_indices = np.where(valid_mask & (pair_probs > threshold))[0]
-            if len(valid_indices) > 0:
-                # Take up to 3 best pairs to avoid over-allocation
-                top_indices = valid_indices[np.argsort(pair_probs[valid_indices])[-3:]]
-                action[top_indices] = 1
+            action = per_ad_logits.argmax(dim=-1).cpu().numpy()
         else:
-            # Stochastic sampling
-            valid_mask = obs['mask'].astype(bool)
-            if valid_mask.any():
-                # Sample multiple pairs based on probabilities
-                num_pairs = min(3, valid_mask.sum())
-                valid_probs = probs[0].cpu().numpy() * valid_mask
-                valid_probs = valid_probs / (valid_probs.sum() + 1e-8)
+            probs = torch.softmax(per_ad_logits, dim=-1)
+            action = torch.multinomial(probs, 1).squeeze(-1).cpu().numpy()
 
-                try:
-                    selected = np.random.choice(len(action), size=num_pairs,
-                                                replace=False, p=valid_probs)
-                    action[selected] = 1
-                except:
-                    # Fallback to deterministic if sampling fails
-                    pass
-
-        # Step environment
         obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
 
-        # Record metrics
         step_time = time.time() - start_time
-        metrics.record_step(reward, action, probs, obs['mask'], info, step_time)
+        metrics.record_step(reward, action, obs['mask'], info, step_time)
 
         if render and step_count % 100 == 0:
             env.env.render()
@@ -280,19 +250,17 @@ def test_ea_comprehensive(
         model_path: str,
         env_config: Dict,
         num_episodes: int = 10,
-        threshold: float = 0.3,
         save_results: bool = True
 ):
-    """Comprehensive EA mode testing with pair analysis"""
+    """Comprehensive EA mode testing — one billboard per ad."""
 
     print("=" * 70)
-    print("COMPREHENSIVE EA MODE TESTING - AD-BILLBOARD PAIR SELECTION")
+    print("COMPREHENSIVE EA MODE TESTING - PER-AD BILLBOARD SELECTION")
     print("=" * 70)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Initialize environment
     print("\n1. Environment Setup:")
     env = OptimizedBillboardEnv(
         billboard_csv=env_config["billboard_csv"],
@@ -305,15 +273,13 @@ def test_ea_comprehensive(
 
     print(f"   Billboards: {env.n_nodes}")
     print(f"   Max ads: {env.config.max_active_ads}")
-    print(f"   Action space: {env.config.max_active_ads * env.n_nodes} possible pairs")
+    print(f"   Action: {env.config.max_active_ads} independent billboard selections")
 
-    # Load model
     print("\n2. Model Configuration:")
     model = load_ea_model(model_path, device, env.n_nodes, env.config.max_active_ads)
     param_count = sum(p.numel() for p in model.parameters())
     print(f"   Parameters: {param_count:,}")
-    print(f"   Architecture: GAT with attention" if model.use_attention else "   Architecture: GAT")
-    print(f"   Pair selection threshold: {threshold}")
+    print(f"   Architecture: {'GIN with attention' if model.use_attention else 'GIN'}")
 
     # Initialize metrics
     metrics = EATestMetrics(env.config.max_active_ads, env.n_nodes)
@@ -328,7 +294,7 @@ def test_ea_comprehensive(
         mode = "DET" if deterministic else "STO"
 
         run_ea_episode(wrapped_env, model, device, metrics,
-                       deterministic=deterministic, threshold=threshold)
+                       deterministic=deterministic)
 
         episode = metrics.episodes[-1]
         print(f"   Episode {i + 1:2d} [{mode}]: Reward={episode['total_reward']:7.2f}, "
@@ -387,7 +353,6 @@ def test_ea_comprehensive(
             'model_path': model_path,
             'mode': 'ea',
             'num_episodes': num_episodes,
-            'threshold': threshold,
             'summary': summary,
             'pair_analysis': {
                 'total_unique_pairs': pair_analysis['total_unique_pairs'],
@@ -469,8 +434,6 @@ if __name__ == "__main__":
                         help='Path to trained model')
     parser.add_argument('--episodes', type=int, default=10,
                         help='Number of test episodes')
-    parser.add_argument('--threshold', type=float, default=0.3,
-                        help='Probability threshold for pair selection')
     parser.add_argument('--billboards', type=str,
                         default=r"C:\Users\parya\PycharmProjects\DynamicBillboard\env\BillBoard_NYC.csv")
     parser.add_argument('--advertisers', type=str,
@@ -486,11 +449,9 @@ if __name__ == "__main__":
         "trajectory_csv": args.trajectories,
     }
 
-    # Run comprehensive EA testing
     test_ea_comprehensive(
         model_path=args.model,
         env_config=env_config,
         num_episodes=args.episodes,
-        threshold=args.threshold,
         save_results=True
     )

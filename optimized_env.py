@@ -548,10 +548,10 @@ class OptimizedBillboardEnv(gym.Env):
             })
         
         elif self.action_mode == 'ea':
-            # Edge Action: select ad-billboard pairs
-            max_pairs = self.config.max_active_ads * self.n_nodes
-            self.action_space = spaces.MultiBinary(max_pairs)
-            # Edge features: 3 semantic features per (ad, billboard) pair
+            # Edge Action: one billboard per ad (max_ads independent categoricals)
+            self.action_space = spaces.MultiDiscrete(
+                [self.n_nodes] * self.config.max_active_ads
+            )
             n_edge_features = 3
             self.observation_space = spaces.Dict({
                 'graph_nodes': spaces.Box(low=-np.inf, high=np.inf,
@@ -566,7 +566,9 @@ class OptimizedBillboardEnv(gym.Env):
                 'edge_features': spaces.Box(low=0.0, high=1.0,
                                            shape=(self.config.max_active_ads, self.n_nodes, n_edge_features),
                                            dtype=np.float32),
-                'mask': spaces.MultiBinary(max_pairs)
+                'mask': spaces.MultiBinary(
+                    [self.config.max_active_ads, self.n_nodes]
+                )
             })
 
         elif self.action_mode == 'mh':
@@ -666,35 +668,29 @@ class OptimizedBillboardEnv(gym.Env):
             return mask
 
         elif self.action_mode == 'ea':
-            # EA mode: mask valid ad-billboard pairs (flattened)
+            # EA mode: 2D mask over (ad_idx, bb_idx) pairs
             active_ads = [ad for ad in self.ads if ad.state == 0]
             n_active = min(len(active_ads), self.config.max_active_ads)
 
             if n_active == 0:
                 logger.warning("No active ads for 'ea' mode")
-                return np.zeros(self.config.max_active_ads * self.n_nodes, dtype=np.int8)
+                return np.zeros((self.config.max_active_ads, self.n_nodes), dtype=np.int8)
 
-            # Vectorized budget check: (n_active,) budgets vs (n_nodes,) total_costs
             budgets = np.array([active_ads[i].remaining_budget for i in range(n_active)], dtype=np.float32)
-            # Broadcasting: (n_active, 1) >= (1, n_nodes) -> (n_active, n_nodes)
-            # Use total_costs (cost × max_duration) for conservative estimate
             affordable = budgets[:, None] >= total_costs[None, :]
-            # Combine: (n_active, n_nodes) & (n_nodes,) broadcast
             valid_pairs = affordable & free_mask
 
-            # Create full mask with zero-padding for unused ad slots
             full_mask = np.zeros((self.config.max_active_ads, self.n_nodes), dtype=np.int8)
             full_mask[:n_active, :] = valid_pairs.astype(np.int8)
 
-            mask = full_mask.flatten()
-            if mask.sum() == 0:
+            if full_mask.sum() == 0:
                 n_free = free_mask.sum()
                 n_has_inf = has_influence.sum()
                 n_afford = (affordable.any(axis=0)).sum() if n_active > 0 else 0
                 logger.debug(f"Zero valid pairs for 'ea' mode: "
                              f"{n_active} active ads, {n_free} free+influenced BBs, "
                              f"{n_has_inf} with influence, {n_afford} affordable")
-            return mask
+            return full_mask
 
         elif self.action_mode == 'mh':
             # MH mode: 2D mask over (ad_idx, bb_idx) pairs
@@ -1115,70 +1111,46 @@ class OptimizedBillboardEnv(gym.Env):
                         logger.warning(f"Invalid action type for NA mode: {type(action)}")
             
             elif self.action_mode == 'ea':
-                # Edge Action mode
-                if isinstance(action, (list, np.ndarray)):
+                # Edge Action mode: action is (max_ads,) — one billboard index per ad
+                if isinstance(action, (list, np.ndarray, torch.Tensor)):
                     action = np.asarray(action).flatten()
-                    expected_shape = self.config.max_active_ads * self.n_nodes
-                    if action.shape[0] != expected_shape:
-                        logger.warning(f"Invalid action shape for 'ea' mode: {action.shape}")
+
+                    if action.shape[0] != self.config.max_active_ads:
+                        logger.warning(f"Invalid EA action shape: {action.shape}, "
+                                       f"expected ({self.config.max_active_ads},)")
                         return
 
                     active_ads = [ad for ad in self.ads if ad.state == 0]
-
-                    # Track used billboards to prevent multi-assign in same step
                     used_billboards = set()
 
-                    # ALLOCATION: Process all selected pairs (no limit since influence masking
-                    # already filters out zero-influence billboards - all allocations are productive)
-                    # Prioritize by expected influence for best results
+                    for ad_idx in range(min(len(active_ads), self.config.max_active_ads)):
+                        bb_idx = int(action[ad_idx])
 
-                    # Get all selected pair indices
-                    selected_indices = np.where(action == 1)[0]
+                        if not (0 <= bb_idx < self.n_nodes):
+                            continue
+                        if bb_idx in used_billboards:
+                            continue
+                        if not self.billboards[bb_idx].is_free():
+                            continue
 
-                    if len(selected_indices) > 0:
-                        # PERFORMANCE: Compute once and reuse
-                        cached_slot_influence = self._precompute_slot_influence(self.current_step)
-                        # Normalized scores for sorting (use max duration for consistency with masking)
-                        max_dur_idx = self.config.slot_duration_range[1] - 1  # 0-indexed
-                        influence_scores = np.clip(cached_slot_influence[:, max_dur_idx] / 100.0, 0.0, 1.0)
+                        ad_to_assign = active_ads[ad_idx]
+                        billboard = self.billboards[bb_idx]
 
-                        # Score each selected pair by billboard's expected influence
-                        pair_scores = []
-                        for pair_idx in selected_indices:
-                            bb_idx = pair_idx % self.n_nodes
-                            score = influence_scores[bb_idx] if bb_idx < len(influence_scores) else 0
-                            pair_scores.append((pair_idx, score))
+                        duration = random.randint(*self.config.slot_duration_range)
+                        total_cost = billboard.b_cost * duration
+                        if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
+                            billboard.assign(ad_to_assign.aid, duration)
+                            used_billboards.add(bb_idx)
 
-                        # Sort by influence score descending (best billboards first)
-                        pair_scores.sort(key=lambda x: x[1], reverse=True)
-
-                        # Process ALL valid pairs (no MAX limit - influence mask ensures quality)
-                        for pair_idx, _ in pair_scores:
-                            ad_idx = pair_idx // self.n_nodes
-                            bb_idx = pair_idx % self.n_nodes
-
-                            if (ad_idx < min(len(active_ads), self.config.max_active_ads) and
-                                self.billboards[bb_idx].is_free() and
-                                bb_idx not in used_billboards):
-
-                                ad_to_assign = active_ads[ad_idx]
-                                billboard = self.billboards[bb_idx]
-
-                                duration = random.randint(*self.config.slot_duration_range)
-                                total_cost = billboard.b_cost * duration
-                                if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
-                                    billboard.assign(ad_to_assign.aid, duration)
-                                    used_billboards.add(bb_idx)
-
-                                    self.placement_history.append({
-                                        'spawn_step': ad_to_assign.spawn_step,
-                                        'allocated_step': self.current_step,
-                                        'ad_id': ad_to_assign.aid,
-                                        'billboard_id': billboard.b_id,
-                                        'duration': duration,
-                                        'demand': ad_to_assign.demand,
-                                        'cost': total_cost
-                                    })
+                            self.placement_history.append({
+                                'spawn_step': ad_to_assign.spawn_step,
+                                'allocated_step': self.current_step,
+                                'ad_id': ad_to_assign.aid,
+                                'billboard_id': billboard.b_id,
+                                'duration': duration,
+                                'demand': ad_to_assign.demand,
+                                'cost': total_cost
+                            })
 
             elif self.action_mode == 'mh':
                 # Multi-Head mode: action is (ad_idx, bb_idx) - two integers
