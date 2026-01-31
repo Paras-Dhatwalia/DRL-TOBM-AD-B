@@ -782,23 +782,21 @@ class BillboardAllocatorGNN(nn.Module):
         ad_logits = self.ad_head(ad_embeds.view(-1, ad_embeds.shape[-1])).view(batch_size, self.max_ads)
 
         # Create ad mask: ad is valid if it has ANY available billboard
-        # ad is valid if ANY billboard is valid
         ad_mask = mask.any(dim=-1).bool()  # (batch_size, max_ads)
         ad_logits[~ad_mask] = self.min_val
 
+        # When ALL ads are masked, all logits are -1e8 → softmax gives NaN.
+        # Replace with 0 (uniform) for both internal sampling AND output logits.
+        no_valid_ads = ~ad_mask.any(dim=-1)  # (batch_size,)
+        if no_valid_ads.any():
+            ad_logits = torch.where(
+                no_valid_ads.unsqueeze(-1).expand_as(ad_logits),
+                torch.zeros_like(ad_logits),
+                ad_logits
+            )
+
         # Sample or get ad selection for conditioning Head 2
         ad_probs = F.softmax(ad_logits, dim=1)
-
-        # When no ads are valid, softmax of all -1e8 produces NaN (0/0).
-        # Replace NaN rows with uniform so Categorical doesn't crash.
-        nan_rows = torch.isnan(ad_probs).any(dim=-1)
-        if nan_rows.any():
-            uniform = torch.ones(self.max_ads, device=ad_probs.device, dtype=ad_probs.dtype) / self.max_ads
-            ad_probs = torch.where(
-                nan_rows.unsqueeze(-1).expand_as(ad_probs),
-                uniform.unsqueeze(0).expand_as(ad_probs),
-                ad_probs
-            )
 
         if self.training and state is not None and 'learn' in info:
             chosen_ads = state[:, 0].long()
@@ -812,19 +810,24 @@ class BillboardAllocatorGNN(nn.Module):
         chosen_ad_embeds = ad_embeds[torch.arange(batch_size), chosen_ads]  # (batch_size, hidden_dim)
         chosen_ad_expanded = chosen_ad_embeds.unsqueeze(1).expand(-1, self.n_billboards, -1)
 
-        # Combine chosen ad with all billboards
         combined_features = torch.cat([billboard_embeds, chosen_ad_expanded], dim=-1)
 
-        # Score billboards - return LOGITS (scores), not probs
         billboard_logits = self.billboard_head(combined_features.view(-1, combined_features.shape[-1]))
         billboard_logits = billboard_logits.view(batch_size, self.n_billboards)
 
-        # Create billboard mask from the chosen ads
         billboard_mask = mask[torch.arange(batch_size), chosen_ads].bool()  # (batch_size, n_billboards)
         billboard_logits[~billboard_mask] = self.min_val
 
-        # CRITICAL: Concatenate logits so Tianshou can batch them
-        # Shape: (batch, max_ads + n_billboards) = (batch, 20 + 444) = (batch, 464)
+        # Same fix for billboard logits: all-masked → uniform
+        no_valid_bbs = ~billboard_mask.any(dim=-1)
+        if no_valid_bbs.any():
+            billboard_logits = torch.where(
+                no_valid_bbs.unsqueeze(-1).expand_as(billboard_logits),
+                torch.zeros_like(billboard_logits),
+                billboard_logits
+            )
+
+        # Concatenate logits: (batch, max_ads + n_billboards)
         concatenated_logits = torch.cat([ad_logits, billboard_logits], dim=-1)
 
         return concatenated_logits, chosen_ads

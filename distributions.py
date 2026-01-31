@@ -394,6 +394,12 @@ class MultiHeadCategorical:
         self._logits = logits
         ad_logits = logits[..., :self.MAX_ADS]
         bb_logits = logits[..., self.MAX_ADS:]
+
+        # Replace NaN logits with 0 (uniform) to prevent Categorical crash.
+        # NaN can occur when model weights diverge during training.
+        ad_logits = torch.nan_to_num(ad_logits, nan=0.0)
+        bb_logits = torch.nan_to_num(bb_logits, nan=0.0)
+
         self.ad_dist = torch.distributions.Categorical(logits=ad_logits)
         self.bb_dist = torch.distributions.Categorical(logits=bb_logits)
         self._batch_shape = logits.shape[:-1]
