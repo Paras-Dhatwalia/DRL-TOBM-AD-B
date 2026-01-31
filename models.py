@@ -523,6 +523,9 @@ class BillboardAllocatorGNN(nn.Module):
 
         logger.debug(f"Built {self.mode.upper()} mode-specific layers")
 
+    # Max samples per super-graph chunk (prevents OOM on dense graphs)
+    _GNN_CHUNK_SIZE = 32
+
     def _batch_gnn_encode(self, nodes: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         """
         Batched GNN encoding via super-graph construction.
@@ -530,6 +533,9 @@ class BillboardAllocatorGNN(nn.Module):
         Instead of looping over batch samples, constructs a single disconnected
         super-graph where each sample's nodes are offset so they don't interact.
         Mathematically identical to per-sample encoding but eliminates the Python loop.
+
+        For large batches (>_GNN_CHUNK_SIZE), processes in chunks to avoid OOM
+        on dense graphs (e.g. 444 NYC billboards with ~100K edges).
 
         Args:
             nodes: (B, N, F) batched node features
@@ -546,6 +552,14 @@ class BillboardAllocatorGNN(nn.Module):
             flat_out = self.billboard_norm(flat_out)
             return flat_out.unsqueeze(0)
 
+        # Chunk large batches to prevent OOM on dense graphs
+        if batch_size > self._GNN_CHUNK_SIZE:
+            chunks = []
+            for i in range(0, batch_size, self._GNN_CHUNK_SIZE):
+                chunk = self._batch_gnn_encode(nodes[i:i + self._GNN_CHUNK_SIZE], edge_index)
+                chunks.append(chunk)
+            return torch.cat(chunks, dim=0)
+
         # 1. Flatten nodes: (B, N, F) -> (B*N, F)
         x_flat = nodes.reshape(batch_size * n_nodes, -1)
 
@@ -560,7 +574,7 @@ class BillboardAllocatorGNN(nn.Module):
 
         out_flat = self.billboard_norm(out_flat)
 
-        # 5. Reshape back: (B*N, D) -> (B, N, D)
+        # 4. Reshape back: (B*N, D) -> (B, N, D)
         return out_flat.reshape(batch_size, n_nodes, -1)
 
     def forward(self, observations: Dict[str, torch.Tensor], 
@@ -805,7 +819,12 @@ class BillboardAllocatorGNN(nn.Module):
         
     def critic_forward(self, observations: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        Forward pass for critic network with memory-efficient graph processing.
+        Forward pass for critic network.
+
+        Processes samples individually to avoid OOM from super-graph construction
+        on dense graphs (e.g. 444 NYC billboards with ~100K edges). The critic
+        runs under torch.no_grad() during _compute_returns so per-sample looping
+        has negligible overhead compared to the memory cost of batched super-graphs.
         """
         device = next(self.parameters()).device
         observations = preprocess_observations(observations)
@@ -814,17 +833,17 @@ class BillboardAllocatorGNN(nn.Module):
                         for k, v in observations.items()}
 
         batch_size = observations['graph_nodes'].shape[0]
-
-        # All samples share the same graph topology
         edge_index = observations['graph_edge_links'][0].to(device).long()
 
-        billboard_embeds = self._batch_gnn_encode(
-            observations['graph_nodes'].float(), edge_index
-        )
+        all_pooled = []
+        for b in range(batch_size):
+            sample_embeds = self.graph_encoder(
+                observations['graph_nodes'][b].float(), edge_index
+            )
+            sample_embeds = self.billboard_norm(sample_embeds)
+            all_pooled.append(sample_embeds.mean(dim=0, keepdim=True))
 
-        # Mean pool per sample: (B, N, D) -> (B, D)
-        pooled = billboard_embeds.mean(dim=1)
-
+        pooled = torch.cat(all_pooled, dim=0)
         values = self.critic(pooled).squeeze(-1)
 
         return values
