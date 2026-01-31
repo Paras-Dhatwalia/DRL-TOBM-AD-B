@@ -124,10 +124,15 @@ def create_env(env_config: dict):
     return NoGraphObsWrapper(base_env)
 
 
-def create_vectorized_envs(env_config: dict, n_envs: int):
-    """Create vectorized environments with OS-appropriate backend."""
+def create_vectorized_envs(env_config: dict, n_envs: int, force_dummy: bool = False):
+    """Create vectorized environments with OS-appropriate backend.
+
+    Args:
+        force_dummy: If True, always use DummyVectorEnv (no subprocesses).
+                     Recommended for test envs to avoid subprocess OOM crashes.
+    """
     factory = lambda: create_env(env_config)
-    if platform.system() == "Windows":
+    if force_dummy or platform.system() == "Windows":
         return ts.env.DummyVectorEnv([factory for _ in range(n_envs)])
     else:
         return ts.env.SubprocVectorEnv([factory for _ in range(n_envs)])
@@ -327,7 +332,7 @@ def train(mode: str, env_config: dict = None, train_config: dict = None):
     action_space = sample_env.action_space
 
     train_envs = create_vectorized_envs(env_config, n_envs=train_config["nr_envs"])
-    test_envs = create_vectorized_envs(env_config, n_envs=2)
+    test_envs = create_vectorized_envs(env_config, n_envs=2, force_dummy=True)
 
     shared_model, actor, critic, optimizer, lr_scheduler, model_config = \
         create_model(mode, train_config, n_billboards, max_ads, graph_numpy, device)
