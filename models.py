@@ -66,50 +66,22 @@ def validate_observations(observations: Dict[str, torch.Tensor], mode: str,
         raise ValueError(f"graph_edge_links must have 2 node indices per edge, "
                         f"got {edge_shape[1]}")
     
-    if mode == 'na':
-        # Node Action mode validation
-        if 'current_ad' not in observations:
-            raise ValueError(f"NA mode requires 'current_ad' key in observations. "
-                           f"Available keys: {list(observations.keys())}")
-        
-        expected_ad_shape = (batch_size, ad_feat_dim)
-        actual_ad_shape = observations['current_ad'].shape
-        if actual_ad_shape != expected_ad_shape:
-            raise ValueError(f"NA mode current_ad shape mismatch. Expected {expected_ad_shape}, "
-                           f"got {actual_ad_shape}")
-        
-        expected_mask_shape = (batch_size, n_billboards)
-        actual_mask_shape = observations['mask'].shape
-        if actual_mask_shape != expected_mask_shape:
-            raise ValueError(f"NA mode mask shape mismatch. Expected {expected_mask_shape}, "
-                           f"got {actual_mask_shape}")
-            
-    elif mode in ['ea', 'mh']:
-        # Edge Action and Multi-Head mode validation
+    if mode in ['na', 'ea', 'mh']:
         if 'ad_features' not in observations:
             raise ValueError(f"{mode.upper()} mode requires 'ad_features' key in observations. "
                            f"Available keys: {list(observations.keys())}")
-        
+
         expected_ad_shape = (batch_size, max_ads, ad_feat_dim)
         actual_ad_shape = observations['ad_features'].shape
         if actual_ad_shape != expected_ad_shape:
             raise ValueError(f"{mode.upper()} mode ad_features shape mismatch. "
                            f"Expected {expected_ad_shape}, got {actual_ad_shape}")
-        
-        if mode == 'ea':
-            expected_mask_shape = (batch_size, max_ads, n_billboards)
-            actual_mask_shape = observations['mask'].shape
-            if actual_mask_shape != expected_mask_shape:
-                raise ValueError(f"EA mode mask shape mismatch. Expected {expected_mask_shape}, "
-                               f"got {actual_mask_shape}.")
-        elif mode == 'mh':
-            # Multi-Head specific mask validation
-            expected_mask_shape = (batch_size, max_ads, n_billboards)
-            actual_mask_shape = observations['mask'].shape
-            if actual_mask_shape != expected_mask_shape:
-                raise ValueError(f"MH mode mask shape mismatch. Expected {expected_mask_shape}, "
-                               f"got {actual_mask_shape}. MH mode requires structured "
-                               f"(batch, ads, billboards) mask.")
+
+        expected_mask_shape = (batch_size, max_ads, n_billboards)
+        actual_mask_shape = observations['mask'].shape
+        if actual_mask_shape != expected_mask_shape:
+            raise ValueError(f"{mode.upper()} mode mask shape mismatch. Expected {expected_mask_shape}, "
+                           f"got {actual_mask_shape}")
     else:
         raise ValueError(f"Unknown mode '{mode}'. Supported modes: 'na', 'ea', 'mh'")
 
@@ -642,32 +614,48 @@ class BillboardAllocatorGNN(nn.Module):
                          mask: torch.Tensor, batch_size: int, state: Optional[torch.Tensor],
                          info: Dict[str, Any]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Node Action forward pass using pre-initialized parameters.
+        Full-step Node Action forward pass.
+
+        Loops over all ads, scoring each ad against all billboards independently.
+        Returns (batch, max_ads * n_billboards) flat scores for PerAdCategorical.
         """
-        
-        current_ad = observations['current_ad']  # (batch_size, ad_feat_dim)
-        ad_embed = self.ad_encoder(current_ad)  # (batch_size, hidden_dim)
+        ad_features = observations['ad_features']  # (batch, max_ads, ad_feat_dim)
 
-        ad_embed_expanded = ad_embed.unsqueeze(1).expand(-1, self.n_billboards, -1)
+        all_scores = []
+        for ad_idx in range(self.max_ads):
+            ad = ad_features[:, ad_idx]  # (batch, ad_feat_dim)
+            ad_embed = self.ad_encoder(ad)  # (batch, hidden_dim)
 
-        combined_features = torch.cat([billboard_embeds, ad_embed_expanded], dim=-1)
-        
-        if self.use_attention:
-            # Use ad as query, projected billboards as key/value
-            ad_query = ad_embed.unsqueeze(1)  # (batch_size, 1, hidden_dim)
-            
-            billboard_key_value = self.na_billboard_proj(billboard_embeds)
-            
-            attended_features = self.attention(ad_query, billboard_key_value, billboard_key_value)
-            combined_features = torch.cat([billboard_embeds, attended_features.expand(-1, self.n_billboards, -1)], dim=-1)
-        
-        combined_flat = combined_features.view(-1, combined_features.shape[-1])
-        scores = self.actor_head(combined_flat).view(batch_size, self.n_billboards)
+            ad_expanded = ad_embed.unsqueeze(1).expand(-1, self.n_billboards, -1)
+            combined = torch.cat([billboard_embeds, ad_expanded], dim=-1)
 
-        scores[~mask] = self.min_val
-        probs = F.softmax(scores, dim=1)
-        
-        return probs, state
+            if self.use_attention:
+                ad_query = ad_embed.unsqueeze(1)  # (batch, 1, hidden_dim)
+                billboard_kv = self.na_billboard_proj(billboard_embeds)
+                attended = self.attention(ad_query, billboard_kv, billboard_kv)
+                combined = torch.cat([billboard_embeds, attended.expand(-1, self.n_billboards, -1)], dim=-1)
+
+            scores = self.actor_head(combined.view(-1, combined.shape[-1])).view(batch_size, self.n_billboards)
+
+            # Per-ad billboard mask
+            ad_mask = mask[:, ad_idx].bool()
+            scores[~ad_mask] = self.min_val
+
+            # Handle all-masked rows
+            fix_rows = ~ad_mask.any(dim=-1) | torch.isnan(scores).any(dim=-1)
+            if fix_rows.any():
+                scores = torch.where(
+                    fix_rows.unsqueeze(-1).expand_as(scores),
+                    torch.zeros_like(scores),
+                    scores
+                )
+
+            all_scores.append(scores)
+
+        all_scores = torch.cat(all_scores, dim=-1)  # (batch, max_ads * n_billboards)
+        all_scores = torch.nan_to_num(all_scores, nan=0.0)
+
+        return all_scores, state
         
     def _forward_ea_fixed(self, billboard_embeds: torch.Tensor, observations: Dict[str, torch.Tensor],
                          mask: torch.Tensor, batch_size: int, state: Optional[torch.Tensor],

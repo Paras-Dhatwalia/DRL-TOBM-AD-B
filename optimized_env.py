@@ -533,18 +533,23 @@ class OptimizedBillboardEnv(gym.Env):
         self.n_ad_features = 12
 
         if self.action_mode == 'na':
-            # Node Action: select billboard (ad chosen by environment)
-            self.action_space = spaces.Discrete(self.n_nodes)
+            # Node Action: one billboard per ad (env orders ads by urgency)
+            self.action_space = spaces.MultiDiscrete(
+                [self.n_nodes] * self.config.max_active_ads
+            )
             self.observation_space = spaces.Dict({
                 'graph_nodes': spaces.Box(low=-np.inf, high=np.inf,
-                                         shape=(self.n_nodes, self.n_node_features), 
+                                         shape=(self.n_nodes, self.n_node_features),
                                          dtype=np.float32),
                 'graph_edge_links': spaces.Box(low=0, high=self.n_nodes-1,
-                                              shape=(2, self.edge_index.shape[1]), 
+                                              shape=(2, self.edge_index.shape[1]),
                                               dtype=np.int64),
-                'mask': spaces.MultiBinary(self.n_nodes),
-                'current_ad': spaces.Box(low=-np.inf, high=np.inf,
-                                        shape=(self.n_ad_features,), dtype=np.float32)
+                'ad_features': spaces.Box(low=-np.inf, high=np.inf,
+                                         shape=(self.config.max_active_ads, self.n_ad_features),
+                                         dtype=np.float32),
+                'mask': spaces.MultiBinary(
+                    [self.config.max_active_ads, self.n_nodes]
+                )
             })
         
         elif self.action_mode == 'ea':
@@ -572,10 +577,11 @@ class OptimizedBillboardEnv(gym.Env):
             })
 
         elif self.action_mode == 'mh':
-            # Multi-Head: two sequential categorical decisions
-            # Action[0] = ad index (0 to max_active_ads-1)
-            # Action[1] = billboard index (0 to n_nodes-1)
-            self.action_space = spaces.MultiDiscrete([self.config.max_active_ads, self.n_nodes])
+            # Multi-Head: 8 autoregressive (ad, billboard) pairs per timestep
+            # Action shape: (max_ads * 2,) = [ad_0, bb_0, ad_1, bb_1, ..., ad_7, bb_7]
+            self.action_space = spaces.MultiDiscrete(
+                np.tile([self.config.max_active_ads, self.n_nodes], self.config.max_active_ads)
+            )
             self.observation_space = spaces.Dict({
                 'graph_nodes': spaces.Box(low=-np.inf, high=np.inf,
                                          shape=(self.n_nodes, self.n_node_features),
@@ -586,7 +592,6 @@ class OptimizedBillboardEnv(gym.Env):
                 'ad_features': spaces.Box(low=-np.inf, high=np.inf,
                                          shape=(self.config.max_active_ads, self.n_ad_features),
                                          dtype=np.float32),
-                # Mask shape stays same: (max_active_ads, n_nodes) for valid (ad, bb) pairs
                 'mask': spaces.MultiBinary([self.config.max_active_ads, self.n_nodes])
             })
     
@@ -595,7 +600,6 @@ class OptimizedBillboardEnv(gym.Env):
         self.current_step = 0
         self.ads: List[Ad] = []
         self.placement_history: List[Dict[str, Any]] = []
-        self.current_ad_for_na_mode: Optional[Ad] = None
         self.performance_metrics = {
             'total_ads_processed': 0,
             'total_ads_completed': 0,
@@ -609,12 +613,6 @@ class OptimizedBillboardEnv(gym.Env):
 
         self.ads_completed_this_step: List[int] = []
         self.ads_failed_this_step: List[int] = []  # Track new failures
-
-        # SUB-STEP STATE: For NA/MH modes, each real timestep has K sub-steps
-        # (one per active ad).
-        self.sub_step_counter: int = 0
-        self.sub_step_ads_served: set = set()
-        self.in_sub_step_sequence: bool = False
 
         # Track used advertiser IDs within current episode.
         # This set acts as a "discard pile" - once an advertiser is used, they
@@ -652,20 +650,29 @@ class OptimizedBillboardEnv(gym.Env):
         total_costs = costs * max_duration
 
         if self.action_mode == 'na':
-            # NA mode: mask free billboards that current ad can afford
-            if self.current_ad_for_na_mode is not None:
-                # Vectorized: free AND affordable (cost × max_duration)
-                affordable = self.current_ad_for_na_mode.remaining_budget >= total_costs
-                mask = (free_mask & affordable).astype(np.int8)
-            else:
-                mask = free_mask.astype(np.int8)
+            # NA mode: 2D mask over (ad_idx, bb_idx) — ads sorted by urgency
+            active_ads = [ad for ad in self.ads if ad.state == 0]
+            active_ads = sorted(active_ads,
+                                key=lambda ad: (ad.ttl / max(ad.original_ttl, 1), ad.aid))
+            n_active = min(len(active_ads), self.config.max_active_ads)
 
-            if mask.sum() == 0:
+            if n_active == 0:
+                return np.zeros((self.config.max_active_ads, self.n_nodes), dtype=np.int8)
+
+            budgets = np.array([active_ads[i].remaining_budget for i in range(n_active)], dtype=np.float32)
+            affordable = budgets[:, None] >= total_costs[None, :]
+            valid_pairs = affordable & free_mask
+
+            full_mask = np.zeros((self.config.max_active_ads, self.n_nodes), dtype=np.int8)
+            full_mask[:n_active, :] = valid_pairs.astype(np.int8)
+
+            if full_mask.sum() == 0:
                 n_free = free_mask.sum()
                 n_has_inf = has_influence.sum()
                 logger.debug(f"Zero valid BBs for 'na' mode: "
-                             f"{n_free} free+influenced, {n_has_inf} with influence")
-            return mask
+                             f"{n_active} active ads, {n_free} free+influenced, "
+                             f"{n_has_inf} with influence")
+            return full_mask
 
         elif self.action_mode == 'ea':
             # EA mode: 2D mask over (ad_idx, bb_idx) pairs
@@ -701,15 +708,9 @@ class OptimizedBillboardEnv(gym.Env):
                 logger.warning("No active ads for 'mh' mode")
                 return np.zeros((self.config.max_active_ads, self.n_nodes), dtype=np.int8)
 
-            # Vectorized budget check (cost × max_duration)
             budgets = np.array([active_ads[i].remaining_budget for i in range(n_active)], dtype=np.float32)
             affordable = budgets[:, None] >= total_costs[None, :]
             valid_pairs = affordable & free_mask
-
-            # SUB-STEP MASKING: zero out rows for already-served ads
-            for i in range(n_active):
-                if active_ads[i].aid in self.sub_step_ads_served:
-                    valid_pairs[i, :] = False
 
             # Create full mask with zero-padding
             pair_mask = np.zeros((self.config.max_active_ads, self.n_nodes), dtype=np.int8)
@@ -794,34 +795,23 @@ class OptimizedBillboardEnv(gym.Env):
             'mask': self.get_mask()
         }
         
-        # Add ad features for modes that need them
-        if self.action_mode in ['ea', 'mh']:
-            ad_features = np.zeros((self.config.max_active_ads, self.n_ad_features),
-                                  dtype=np.float32)
-            active_ads = [ad for ad in self.ads if ad.state == 0]
+        # All modes now use ad_features (NA/EA/MH all full-step except MH temporarily)
+        ad_features = np.zeros((self.config.max_active_ads, self.n_ad_features),
+                              dtype=np.float32)
+        active_ads = [ad for ad in self.ads if ad.state == 0]
 
-            for i, ad in enumerate(active_ads[:self.config.max_active_ads]):
-                ad_features[i] = ad.get_feature_vector()
+        if self.action_mode == 'na':
+            # NA: sort by urgency (lowest TTL ratio first, tie-break by ad.aid)
+            active_ads = sorted(active_ads,
+                                key=lambda ad: (ad.ttl / max(ad.original_ttl, 1), ad.aid))
 
-            obs['ad_features'] = ad_features
+        for i, ad in enumerate(active_ads[:self.config.max_active_ads]):
+            ad_features[i] = ad.get_feature_vector()
 
-            # Add semantic edge features for EA mode
-            if self.action_mode == 'ea':
-                obs['edge_features'] = self.get_edge_features()
-        
-        # Add current ad for NA mode (cycles through unserved ads in sub-step mode)
-        elif self.action_mode == 'na':
-            # Get active ads NOT YET SERVED this timestep
-            active_ads = [ad for ad in self.ads if ad.state == 0
-                          and ad.aid not in self.sub_step_ads_served]
-            if active_ads:
-                # DETERMINISTIC: Select most urgent unserved ad (lowest TTL ratio)
-                self.current_ad_for_na_mode = min(active_ads,
-                                                  key=lambda ad: ad.ttl / max(ad.original_ttl, 1))
-                obs['current_ad'] = self.current_ad_for_na_mode.get_feature_vector()
-            else:
-                self.current_ad_for_na_mode = None
-                obs['current_ad'] = np.zeros(self.n_ad_features, dtype=np.float32)
+        obs['ad_features'] = ad_features
+
+        if self.action_mode == 'ea':
+            obs['edge_features'] = self.get_edge_features()
         
         return obs
 
@@ -1065,19 +1055,39 @@ class OptimizedBillboardEnv(gym.Env):
         """Execute the selected action with validation."""
         try:
             if self.action_mode == 'na':
-                # Node Action mode - now accepts single integer
-                ad_to_assign = self.current_ad_for_na_mode
-                if ad_to_assign and isinstance(action, (int, np.integer)):
-                    bb_idx = int(action)
-                    
-                    # Check if action is valid and billboard is free
-                    if 0 <= bb_idx < self.n_nodes and self.billboards[bb_idx].is_free():
+                # Node Action: (max_ads,) — one billboard per ad, ads sorted by urgency
+                if isinstance(action, (list, np.ndarray, torch.Tensor)):
+                    action = np.asarray(action).flatten()
+
+                    if action.shape[0] != self.config.max_active_ads:
+                        logger.warning(f"Invalid NA action shape: {action.shape}, "
+                                       f"expected ({self.config.max_active_ads},)")
+                        return
+
+                    active_ads = [ad for ad in self.ads if ad.state == 0]
+                    # Same urgency sort as _get_obs and get_mask
+                    active_ads = sorted(active_ads,
+                                        key=lambda ad: (ad.ttl / max(ad.original_ttl, 1), ad.aid))
+                    used_billboards = set()
+
+                    for ad_idx in range(min(len(active_ads), self.config.max_active_ads)):
+                        bb_idx = int(action[ad_idx])
+
+                        if not (0 <= bb_idx < self.n_nodes):
+                            continue
+                        if bb_idx in used_billboards:
+                            continue
+                        if not self.billboards[bb_idx].is_free():
+                            continue
+
+                        ad_to_assign = active_ads[ad_idx]
                         billboard = self.billboards[bb_idx]
 
                         duration = random.randint(*self.config.slot_duration_range)
                         total_cost = billboard.b_cost * duration
                         if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
                             billboard.assign(ad_to_assign.aid, duration)
+                            used_billboards.add(bb_idx)
 
                             self.placement_history.append({
                                 'spawn_step': ad_to_assign.spawn_step,
@@ -1088,27 +1098,6 @@ class OptimizedBillboardEnv(gym.Env):
                                 'demand': ad_to_assign.demand,
                                 'cost': total_cost
                             })
-
-                            if self.config.debug:
-                                logger.debug(f"Assigned ad {ad_to_assign.aid} to billboard {billboard.b_id} "
-                                           f"(total cost: ${total_cost:.2f} = ${billboard.b_cost:.2f}/step × {duration} steps, "
-                                           f"remaining budget: ${ad_to_assign.remaining_budget:.2f})")
-                        elif self.config.debug:
-                            logger.warning(f"Ad {ad_to_assign.aid} can't afford billboard {billboard.b_id} "
-                                         f"(total cost: ${total_cost:.2f} = ${billboard.b_cost:.2f}/step × {duration} steps, "
-                                         f"budget: ${ad_to_assign.remaining_budget:.2f})")
-                    
-                    elif self.config.debug:
-                        if not (0 <= bb_idx < self.n_nodes):
-                            logger.warning(f"Invalid action (billboard index) {bb_idx}")
-                        elif not self.billboards[bb_idx].is_free():
-                            logger.warning(f"Action failed: Billboard {bb_idx} is not free")
-                
-                elif self.config.debug:
-                    if not ad_to_assign:
-                        logger.warning("NA action skipped: No ad to assign")
-                    else:
-                        logger.warning(f"Invalid action type for NA mode: {type(action)}")
             
             elif self.action_mode == 'ea':
                 # Edge Action mode: action is (max_ads,) — one billboard index per ad
@@ -1153,53 +1142,54 @@ class OptimizedBillboardEnv(gym.Env):
                             })
 
             elif self.action_mode == 'mh':
-                # Multi-Head mode: action is (ad_idx, bb_idx) - two integers
+                # Multi-Head: (max_ads * 2,) = [ad_0, bb_0, ad_1, bb_1, ..., ad_7, bb_7]
                 if isinstance(action, (list, np.ndarray, torch.Tensor)):
                     action = np.asarray(action).flatten()
 
-                    if len(action) != 2:
-                        if self.config.debug:
-                            logger.warning(f"Invalid MH action length: {len(action)}, expected 2")
+                    expected_len = self.config.max_active_ads * 2
+                    if len(action) != expected_len:
+                        logger.warning(f"Invalid MH action length: {len(action)}, expected {expected_len}")
                         return
 
-                    ad_idx = int(action[0])
-                    bb_idx = int(action[1])
-
-                    # Validate indices
                     active_ads = [ad for ad in self.ads if ad.state == 0]
-                    if ad_idx >= len(active_ads) or ad_idx < 0:
-                        if self.config.debug:
-                            logger.debug(f"Invalid ad index: {ad_idx}, active ads: {len(active_ads)}")
-                        return
+                    used_ads = set()
+                    used_billboards = set()
 
-                    if bb_idx >= self.n_nodes or bb_idx < 0:
-                        if self.config.debug:
-                            logger.debug(f"Invalid billboard index: {bb_idx}")
-                        return
+                    for round_idx in range(self.config.max_active_ads):
+                        ad_idx = int(action[round_idx * 2])
+                        bb_idx = int(action[round_idx * 2 + 1])
 
-                    ad_to_assign = active_ads[ad_idx]
-                    billboard = self.billboards[bb_idx]
+                        if not (0 <= ad_idx < len(active_ads)):
+                            continue
+                        if ad_idx in used_ads:
+                            continue
+                        if not (0 <= bb_idx < self.n_nodes):
+                            continue
+                        if bb_idx in used_billboards:
+                            continue
+                        if not self.billboards[bb_idx].is_free():
+                            continue
 
-                    # Check billboard is free
-                    if not billboard.is_free():
-                        if self.config.debug:
-                            logger.debug(f"Billboard {bb_idx} is occupied")
-                        return
+                        ad_to_assign = active_ads[ad_idx]
+                        billboard = self.billboards[bb_idx]
 
-                    duration = random.randint(*self.config.slot_duration_range)
-                    total_cost = billboard.b_cost * duration
+                        duration = random.randint(*self.config.slot_duration_range)
+                        total_cost = billboard.b_cost * duration
 
-                    if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
-                        billboard.assign(ad_to_assign.aid, duration)
-                        self.placement_history.append({
-                            'spawn_step': ad_to_assign.spawn_step,
-                            'allocated_step': self.current_step,
-                            'ad_id': ad_to_assign.aid,
-                            'billboard_id': billboard.b_id,
-                            'duration': duration,
-                            'demand': ad_to_assign.demand,
-                            'cost': total_cost
-                        })
+                        if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
+                            billboard.assign(ad_to_assign.aid, duration)
+                            used_ads.add(ad_idx)
+                            used_billboards.add(bb_idx)
+
+                            self.placement_history.append({
+                                'spawn_step': ad_to_assign.spawn_step,
+                                'allocated_step': self.current_step,
+                                'ad_id': ad_to_assign.aid,
+                                'billboard_id': billboard.b_id,
+                                'duration': duration,
+                                'demand': ad_to_assign.demand,
+                                'cost': total_cost
+                            })
 
         except Exception as e:
             logger.error(f"Error executing action: {e}")
@@ -1245,11 +1235,6 @@ class OptimizedBillboardEnv(gym.Env):
 
         self.utilization_sum = 0.0
 
-        # SUB-STEP STATE
-        self.sub_step_counter = 0
-        self.sub_step_ads_served = set()
-        self.in_sub_step_sequence = False
-
         # All advertisers become available again
         self.used_advertiser_ids.clear()
 
@@ -1269,20 +1254,11 @@ class OptimizedBillboardEnv(gym.Env):
     
     
     def _step_internal(self, action):
-        """Internal step with sub-step support for NA/MH modes.
-
-        EA mode: single full step per call (unchanged behavior).
-        NA/MH mode: each call is one sub-step. A real timestep consists of
-        K sub-steps (one per active ad). Time only advances after all
-        active ads are served.
-        """
-        if self.action_mode == 'ea':
-            return self._full_step(action)
-        else:
-            return self._sub_step(action)
+        """Internal step dispatch. All modes use full-step."""
+        return self._full_step(action)
 
     def _full_step(self, action):
-        """Full-step logic for EA mode (unchanged behavior)."""
+        """Full-step logic for EA and NA modes."""
         self.ads_completed_this_step.clear()
         self.ads_failed_this_step.clear()
 
@@ -1325,91 +1301,6 @@ class OptimizedBillboardEnv(gym.Env):
             self._log_episode_end()
 
         return self._get_obs(), reward, terminated, False, info
-
-    def _sub_step(self, action):
-        """Sub-step logic for NA/MH modes (Begnardi-style sequential decisions).
-
-        Each real timestep has K sub-steps where K = number of active ads.
-        Sub-step 0: advance time (influence, tick, release).
-        Each sub-step: agent makes one allocation decision.
-        Last sub-step: compute reward, spawn ads, increment real step.
-        """
-        # --- Start of new real timestep ---
-        if not self.in_sub_step_sequence:
-            self.in_sub_step_sequence = True
-            self.sub_step_counter = 0
-            self.sub_step_ads_served = set()
-
-            # Clear events from previous timestep
-            self.ads_completed_this_step.clear()
-            self.ads_failed_this_step.clear()
-
-            # Advance time: influence, tick, release
-            self._apply_influence_for_current_minute()
-            self._tick_and_release_boards()
-
-            for ad in self.ads:
-                prev_state = ad.state
-                ad.step_time()
-                if ad.state == 2 and prev_state != 2:
-                    self.performance_metrics['total_ads_tardy'] += 1
-                    self.ads_failed_this_step.append(ad.aid)
-
-        # --- Execute one allocation ---
-        active_ads = [ad for ad in self.ads if ad.state == 0]
-        n_active = len(active_ads)
-
-        if n_active > 0:
-            self._execute_action(action)
-
-            # Mark ad as served this sub-step
-            if self.action_mode == 'na':
-                if self.current_ad_for_na_mode is not None:
-                    self.sub_step_ads_served.add(self.current_ad_for_na_mode.aid)
-            elif self.action_mode == 'mh':
-                if isinstance(action, (list, np.ndarray, torch.Tensor)):
-                    action_arr = np.asarray(action).flatten()
-                    if len(action_arr) >= 1:
-                        ad_idx = int(action_arr[0])
-                        if 0 <= ad_idx < len(active_ads):
-                            self.sub_step_ads_served.add(active_ads[ad_idx].aid)
-
-        self.sub_step_counter += 1
-
-        # --- Check if all active ads served or safety cap reached ---
-        unserved = [ad for ad in self.ads if ad.state == 0
-                    and ad.aid not in self.sub_step_ads_served]
-        all_served = (len(unserved) == 0)
-        # Safety cap: max sub-steps = max_active_ads (prevents infinite loop
-        # if MH agent repeatedly picks already-served ads despite masking)
-        cap_reached = (self.sub_step_counter >= self.config.max_active_ads)
-
-        if all_served or n_active == 0 or cap_reached:
-            # End of real timestep
-            self.in_sub_step_sequence = False
-
-            reward = self._compute_reward()
-
-            # Update metrics
-            self.performance_metrics['total_revenue'] = sum(
-                b.revenue_generated for b in self.billboards
-            )
-            occupied_count = sum(1 for b in self.billboards if not b.is_free())
-            self.utilization_sum += occupied_count / max(1, self.n_nodes)
-
-            self._spawn_ads()
-
-            self.current_step += 1
-            terminated = (self.current_step >= self.config.max_events)
-
-            info = self._build_info_dict()
-            if terminated:
-                self._log_episode_end()
-
-            return self._get_obs(), reward, terminated, False, info
-        else:
-            # Mid-timestep: return updated obs for next sub-step
-            return self._get_obs(), 0.0, False, False, {'sub_step': True}
 
     def _build_info_dict(self) -> dict:
         """Build the info dictionary returned at end of real timestep."""

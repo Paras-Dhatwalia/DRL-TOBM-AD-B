@@ -214,37 +214,37 @@ class MaskedCategorical(Distribution):
 
 
 class MultiHeadCategorical:
-    """Autoregressive distribution for multi-head action selection (MH mode).
+    """Full-step autoregressive distribution for MH mode.
+
+    Performs MAX_ADS rounds of autoregressive (ad, billboard) selection.
+    Each round: pick an unselected ad, then pick a billboard for that ad.
 
     Accepts CONCATENATED logits: [ad_logits, all_bb_logits_flat] with shape
     (batch, max_ads + max_ads * n_billboards).
 
-    Splits them into:
-    - ad_logits: (batch, max_ads)
-    - all_bb_logits: (batch, max_ads, n_billboards)
-
-    Sampling is autoregressive: sample ad first, then sample billboard
-    conditioned on the chosen ad. log_prob computes the correct joint
-    probability P(ad) * P(billboard | ad).
+    Action shape: (batch, max_ads * 2) = [ad_0, bb_0, ad_1, bb_1, ..., ad_K, bb_K]
     """
 
-    MAX_ADS = 20
+    MAX_ADS = 8
     N_BILLBOARDS = 444
 
     def __init__(self, logits: torch.Tensor):
         self._logits = logits
-        ad_logits = logits[..., :self.MAX_ADS]
-        bb_logits_flat = logits[..., self.MAX_ADS:]
 
-        ad_logits = torch.nan_to_num(ad_logits, nan=0.0)
-        bb_logits_flat = torch.nan_to_num(bb_logits_flat, nan=0.0)
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+            self._was_1d = True
+        else:
+            self._was_1d = False
 
-        # Reshape: (batch, max_ads * n_bb) -> (batch, max_ads, n_bb)
+        self._ad_logits = torch.nan_to_num(logits[..., :self.MAX_ADS], nan=0.0)
+        bb_logits_flat = torch.nan_to_num(logits[..., self.MAX_ADS:], nan=0.0)
+
+        # (batch, max_ads, n_bb)
         bb_shape = list(logits.shape[:-1]) + [self.MAX_ADS, self.N_BILLBOARDS]
         self._all_bb_logits = bb_logits_flat.view(*bb_shape)
 
-        self.ad_dist = torch.distributions.Categorical(logits=ad_logits)
-        self._batch_shape = logits.shape[:-1]
+        self._batch_shape = logits.shape[:1]
 
     def __len__(self):
         if self._logits.dim() == 1:
@@ -259,72 +259,166 @@ class MultiHeadCategorical:
     def batch_shape(self):
         return self._batch_shape
 
-    def _bb_dist_for_ad(self, ad_indices):
-        """Get billboard distribution conditioned on specific ad indices."""
-        if ad_indices.dim() == 0:
-            bb_logits = self._all_bb_logits[ad_indices]
-        else:
-            batch_idx = torch.arange(ad_indices.shape[0], device=ad_indices.device)
-            bb_logits = self._all_bb_logits[batch_idx, ad_indices]
-        return torch.distributions.Categorical(logits=bb_logits)
+    def _masked_ad_logits(self, ad_logits, used_ads_mask):
+        """Mask out already-selected ads. used_ads_mask: (batch, max_ads) bool, True=used."""
+        masked = ad_logits.clone()
+        masked[used_ads_mask] = float('-inf')
+        # If all masked, use uniform to prevent NaN
+        all_masked = used_ads_mask.all(dim=-1)
+        if all_masked.any():
+            masked[all_masked] = 0.0
+        return masked
 
-        
+    def sample(self, sample_shape=torch.Size()):
+        """Sample MAX_ADS (ad, bb) pairs autoregressively."""
+        batch_size = self._ad_logits.shape[0]
+        device = self._ad_logits.device
 
-    def sample(self):
-        ad_action = self.ad_dist.sample()
-        bb_dist = self._bb_dist_for_ad(ad_action)
-        bb_action = bb_dist.sample()
-        return torch.stack([ad_action, bb_action], dim=-1)
+        used_ads = torch.zeros(batch_size, self.MAX_ADS, dtype=torch.bool, device=device)
+        pairs = []
+
+        for _ in range(self.MAX_ADS):
+            masked_logits = self._masked_ad_logits(self._ad_logits, used_ads)
+            ad_dist = torch.distributions.Categorical(logits=masked_logits)
+            ad_action = ad_dist.sample()  # (batch,)
+
+            # Mark ad as used
+            used_ads.scatter_(1, ad_action.unsqueeze(1), True)
+
+            # Sample billboard for chosen ad
+            batch_idx = torch.arange(batch_size, device=device)
+            bb_logits = self._all_bb_logits[batch_idx, ad_action]  # (batch, n_bb)
+            bb_dist = torch.distributions.Categorical(logits=bb_logits)
+            bb_action = bb_dist.sample()  # (batch,)
+
+            pairs.extend([ad_action, bb_action])
+
+        # (batch, max_ads * 2)
+        actions = torch.stack(pairs, dim=-1)
+        if self._was_1d:
+            actions = actions.squeeze(0)
+        return actions
 
     def rsample(self, sample_shape=torch.Size()):
-        return self.sample()
+        return self.sample(sample_shape)
 
     def log_prob(self, actions):
-        ad_action = actions[..., 0].long()
-        bb_action = actions[..., 1].long()
-        ad_lp = self.ad_dist.log_prob(ad_action)
-        bb_dist = self._bb_dist_for_ad(ad_action)
-        bb_lp = bb_dist.log_prob(bb_action)
-        return ad_lp + bb_lp
+        """Joint log prob across all MAX_ADS autoregressive rounds.
+
+        Args:
+            actions: (batch, max_ads * 2) or (max_ads * 2,)
+        Returns:
+            Scalar log prob per batch element.
+        """
+        if actions.dim() == 1:
+            actions = actions.unsqueeze(0)
+
+        batch_size = actions.shape[0]
+        device = actions.device
+
+        used_ads = torch.zeros(batch_size, self.MAX_ADS, dtype=torch.bool, device=device)
+        total_lp = torch.zeros(batch_size, device=device)
+
+        for k in range(self.MAX_ADS):
+            ad_action = actions[:, k * 2].long()
+            bb_action = actions[:, k * 2 + 1].long()
+
+            # Ad log prob with masking from previous rounds
+            masked_logits = self._masked_ad_logits(self._ad_logits, used_ads)
+            ad_dist = torch.distributions.Categorical(logits=masked_logits)
+            total_lp = total_lp + ad_dist.log_prob(ad_action)
+
+            # Mark ad as used
+            used_ads.scatter_(1, ad_action.unsqueeze(1), True)
+
+            # Billboard log prob conditioned on chosen ad
+            batch_idx = torch.arange(batch_size, device=device)
+            bb_logits = self._all_bb_logits[batch_idx, ad_action]
+            bb_dist = torch.distributions.Categorical(logits=bb_logits)
+            total_lp = total_lp + bb_dist.log_prob(bb_action)
+
+        if self._was_1d:
+            total_lp = total_lp.squeeze(0)
+        return total_lp
 
     def entropy(self):
-        # H(ad, bb) = H(ad) + E_ad[H(bb|ad)]
-        ad_entropy = self.ad_dist.entropy()
-        ad_probs = self.ad_dist.probs  # (batch, max_ads)
+        """Approximate entropy: sum of per-round H(ad|masked) + E[H(bb|ad)].
 
-        # Conditional entropy for each ad's billboard distribution
-        bb_log_probs = torch.log_softmax(self._all_bb_logits, dim=-1)
+        Uses greedy (mode) ad selection to determine masking sequence.
+        Exact computation would require enumerating all orderings.
+        """
+        batch_size = self._ad_logits.shape[0]
+        device = self._ad_logits.device
+
+        used_ads = torch.zeros(batch_size, self.MAX_ADS, dtype=torch.bool, device=device)
+        total_ent = torch.zeros(batch_size, device=device)
+
         bb_probs = torch.softmax(self._all_bb_logits, dim=-1)
+        bb_log_probs = torch.log_softmax(self._all_bb_logits, dim=-1)
         bb_entropies = -(bb_probs * bb_log_probs).sum(dim=-1)  # (batch, max_ads)
 
-        expected_bb_entropy = (ad_probs * bb_entropies).sum(dim=-1)
-        return ad_entropy + expected_bb_entropy
+        for _ in range(self.MAX_ADS):
+            masked_logits = self._masked_ad_logits(self._ad_logits, used_ads)
+            ad_dist = torch.distributions.Categorical(logits=masked_logits)
+
+            # H(ad | remaining)
+            total_ent = total_ent + ad_dist.entropy()
+
+            # E_ad[H(bb|ad)] for this round
+            ad_probs = ad_dist.probs  # (batch, max_ads)
+            expected_bb_ent = (ad_probs * bb_entropies).sum(dim=-1)
+            total_ent = total_ent + expected_bb_ent
+
+            # Advance masking using greedy selection (mode)
+            greedy_ad = ad_dist.probs.argmax(dim=-1)
+            used_ads.scatter_(1, greedy_ad.unsqueeze(1), True)
+
+        if self._was_1d:
+            total_ent = total_ent.squeeze(0)
+        return total_ent
 
     @property
     def mode(self):
-        ad_mode = self.ad_dist.probs.argmax(dim=-1)
-        bb_dist = self._bb_dist_for_ad(ad_mode)
-        bb_mode = bb_dist.probs.argmax(dim=-1)
-        return torch.stack([ad_mode, bb_mode], dim=-1)
+        """Deterministic: greedily pick best ad then best billboard each round."""
+        batch_size = self._ad_logits.shape[0]
+        device = self._ad_logits.device
+
+        used_ads = torch.zeros(batch_size, self.MAX_ADS, dtype=torch.bool, device=device)
+        pairs = []
+
+        for _ in range(self.MAX_ADS):
+            masked_logits = self._masked_ad_logits(self._ad_logits, used_ads)
+            ad_action = masked_logits.argmax(dim=-1)
+            used_ads.scatter_(1, ad_action.unsqueeze(1), True)
+
+            batch_idx = torch.arange(batch_size, device=device)
+            bb_logits = self._all_bb_logits[batch_idx, ad_action]
+            bb_action = bb_logits.argmax(dim=-1)
+
+            pairs.extend([ad_action, bb_action])
+
+        actions = torch.stack(pairs, dim=-1)
+        if self._was_1d:
+            actions = actions.squeeze(0)
+        return actions
 
     @property
     def probs(self):
-        # For Tianshou compatibility: ad probs + marginal bb probs
-        ad_probs = self.ad_dist.probs
+        # First-round marginal: ad probs + marginal bb probs
+        ad_probs = torch.softmax(self._ad_logits, dim=-1)
         bb_probs = torch.softmax(self._all_bb_logits, dim=-1)
-        # Marginal P(bb) = sum_a P(a) * P(bb|a)
         marginal_bb = (ad_probs.unsqueeze(-1) * bb_probs).sum(dim=-2)
         return torch.cat([ad_probs, marginal_bb], dim=-1)
 
     @property
     def mean(self):
-        ad_probs = self.ad_dist.probs
-        ad_indices = torch.arange(ad_probs.shape[-1], device=ad_probs.device, dtype=ad_probs.dtype)
+        ad_probs = torch.softmax(self._ad_logits, dim=-1)
+        ad_indices = torch.arange(self.MAX_ADS, device=ad_probs.device, dtype=ad_probs.dtype)
         ad_mean = (ad_probs * ad_indices).sum(-1)
 
         bb_probs = torch.softmax(self._all_bb_logits, dim=-1)
-        bb_indices = torch.arange(bb_probs.shape[-1], device=bb_probs.device, dtype=bb_probs.dtype)
-        bb_means_per_ad = (bb_probs * bb_indices).sum(-1)  # (batch, max_ads)
+        bb_indices = torch.arange(self.N_BILLBOARDS, device=bb_probs.device, dtype=bb_probs.dtype)
+        bb_means_per_ad = (bb_probs * bb_indices).sum(-1)
         bb_mean = (ad_probs * bb_means_per_ad).sum(-1)
         return torch.stack([ad_mean, bb_mean], dim=-1)
 
@@ -335,10 +429,10 @@ class MultiHeadCategorical:
             mean = (probs * indices).sum(-1, keepdim=True)
             return (probs * (indices - mean) ** 2).sum(-1)
 
-        ad_var = cat_variance(self.ad_dist.probs)
+        ad_var = cat_variance(torch.softmax(self._ad_logits, dim=-1))
         bb_probs = torch.softmax(self._all_bb_logits, dim=-1)
         bb_vars = cat_variance(bb_probs.view(-1, bb_probs.shape[-1]))
-        bb_vars = bb_vars.view(*bb_probs.shape[:-1])  # (batch, max_ads)
+        bb_vars = bb_vars.view(*bb_probs.shape[:-1])
         bb_var = bb_vars.mean(-1)
         return torch.stack([ad_var, bb_var], dim=-1)
 

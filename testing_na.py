@@ -15,7 +15,6 @@ from datetime import datetime
 
 from optimized_env import OptimizedBillboardEnv, EnvConfig
 from models import BillboardAllocatorGNN
-from pettingzoo.utils import BaseWrapper
 
 
 class TestMetrics:
@@ -77,20 +76,18 @@ class TestMetrics:
         }
 
 
-class MinimalWrapper(BaseWrapper):
-    """Minimal wrapper for testing"""
+class MinimalWrapper:
+    """Minimal wrapper for testing — passes through Gym-style returns."""
+
+    def __init__(self, env):
+        self.env = env
 
     def reset(self, *args, **kwargs):
-        obs, info = self.env.reset(*args, **kwargs)
-        return obs, info
+        return self.env.reset(*args, **kwargs)
 
     def step(self, action):
-        obs, rewards, terms, truncs, infos = self.env.step(action)
-        reward = list(rewards.values())[0] if rewards else 0
-        term = list(terms.values())[0] if terms else False
-        trunc = list(truncs.values())[0] if truncs else False
-        info = list(infos.values())[0] if infos else {}
-        return obs, reward, term, trunc, info
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return obs, float(reward), bool(terminated), bool(truncated), info
 
 
 def load_model(model_path: str, device: torch.device, n_billboards: int) -> BillboardAllocatorGNN:
@@ -132,16 +129,19 @@ def preprocess_observation(obs: Dict, device: torch.device) -> Dict:
     return {
         'graph_nodes': torch.from_numpy(obs['graph_nodes']).float().unsqueeze(0).to(device),
         'graph_edge_links': torch.from_numpy(obs['graph_edge_links']).long().unsqueeze(0).to(device),
+        'ad_features': torch.from_numpy(obs['ad_features']).float().unsqueeze(0).to(device),
         'mask': torch.from_numpy(obs['mask']).bool().unsqueeze(0).to(device),
-        'current_ad': torch.from_numpy(obs['current_ad']).float().unsqueeze(0).to(device)
     }
 
 
 def run_episode(env, model, device, deterministic=True, render=False):
-    """Run single test episode"""
+    """Run single test episode — full-step, one billboard per ad."""
     obs, info = env.reset()
     metrics = TestMetrics()
     metrics.start_episode()
+
+    max_ads = env.env.config.max_active_ads
+    n_bb = env.env.n_nodes
 
     done = False
     step = 0
@@ -149,23 +149,22 @@ def run_episode(env, model, device, deterministic=True, render=False):
     while not done:
         start_time = time.time()
 
-        # Preprocess observation
         obs_torch = preprocess_observation(obs, device)
 
-        # Get action from model
         with torch.no_grad():
-            probs, _ = model(obs_torch)
+            logits, _ = model(obs_torch)
+            # logits shape: (1, max_ads * n_bb) — reshape to per-ad
+            per_ad_logits = logits[0].view(max_ads, n_bb)
 
-            if deterministic:
-                action = probs.argmax(dim=1).cpu().numpy()[0]
-            else:
-                action = torch.multinomial(probs[0], 1).cpu().numpy()[0]
+        if deterministic:
+            action = per_ad_logits.argmax(dim=-1).cpu().numpy()
+        else:
+            probs = torch.softmax(per_ad_logits, dim=-1)
+            action = torch.multinomial(probs, 1).squeeze(-1).cpu().numpy()
 
-        # Step environment with integer action
         obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
 
-        # Record metrics
         step_time = time.time() - start_time
         metrics.record_step(reward, action, info, step_time)
 

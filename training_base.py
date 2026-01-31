@@ -70,8 +70,8 @@ BASE_TRAIN_CONFIG = {
 MODE_DEFAULTS = {
     "na": {
         "discount_factor": 0.995,
-        "step_per_collect": 5760,   # 4 episodes x 1440 steps
-        "step_per_epoch": 14400,    # 10 episodes worth per epoch
+        "step_per_collect": 5760,   # 4 full-step episodes x 1440 steps
+        "step_per_epoch": 14400,    # 10 full-step episodes per epoch
         "buffer_size": 23040,
         "save_path": "models/ppo_billboard_na.pt",
         "log_path": "logs/ppo_billboard_na",
@@ -81,8 +81,8 @@ MODE_DEFAULTS = {
     },
     "mh": {
         "discount_factor": 0.995,
-        "step_per_collect": 5760,   # 4 episodes x 1440 steps
-        "step_per_epoch": 14400,    # 10 episodes worth per epoch
+        "step_per_collect": 5760,   # 4 full-step episodes x 1440 steps
+        "step_per_epoch": 14400,    # 10 full-step episodes per epoch
         "buffer_size": 23040,
         "save_path": "models/ppo_billboard_mh.pt",
         "log_path": "logs/ppo_billboard_mh",
@@ -137,7 +137,8 @@ def create_vectorized_envs(env_config: dict, n_envs: int):
 def get_dist_fn(mode: str, max_ads: int, n_billboards: int = 0):
     """Get the distribution function for a given mode."""
     if mode == 'na':
-        return torch.distributions.Categorical
+        from distributions import create_per_ad_dist_fn
+        return create_per_ad_dist_fn(max_ads, n_billboards)
 
     elif mode == 'mh':
         from distributions import create_multi_head_dist_fn
