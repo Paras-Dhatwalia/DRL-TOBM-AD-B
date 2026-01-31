@@ -618,6 +618,12 @@ class BillboardAllocatorGNN(nn.Module):
             observations['graph_nodes'].float(), edge_index
         )
 
+        # Clamp extreme values from GNN to prevent NaN propagation downstream.
+        # GIN convolutions sum neighbor features across high-degree nodes, which
+        # can produce inf/NaN after 3 layers on dense graphs (444 nodes, ~100K edges).
+        if torch.isnan(billboard_embeds).any() or torch.isinf(billboard_embeds).any():
+            billboard_embeds = torch.nan_to_num(billboard_embeds, nan=0.0, posinf=1e6, neginf=-1e6)
+
         mask = observations['mask'].bool()
         
         if self.mode == 'na':
@@ -798,6 +804,16 @@ class BillboardAllocatorGNN(nn.Module):
         # Sample or get ad selection for conditioning Head 2
         ad_probs = F.softmax(ad_logits, dim=1)
 
+        # Replace NaN probs from any source (all-masked, weight divergence, etc.)
+        nan_rows = torch.isnan(ad_probs).any(dim=-1)
+        if nan_rows.any():
+            uniform = torch.ones(self.max_ads, device=ad_probs.device, dtype=ad_probs.dtype) / self.max_ads
+            ad_probs = torch.where(
+                nan_rows.unsqueeze(-1).expand_as(ad_probs),
+                uniform.unsqueeze(0).expand_as(ad_probs),
+                ad_probs
+            )
+
         if self.training and state is not None and 'learn' in info:
             chosen_ads = state[:, 0].long()
         else:
@@ -818,14 +834,20 @@ class BillboardAllocatorGNN(nn.Module):
         billboard_mask = mask[torch.arange(batch_size), chosen_ads].bool()  # (batch_size, n_billboards)
         billboard_logits[~billboard_mask] = self.min_val
 
-        # Same fix for billboard logits: all-masked → uniform
+        # Replace all-masked or NaN billboard logits with uniform
         no_valid_bbs = ~billboard_mask.any(dim=-1)
-        if no_valid_bbs.any():
+        bb_nan = torch.isnan(billboard_logits).any(dim=-1)
+        fix_bb = no_valid_bbs | bb_nan
+        if fix_bb.any():
             billboard_logits = torch.where(
-                no_valid_bbs.unsqueeze(-1).expand_as(billboard_logits),
+                fix_bb.unsqueeze(-1).expand_as(billboard_logits),
                 torch.zeros_like(billboard_logits),
                 billboard_logits
             )
+
+        # Replace any remaining NaN in logits before output
+        ad_logits = torch.nan_to_num(ad_logits, nan=0.0)
+        billboard_logits = torch.nan_to_num(billboard_logits, nan=0.0)
 
         # Concatenate logits: (batch, max_ads + n_billboards)
         concatenated_logits = torch.cat([ad_logits, billboard_logits], dim=-1)
