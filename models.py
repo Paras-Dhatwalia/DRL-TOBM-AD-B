@@ -97,13 +97,11 @@ def validate_observations(observations: Dict[str, torch.Tensor], mode: str,
                            f"Expected {expected_ad_shape}, got {actual_ad_shape}")
         
         if mode == 'ea':
-            # Edge Action specific mask validation
-            expected_mask_shape = (batch_size, max_ads * n_billboards)
+            expected_mask_shape = (batch_size, max_ads, n_billboards)
             actual_mask_shape = observations['mask'].shape
             if actual_mask_shape != expected_mask_shape:
                 raise ValueError(f"EA mode mask shape mismatch. Expected {expected_mask_shape}, "
-                               f"got {actual_mask_shape}. EA mode requires flattened "
-                               f"(ad, billboard) pair mask.")
+                               f"got {actual_mask_shape}.")
         elif mode == 'mh':
             # Multi-Head specific mask validation
             expected_mask_shape = (batch_size, max_ads, n_billboards)
