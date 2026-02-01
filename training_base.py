@@ -259,7 +259,8 @@ def run_post_training_eval(policy, env_factory, mode_name, best_model_path=None,
     if best_model_path and shared_model and os.path.exists(best_model_path):
         try:
             checkpoint = torch.load(best_model_path,
-                                    map_location=next(shared_model.parameters()).device)
+                                    map_location=next(shared_model.parameters()).device,
+                                    weights_only=False)
             shared_model.load_state_dict(checkpoint['model_state_dict'])
             saved_reward = checkpoint.get('best_reward', 'N/A')
             logger.info(f"Loaded best checkpoint (reward={saved_reward}) from {best_model_path}")
@@ -456,7 +457,7 @@ def train(mode: str, env_config: dict = None, train_config: dict = None):
                                best_model_path=train_config["save_path"],
                                shared_model=shared_model)
 
-        best_reward = result.get('best_reward', 'N/A')
+        best_reward = getattr(result, 'best_reward', 'N/A')
         logger.info("=" * 60)
         logger.info(f"Training complete! Best test reward: {best_reward}")
         logger.info(f"Best model saved to: {train_config['save_path']}")
