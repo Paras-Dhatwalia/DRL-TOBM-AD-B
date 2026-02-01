@@ -1,8 +1,7 @@
 """
 Custom Distributions for Billboard Allocation RL
 
-- PerAdCategorical: Independent categorical per ad, selects one billboard per ad (EA mode).
-- MaskedCategorical: Categorical with action masking (NA mode).
+- PerAdCategorical: Independent categorical per ad, selects one billboard per ad (NA and EA modes).
 - MultiHeadCategorical: Two-head categorical for ad + billboard selection (MH mode).
 
 Compatible with Tianshou's PPO policy via dist_fn parameter.
@@ -10,7 +9,6 @@ Compatible with Tianshou's PPO policy via dist_fn parameter.
 
 import torch
 import torch.nn.functional as F
-from torch.distributions import Distribution, constraints
 from typing import Optional, Union
 
 
@@ -133,86 +131,6 @@ class PerAdCategorical:
         return self.variance.sqrt()
 
 
-class MaskedCategorical(Distribution):
-    """
-    Categorical distribution with action masking support.
-
-    Used for NA (Node Action) mode where a single billboard is selected
-    from the set of valid (unmasked) billboards.
-
-    Args:
-        logits: Unnormalized log probabilities, shape (batch_size, num_actions)
-        probs: Probabilities, shape (batch_size, num_actions)
-        mask: Boolean mask, shape (batch_size, num_actions). True = valid action.
-
-    The mask is applied by setting logits of invalid actions to -inf,
-    which zeros out their probability after softmax.
-    """
-
-    arg_constraints = {
-        'logits': constraints.real,
-        'probs': constraints.simplex
-    }
-
-    def __init__(
-        self,
-        logits: Optional[torch.Tensor] = None,
-        probs: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None,
-        validate_args: bool = False
-    ):
-        if (logits is None) == (probs is None):
-            raise ValueError("Exactly one of 'logits' or 'probs' must be specified")
-
-        self.mask = mask
-
-        if logits is not None:
-            # Apply mask to logits
-            if mask is not None:
-                mask_bool = mask.bool() if mask.dtype != torch.bool else mask
-                # Set invalid action logits to very negative value
-                masked_logits = logits.masked_fill(~mask_bool, float('-inf'))
-            else:
-                masked_logits = logits
-            self._categorical = torch.distributions.Categorical(logits=masked_logits)
-        else:
-            # Apply mask to probs
-            if mask is not None:
-                mask_bool = mask.bool() if mask.dtype != torch.bool else mask
-                masked_probs = probs * mask_bool.float()
-                # Renormalize
-                masked_probs = masked_probs / (masked_probs.sum(dim=-1, keepdim=True) + 1e-8)
-            else:
-                masked_probs = probs
-            self._categorical = torch.distributions.Categorical(probs=masked_probs)
-
-        super().__init__(
-            batch_shape=self._categorical.batch_shape,
-            validate_args=validate_args
-        )
-
-    @property
-    def logits(self) -> torch.Tensor:
-        return self._categorical.logits
-
-    @property
-    def probs(self) -> torch.Tensor:
-        return self._categorical.probs
-
-    def sample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
-        return self._categorical.sample(sample_shape)
-
-    def log_prob(self, value: torch.Tensor) -> torch.Tensor:
-        return self._categorical.log_prob(value)
-
-    def entropy(self) -> torch.Tensor:
-        return self._categorical.entropy()
-
-    @property
-    def mode(self) -> torch.Tensor:
-        return self.probs.argmax(dim=-1)
-
-
 class MultiHeadCategorical:
     """Full-step autoregressive distribution for MH mode.
 
@@ -260,13 +178,15 @@ class MultiHeadCategorical:
         return self._batch_shape
 
     def _masked_ad_logits(self, ad_logits, used_ads_mask):
-        """Mask out already-selected ads. used_ads_mask: (batch, max_ads) bool, True=used."""
-        masked = ad_logits.clone()
-        masked[used_ads_mask] = float('-inf')
+        """Mask out already-selected ads. used_ads_mask: (batch, max_ads) bool, True=used.
+
+        Uses non-inplace ops to preserve autograd graph for PPO backprop.
+        """
+        neg_inf = torch.tensor(float('-inf'), device=ad_logits.device, dtype=ad_logits.dtype)
+        masked = torch.where(used_ads_mask, neg_inf, ad_logits)
         # If all masked, use uniform to prevent NaN
-        all_masked = used_ads_mask.all(dim=-1)
-        if all_masked.any():
-            masked[all_masked] = 0.0
+        all_masked = used_ads_mask.all(dim=-1, keepdim=True)
+        masked = torch.where(all_masked.expand_as(masked), torch.zeros_like(masked), masked)
         return masked
 
     def sample(self, sample_shape=torch.Size()):
@@ -282,8 +202,8 @@ class MultiHeadCategorical:
             ad_dist = torch.distributions.Categorical(logits=masked_logits)
             ad_action = ad_dist.sample()  # (batch,)
 
-            # Mark ad as used
-            used_ads.scatter_(1, ad_action.unsqueeze(1), True)
+            # Mark ad as used (non-inplace)
+            used_ads = used_ads | F.one_hot(ad_action, self.MAX_ADS).bool()
 
             # Sample billboard for chosen ad
             batch_idx = torch.arange(batch_size, device=device)
@@ -309,6 +229,8 @@ class MultiHeadCategorical:
             actions: (batch, max_ads * 2) or (max_ads * 2,)
         Returns:
             Scalar log prob per batch element.
+
+        Uses non-inplace ops throughout to preserve autograd graph.
         """
         if actions.dim() == 1:
             actions = actions.unsqueeze(0)
@@ -328,8 +250,8 @@ class MultiHeadCategorical:
             ad_dist = torch.distributions.Categorical(logits=masked_logits)
             total_lp = total_lp + ad_dist.log_prob(ad_action)
 
-            # Mark ad as used
-            used_ads.scatter_(1, ad_action.unsqueeze(1), True)
+            # Mark ad as used (non-inplace to preserve autograd)
+            used_ads = used_ads | F.one_hot(ad_action, self.MAX_ADS).bool()
 
             # Billboard log prob conditioned on chosen ad
             batch_idx = torch.arange(batch_size, device=device)
@@ -369,9 +291,9 @@ class MultiHeadCategorical:
             expected_bb_ent = (ad_probs * bb_entropies).sum(dim=-1)
             total_ent = total_ent + expected_bb_ent
 
-            # Advance masking using greedy selection (mode)
+            # Advance masking using greedy selection (non-inplace)
             greedy_ad = ad_dist.probs.argmax(dim=-1)
-            used_ads.scatter_(1, greedy_ad.unsqueeze(1), True)
+            used_ads = used_ads | F.one_hot(greedy_ad, self.MAX_ADS).bool()
 
         if self._was_1d:
             total_ent = total_ent.squeeze(0)
@@ -389,7 +311,7 @@ class MultiHeadCategorical:
         for _ in range(self.MAX_ADS):
             masked_logits = self._masked_ad_logits(self._ad_logits, used_ads)
             ad_action = masked_logits.argmax(dim=-1)
-            used_ads.scatter_(1, ad_action.unsqueeze(1), True)
+            used_ads = used_ads | F.one_hot(ad_action, self.MAX_ADS).bool()
 
             batch_idx = torch.arange(batch_size, device=device)
             bb_logits = self._all_bb_logits[batch_idx, ad_action]
