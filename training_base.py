@@ -59,12 +59,12 @@ BASE_TRAIN_CONFIG = {
     "lr": 3e-4,
     "gae_lambda": 0.95,
     "vf_coef": 0.5,
-    "ent_coef": 0.01,
+    "ent_coef": 0.02,
     "max_grad_norm": 0.5,
-    "eps_clip": 0.2,
+    "eps_clip": 0.1,
     "batch_size": 64,
     "max_epoch": 100,
-    "repeat_per_collect": 10,
+    "repeat_per_collect": 4,
 }
 
 MODE_DEFAULTS = {
@@ -244,11 +244,30 @@ def eval_business_metrics(policy, env_factory, epoch, step_idx,
     eval_env.close()
 
 
-def run_post_training_eval(policy, env_factory, mode_name):
-    """Run a full post-training evaluation episode and print results."""
+def run_post_training_eval(policy, env_factory, mode_name, best_model_path=None,
+                           shared_model=None):
+    """Run a full post-training evaluation episode using the best saved model.
+
+    If best_model_path is provided and exists, loads those weights before eval
+    so we evaluate the best checkpoint, not the potentially degraded final weights.
+    """
     logger.info("=" * 60)
     logger.info("POST-TRAINING EVALUATION")
     logger.info("=" * 60)
+
+    # Load best checkpoint weights if available
+    if best_model_path and shared_model and os.path.exists(best_model_path):
+        try:
+            checkpoint = torch.load(best_model_path,
+                                    map_location=next(shared_model.parameters()).device)
+            shared_model.load_state_dict(checkpoint['model_state_dict'])
+            saved_reward = checkpoint.get('best_reward', 'N/A')
+            logger.info(f"Loaded best checkpoint (reward={saved_reward}) from {best_model_path}")
+        except Exception as e:
+            logger.warning(f"Could not load best checkpoint: {e}. Using final weights.")
+    else:
+        logger.info("No best checkpoint available — evaluating final weights.")
+
     logger.info("Running full episode with trained policy...")
 
     try:
@@ -376,26 +395,18 @@ def train(mode: str, env_config: dict = None, train_config: dict = None):
     writer = SummaryWriter(train_config["log_path"])
     tb_logger = TensorboardLogger(writer)
 
-    best_reward = -float('inf')
-
     def save_best_fn(policy):
-        nonlocal best_reward
-        # Tianshou calls this when test reward improves; collect to get value
-        test_result = test_collector.collect(n_episode=10)
-        current_reward = test_result.returns.mean()
-
-        if current_reward > best_reward:
-            best_reward = current_reward
-            logger.info(f"New best reward: {best_reward:.2f}, saving...")
-            torch.save({
-                'model_state_dict': shared_model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'config': model_config,
-                'training_config': train_config,
-                'best_reward': best_reward,
-                'graph': graph_numpy,
-                'mode': mode,
-            }, train_config["save_path"])
+        # Tianshou calls this ONLY when test reward improves — always save.
+        # No redundant test_collector.collect() call needed.
+        logger.info(f"Test reward improved, saving checkpoint...")
+        torch.save({
+            'model_state_dict': shared_model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'config': model_config,
+            'training_config': train_config,
+            'graph': graph_numpy,
+            'mode': mode,
+        }, train_config["save_path"])
 
     env_factory = lambda: create_env(env_config)
 
@@ -431,21 +442,26 @@ def train(mode: str, env_config: dict = None, train_config: dict = None):
 
         result = trainer.run()
 
-        run_post_training_eval(policy, env_factory, mode.upper())
-
-        logger.info("=" * 60)
-        logger.info(f"Training complete! Best reward: {best_reward:.2f}")
-        logger.info(f"Model saved to: {train_config['save_path']}")
-        logger.info("=" * 60)
-
+        # Save final-epoch model BEFORE loading best checkpoint for eval
         torch.save({
             'model_state_dict': shared_model.state_dict(),
             'config': model_config,
             'training_config': train_config,
-            'final_reward': best_reward,
             'graph': graph_numpy,
             'mode': mode,
         }, train_config["save_path"].replace('.pt', '_final.pt'))
+
+        # Post-training eval loads the BEST checkpoint, not final weights
+        run_post_training_eval(policy, env_factory, mode.upper(),
+                               best_model_path=train_config["save_path"],
+                               shared_model=shared_model)
+
+        best_reward = result.get('best_reward', 'N/A')
+        logger.info("=" * 60)
+        logger.info(f"Training complete! Best test reward: {best_reward}")
+        logger.info(f"Best model saved to: {train_config['save_path']}")
+        logger.info(f"Final model saved to: {train_config['save_path'].replace('.pt', '_final.pt')}")
+        logger.info("=" * 60)
 
         return result
 
