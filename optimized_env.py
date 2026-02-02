@@ -1262,22 +1262,22 @@ class OptimizedBillboardEnv(gym.Env):
         self.ads_completed_this_step.clear()
         self.ads_failed_this_step.clear()
 
-        # 1. Apply influence
+        # 1. Apply influence (from previous assignments)
         self._apply_influence_for_current_minute()
 
         # 2. Tick and release expired billboards
         self._tick_and_release_boards()
 
-        # 3. Tick ad TTLs
+        # 3. Execute agent action (BEFORE TTL tick so agent can act on TTL=1 ads)
+        self._execute_action(action)
+
+        # 4. Tick ad TTLs
         for ad in self.ads:
             prev_state = ad.state
             ad.step_time()
             if ad.state == 2 and prev_state != 2:
                 self.performance_metrics['total_ads_tardy'] += 1
                 self.ads_failed_this_step.append(ad.aid)
-
-        # 4. Execute agent action
-        self._execute_action(action)
 
         # 5. Compute reward
         reward = self._compute_reward()

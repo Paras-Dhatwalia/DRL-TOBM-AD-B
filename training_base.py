@@ -47,7 +47,7 @@ def setup_logging():
 # These paths must be set by each training script before calling train()
 DATA_PATHS = {
     "billboard_csv": r"C:\Coding Files\DRL-TOBM-AD-B\bb_nyc_updated2.csv",
-    "advertiser_csv": r"C:\Coding Files\DRL-TOBM-AD-B\Advertiser_U100.csv",
+    "advertiser_csv": r"C:\Coding Files\DRL-TOBM-AD-B\Advertiser_100_N.csv",
     "trajectory_csv": r"C:\Coding Files\DRL-TOBM-AD-B\trajectory_augmented.csv",
 }
 
