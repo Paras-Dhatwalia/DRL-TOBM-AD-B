@@ -24,7 +24,7 @@ class EnvConfig:
     new_ads_per_step_range: Tuple[int, int] = (0, 3)
     tardiness_cost: float = 50.0
     max_events: int = 1440  # 1 minute per step, 1440 minutes = 24 hours
-    max_active_ads: int = 8
+    max_active_ads: int = 20
     ad_ttl: int = 720  # Ad time-to-live in timesteps
     graph_connection_distance: float = 5000.0
     cache_ttl: int = 1

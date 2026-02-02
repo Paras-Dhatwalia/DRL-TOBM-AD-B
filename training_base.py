@@ -62,7 +62,7 @@ BASE_TRAIN_CONFIG = {
     "ent_coef": 0.02,
     "max_grad_norm": 0.1,
     "eps_clip": 0.05,
-    "batch_size": 512,
+    "batch_size": 128,
     "max_epoch": 100,
     "repeat_per_collect": 4,
 }
