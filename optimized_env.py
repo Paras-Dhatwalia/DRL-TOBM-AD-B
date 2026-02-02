@@ -828,9 +828,9 @@ class OptimizedBillboardEnv(gym.Env):
            ~100x weaker than completion bonus.
         """
         C_ONGOING = 0.001
-        C_TARDY = 1.0
+        C_TARDY = 2.0
         C_COMPLETION = 10.0
-        C_PROGRESS = 0.1
+        C_PROGRESS = 5.0
 
         reward = 0.0
 

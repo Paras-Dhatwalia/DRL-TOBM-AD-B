@@ -60,9 +60,9 @@ BASE_TRAIN_CONFIG = {
     "gae_lambda": 0.95,
     "vf_coef": 0.5,
     "ent_coef": 0.02,
-    "max_grad_norm": 0.5,
-    "eps_clip": 0.1,
-    "batch_size": 64,
+    "max_grad_norm": 0.1,
+    "eps_clip": 0.05,
+    "batch_size": 512,
     "max_epoch": 100,
     "repeat_per_collect": 4,
 }
@@ -70,7 +70,7 @@ BASE_TRAIN_CONFIG = {
 MODE_DEFAULTS = {
     "na": {
         "discount_factor": 0.995,
-        "step_per_collect": 5760,   # 4 full-step episodes x 1440 steps
+        "step_per_collect": 11520,   # 8 full-step episodes x 1440 steps
         "step_per_epoch": 14400,    # 10 full-step episodes per epoch
         "buffer_size": 23040,
         "save_path": "models/ppo_billboard_na.pt",
@@ -81,7 +81,7 @@ MODE_DEFAULTS = {
     },
     "mh": {
         "discount_factor": 0.995,
-        "step_per_collect": 5760,   # 4 full-step episodes x 1440 steps
+        "step_per_collect": 11520,   # 8 full-step episodes x 1440 steps
         "step_per_epoch": 14400,    # 10 full-step episodes per epoch
         "buffer_size": 23040,
         "save_path": "models/ppo_billboard_mh.pt",
@@ -92,9 +92,9 @@ MODE_DEFAULTS = {
     },
     "ea": {
         "discount_factor": 0.995,
-        "step_per_collect": 5760,
+        "step_per_collect": 11520,
         "step_per_epoch": 14400,
-        "buffer_size": 5760,  # = step_per_collect (on-policy PPO needs 1 cycle)
+        "buffer_size": 11520,  # = step_per_collect (on-policy PPO needs 1 cycle)
         "save_path": "models/ppo_billboard_ea.pt",
         "log_path": "logs/ppo_billboard_ea",
         "use_attention": False,  # Attention causes OOM with large EA action space
@@ -396,10 +396,19 @@ def train(mode: str, env_config: dict = None, train_config: dict = None):
     writer = SummaryWriter(train_config["log_path"])
     tb_logger = TensorboardLogger(writer)
 
+    best_reward_so_far = [None]  # mutable container for closure
+
     def save_best_fn(policy):
         # Tianshou calls this ONLY when test reward improves — always save.
-        # No redundant test_collector.collect() call needed.
-        logger.info(f"Test reward improved, saving checkpoint...")
+        # Compute current test reward from collector buffer stats.
+        try:
+            buf = test_collector.buffer
+            rews = buf.rew[:len(buf)]
+            current_reward = float(rews.mean()) if len(rews) > 0 else 0.0
+        except Exception:
+            current_reward = 0.0
+        best_reward_so_far[0] = current_reward
+        logger.info(f"New best reward: {current_reward:.2f}, saving...")
         torch.save({
             'model_state_dict': shared_model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
@@ -407,6 +416,7 @@ def train(mode: str, env_config: dict = None, train_config: dict = None):
             'training_config': train_config,
             'graph': graph_numpy,
             'mode': mode,
+            'best_reward': current_reward,
         }, train_config["save_path"])
 
     env_factory = lambda: create_env(env_config)
