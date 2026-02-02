@@ -105,18 +105,22 @@ def run_greedy_eval(n_episodes=5):
             is_free = np.array([b.is_free() for b in env.billboards])
             costs = np.array([b.b_cost for b in env.billboards])
             
-            # Get p_sizes for weighting
-            # p_size is normalized size (0-1)
-            p_sizes = np.array([b.p_size for b in env.billboards])
-            
             # Mask of valid candidates: Free AND has some influence (> 0)
             candidate_mask = is_free & (expected_influence > 0.001)
 
+            # Get p_sizes for weighting
+            p_sizes = np.array([b.p_size for b in env.billboards])
+            
             # Weighted Score = Expected Users * Size Ratio
-            # This approximates the 'probability' sum used in the actual step
             weighted_influence = expected_influence * p_sizes
             
-            sorting_metric = weighted_influence
+            # Calculate ROI (Influence per Dollar)
+            # Avoid divide by zero
+            safe_costs = np.maximum(costs, 0.1)
+            roi_metric = weighted_influence / safe_costs
+            
+            # Use ROI as the sorting metric
+            sorting_metric = roi_metric
 
             # We want to pick the BEST candidates. 
             # Sort all billboards by WEIGHTED influence (descending)

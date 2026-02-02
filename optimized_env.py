@@ -178,10 +178,10 @@ class Ad:
     # Scaling constants for inference-stable normalization
     # These ensure all features are in [0, 1] regardless of batch size
     # Values from Advertiser_100.csv: Demand=100-149, Payment=90k-161k, Ratio=902-1099
-    MAX_DEMAND = 200.0         # Demand range: 100-149, buffer to 200
-    MAX_PAYMENT = 200000.0     # Payment range: 90k-161k, buffer to 200k
-    MAX_RATIO = 1200.0         # Ratio range: 902-1099, buffer to 1200
-    MAX_BILLBOARDS = 25.0      # Max billboards per ad
+    MAX_DEMAND = 10000.0       # Demand range: ~6000 max
+    MAX_PAYMENT = 10000000.0   # Payment range: ~6M max
+    MAX_RATIO = 1500.0         # Ratio range: ~1100 max
+    MAX_BILLBOARDS = 50.0      # Max billboards per ad
 
     def get_feature_vector(self) -> np.ndarray:
         """Get feature vector for this ad (12 features, all normalized to [0, 1]).
@@ -244,9 +244,9 @@ class Billboard:
     # Scaling constants for inference-stable normalization
     # These ensure all features are in [0, 1] regardless of batch size
     # Values from BB_NYC.csv: B_Size=80-670, B_Cost=0.25-104.5, Influence=0.4-149.8
-    MAX_COST = 150.0         # Cost range: 0.25-104.5, buffer to 150
+    MAX_COST = 20000.0       # Cost range: ~12k max
     MAX_SIZE = 800.0         # Size range: 80-670, buffer to 800
-    MAX_INFLUENCE = 200.0    # Influence range: 0.4-149.8, buffer to 200
+    MAX_INFLUENCE = 20000.0  # Influence range: ~16k max
     MAX_DURATION = 10.0      # Max occupation duration
     MAX_USAGE = 100.0        # Max total usage count
 
