@@ -1001,8 +1001,8 @@ class OptimizedBillboardEnv(gym.Env):
 
         # HYSTERESIS: Only spawn when below low threshold
         # LOW_THRESHOLD is 75% of max to ensure continuous ad flow
-        LOW_THRESHOLD = max(1, int(self.config.max_active_ads * 0.75))  # 6 when max=8
-        HIGH_THRESHOLD = self.config.max_active_ads  # 8
+        LOW_THRESHOLD = max(1, int(self.config.max_active_ads * 0.75))  # 15 when max=20
+        HIGH_THRESHOLD = self.config.max_active_ads  # 20
 
         active_count = len(self.ads)
         if active_count >= LOW_THRESHOLD:

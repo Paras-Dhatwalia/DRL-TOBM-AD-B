@@ -26,7 +26,8 @@ class PerAdCategorical:
     one billboard per ad per timestep.
     """
 
-    MAX_ADS = 8
+    # Defaults - overwritten by create_per_ad_dist_fn() during training
+    MAX_ADS = 20  # Must match EnvConfig.max_active_ads
     N_BILLBOARDS = 444
 
     def __init__(self, logits: torch.Tensor):
@@ -143,7 +144,8 @@ class MultiHeadCategorical:
     Action shape: (batch, max_ads * 2) = [ad_0, bb_0, ad_1, bb_1, ..., ad_K, bb_K]
     """
 
-    MAX_ADS = 8
+    # Defaults - overwritten by create_multi_head_dist_fn() during training
+    MAX_ADS = 20  # Must match EnvConfig.max_active_ads
     N_BILLBOARDS = 444
 
     def __init__(self, logits: torch.Tensor):

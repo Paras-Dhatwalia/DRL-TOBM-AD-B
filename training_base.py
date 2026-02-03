@@ -63,7 +63,7 @@ BASE_TRAIN_CONFIG = {
     "max_grad_norm": 0.1,
     "eps_clip": 0.05,
     "batch_size": 128,
-    "max_epoch": 100,
+    "max_epoch": 50,
     "repeat_per_collect": 4,
 }
 
@@ -77,7 +77,7 @@ MODE_DEFAULTS = {
         "log_path": "logs/ppo_billboard_na",
         "use_attention": True,
         "dropout": 0.1,
-        "deterministic_eval": True,
+        "deterministic_eval": False,  # Stochastic to avoid billboard collisions
     },
     "mh": {
         "discount_factor": 0.995,
@@ -88,7 +88,7 @@ MODE_DEFAULTS = {
         "log_path": "logs/ppo_billboard_mh",
         "use_attention": True,
         "dropout": 0.1,
-        "deterministic_eval": True,
+        "deterministic_eval": False,  # Stochastic to avoid billboard collisions
     },
     "ea": {
         "discount_factor": 0.995,
@@ -315,6 +315,7 @@ def run_post_training_eval(policy, env_factory, mode_name, best_model_path=None,
     except Exception as e:
         logger.error(f"Post-training evaluation failed: {e}")
         import traceback
+        traceback.print_exc()
         traceback.print_exc()
 
 

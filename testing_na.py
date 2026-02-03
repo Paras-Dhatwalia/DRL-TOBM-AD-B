@@ -90,7 +90,7 @@ class MinimalWrapper:
         return obs, float(reward), bool(terminated), bool(truncated), info
 
 
-def load_model(model_path: str, device: torch.device, n_billboards: int) -> BillboardAllocatorGNN:
+def load_model(model_path: str, device: torch.device, n_billboards: int, max_ads: int) -> BillboardAllocatorGNN:
     """Load trained model with proper configuration"""
     checkpoint = torch.load(model_path, map_location=device)
 
@@ -105,7 +105,7 @@ def load_model(model_path: str, device: torch.device, n_billboards: int) -> Bill
             'n_graph_layers': 3,
             'mode': 'na',
             'n_billboards': n_billboards,
-            'max_ads': 8,
+            'max_ads': max_ads,
             'use_attention': True,
             'conv_type': 'gin',
             'dropout': 0.0
@@ -208,7 +208,7 @@ def test_model_comprehensive(
 
     # Load model
     print("\n2. Loading Model...")
-    model = load_model(model_path, device, env.n_nodes)
+    model = load_model(model_path, device, env.n_nodes, env.config.max_active_ads)
     param_count = sum(p.numel() for p in model.parameters())
     print(f"   Parameters: {param_count:,}")
     print(f"   Architecture: {model.graph_encoder.conv_type.upper()}, {model.graph_encoder.n_layers} layers")
