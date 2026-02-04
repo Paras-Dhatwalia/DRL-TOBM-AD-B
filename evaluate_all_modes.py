@@ -32,14 +32,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# Data paths (same as training)
-DATA_PATHS = {
-    "billboard_csv": r"C:\Coding Files\DRL-TOBM-AD-B\bb_nyc_updated2.csv",
-    "advertiser_csv": r"C:\Coding Files\DRL-TOBM-AD-B\Advertiser_100_N.csv",
-    "trajectory_csv": r"C:\Coding Files\DRL-TOBM-AD-B\trajectory_augmented_skewed.csv",
+# Default data paths (can be overridden via CLI)
+DEFAULT_DATA_PATHS = {
+    "billboard_csv": "bb_nyc_updated2.csv",
+    "advertiser_csv": "Advertiser_100_N.csv",
+    "trajectory_csv": "trajectory_augmented_skewed.csv",
 }
 
-MODEL_PATHS = {
+# Default model paths (can be overridden via CLI)
+DEFAULT_MODEL_PATHS = {
     "na": "models/ppo_billboard_na.pt",
     "ea": "models/ppo_billboard_ea.pt",
     "mh": "models/ppo_billboard_mh.pt",
@@ -371,6 +372,7 @@ def run_episode(env: OptimizedBillboardEnv, mode: str, model: Optional[Billboard
 
 
 def evaluate_mode(mode: str, n_episodes: int, device: torch.device,
+                  data_paths: Dict[str, str], model_paths: Dict[str, str],
                   deterministic: bool = True) -> ModeResults:
     """Evaluate a single mode across multiple episodes."""
     logger.info(f"\n{'='*60}")
@@ -379,9 +381,9 @@ def evaluate_mode(mode: str, n_episodes: int, device: torch.device,
 
     # Create environment
     env = OptimizedBillboardEnv(
-        billboard_csv=DATA_PATHS["billboard_csv"],
-        advertiser_csv=DATA_PATHS["advertiser_csv"],
-        trajectory_csv=DATA_PATHS["trajectory_csv"],
+        billboard_csv=data_paths["billboard_csv"],
+        advertiser_csv=data_paths["advertiser_csv"],
+        trajectory_csv=data_paths["trajectory_csv"],
         action_mode='na' if mode in ['greedy', 'greedy_dynamic', 'random'] else mode,
         config=EnvConfig()
     )
@@ -389,7 +391,7 @@ def evaluate_mode(mode: str, n_episodes: int, device: torch.device,
     # Load model if needed
     model = None
     if mode in ['na', 'ea', 'mh']:
-        model_path = MODEL_PATHS.get(mode)
+        model_path = model_paths.get(mode)
         if model_path:
             model = load_model(model_path, mode, device, env.n_nodes, env.config.max_active_ads)
             if model is None:
@@ -478,7 +480,32 @@ def save_results(all_results: Dict[str, ModeResults], output_path: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Evaluate all billboard allocation modes')
+    parser = argparse.ArgumentParser(
+        description='Evaluate all billboard allocation modes',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic evaluation with defaults
+  python evaluate_all_modes.py --episodes 10
+
+  # Point to custom model directory
+  python evaluate_all_modes.py --model-dir /path/to/models --episodes 10
+
+  # Point to specific model files
+  python evaluate_all_modes.py --model-na models/na_best.pt --model-ea models/ea_v2.pt
+
+  # Use custom data files
+  python evaluate_all_modes.py --billboard-csv data/bb.csv --trajectory-csv data/traj.csv
+
+  # Run on remote system with all custom paths
+  python evaluate_all_modes.py \\
+      --model-dir /home/user/trained_models \\
+      --data-dir /home/user/data \\
+      --episodes 20
+        """
+    )
+
+    # Episode and mode settings
     parser.add_argument('--episodes', type=int, default=10, help='Episodes per mode')
     parser.add_argument('--modes', nargs='+', default=['na', 'ea', 'mh', 'greedy_dynamic', 'random'],
                        help='Modes to evaluate')
@@ -488,7 +515,59 @@ def main():
     parser.add_argument('--output', type=str, default='evaluation_results.json',
                        help='Output JSON file')
 
+    # Model path arguments
+    parser.add_argument('--model-dir', type=str, default=None,
+                       help='Directory containing trained models (looks for ppo_billboard_*.pt)')
+    parser.add_argument('--model-na', type=str, default=None,
+                       help='Path to NA mode model (overrides --model-dir)')
+    parser.add_argument('--model-ea', type=str, default=None,
+                       help='Path to EA mode model (overrides --model-dir)')
+    parser.add_argument('--model-mh', type=str, default=None,
+                       help='Path to MH mode model (overrides --model-dir)')
+
+    # Data path arguments
+    parser.add_argument('--data-dir', type=str, default=None,
+                       help='Directory containing data files')
+    parser.add_argument('--billboard-csv', type=str, default=None,
+                       help='Path to billboard CSV (overrides --data-dir)')
+    parser.add_argument('--advertiser-csv', type=str, default=None,
+                       help='Path to advertiser CSV (overrides --data-dir)')
+    parser.add_argument('--trajectory-csv', type=str, default=None,
+                       help='Path to trajectory CSV (overrides --data-dir)')
+
     args = parser.parse_args()
+
+    # Build model paths
+    model_paths = DEFAULT_MODEL_PATHS.copy()
+    if args.model_dir:
+        model_paths = {
+            "na": str(Path(args.model_dir) / "ppo_billboard_na.pt"),
+            "ea": str(Path(args.model_dir) / "ppo_billboard_ea.pt"),
+            "mh": str(Path(args.model_dir) / "ppo_billboard_mh.pt"),
+        }
+    # Override with specific paths if provided
+    if args.model_na:
+        model_paths["na"] = args.model_na
+    if args.model_ea:
+        model_paths["ea"] = args.model_ea
+    if args.model_mh:
+        model_paths["mh"] = args.model_mh
+
+    # Build data paths
+    data_paths = DEFAULT_DATA_PATHS.copy()
+    if args.data_dir:
+        data_paths = {
+            "billboard_csv": str(Path(args.data_dir) / "bb_nyc_updated2.csv"),
+            "advertiser_csv": str(Path(args.data_dir) / "Advertiser_100_N.csv"),
+            "trajectory_csv": str(Path(args.data_dir) / "trajectory_augmented_skewed.csv"),
+        }
+    # Override with specific paths if provided
+    if args.billboard_csv:
+        data_paths["billboard_csv"] = args.billboard_csv
+    if args.advertiser_csv:
+        data_paths["advertiser_csv"] = args.advertiser_csv
+    if args.trajectory_csv:
+        data_paths["trajectory_csv"] = args.trajectory_csv
 
     if args.baselines_only:
         args.modes = ['greedy_dynamic', 'random']
@@ -502,12 +581,19 @@ def main():
     logger.info(f"Episodes per mode: {args.episodes}")
     logger.info(f"Modes to evaluate: {args.modes}")
     logger.info(f"Deterministic: {args.deterministic}")
+    logger.info(f"\nData paths:")
+    for k, v in data_paths.items():
+        logger.info(f"  {k}: {v}")
+    logger.info(f"\nModel paths:")
+    for k, v in model_paths.items():
+        exists = "✓" if Path(v).exists() else "✗"
+        logger.info(f"  {k}: {v} [{exists}]")
 
     all_results = {}
     total_start = time.time()
 
     for mode in args.modes:
-        results = evaluate_mode(mode, args.episodes, device, args.deterministic)
+        results = evaluate_mode(mode, args.episodes, device, data_paths, model_paths, args.deterministic)
         all_results[mode] = results
 
     total_time = time.time() - total_start
