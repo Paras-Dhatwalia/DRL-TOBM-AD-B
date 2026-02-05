@@ -26,7 +26,7 @@ class EnvConfig:
     max_events: int = 1440  # 1 minute per step, 1440 minutes = 24 hours
     max_active_ads: int = 20
     ad_ttl: int = 720  # Ad time-to-live in timesteps
-    graph_connection_distance: float = 5000.0
+    graph_connection_distance: float = 500.0
     cache_ttl: int = 1
     enable_profiling: bool = False
     debug: bool = False
@@ -835,7 +835,7 @@ class OptimizedBillboardEnv(gym.Env):
         """
         C_TARDY = 2.0
         C_COMPLETION = 10.0
-        C_PROGRESS = 0.001
+        C_PROGRESS = 0.01
 
         reward = 0.0
 
