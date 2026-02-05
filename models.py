@@ -480,8 +480,10 @@ class BillboardAllocatorGNN(nn.Module):
             )
 
         # Critic network (shared across all modes)
+        # Input: billboard embeddings (pooled) + ad embeddings (pooled)
+        critic_input_dim = self.billboard_embed_dim + hidden_dim
         self.critic = nn.Sequential(
-            Linear(self.billboard_embed_dim, 2 * hidden_dim),
+            Linear(critic_input_dim, 2 * hidden_dim),
             LayerNorm(2 * hidden_dim),
             ReLU(),
             Dropout(dropout),
@@ -825,10 +827,13 @@ class BillboardAllocatorGNN(nn.Module):
         """
         Forward pass for critic network.
 
-        Processes samples individually to avoid OOM from super-graph construction
-        on dense graphs (e.g. 444 NYC billboards with ~100K edges). The critic
-        runs under torch.no_grad() during _compute_returns so per-sample looping
-        has negligible overhead compared to the memory cost of batched super-graphs.
+        Encodes both billboard state (via GNN) and ad state (via ad_encoder)
+        to produce value estimates. Both signals are critical:
+        - Billboard state: occupancy, cost, influence, location
+        - Ad state: TTL urgency, budget remaining, demand progress
+
+        Processes GNN samples individually to avoid OOM from super-graph
+        construction on dense graphs (444 NYC billboards, ~100K edges).
         """
         device = next(self.parameters()).device
         observations = preprocess_observations(observations)
@@ -839,16 +844,28 @@ class BillboardAllocatorGNN(nn.Module):
         batch_size = observations['graph_nodes'].shape[0]
         edge_index = observations['graph_edge_links'][0].to(device).long()
 
-        all_pooled = []
+        # Billboard encoding (per-sample GNN to avoid OOM)
+        all_billboard_pooled = []
         for b in range(batch_size):
             sample_embeds = self.graph_encoder(
                 observations['graph_nodes'][b].float(), edge_index
             )
             sample_embeds = self.billboard_norm(sample_embeds)
-            all_pooled.append(sample_embeds.mean(dim=0, keepdim=True))
+            all_billboard_pooled.append(sample_embeds.mean(dim=0, keepdim=True))
 
-        pooled = torch.cat(all_pooled, dim=0)
-        values = self.critic(pooled).squeeze(-1)
+        billboard_pooled = torch.cat(all_billboard_pooled, dim=0)  # (batch, billboard_embed_dim)
+
+        # Ad encoding (shared ad_encoder)
+        ad_features = observations['ad_features'].float()  # (batch, max_ads, ad_feat_dim)
+        ad_flat = ad_features.view(-1, ad_features.shape[-1])  # (batch*max_ads, ad_feat_dim)
+        ad_embeds = self.ad_encoder(ad_flat)  # (batch*max_ads, hidden_dim)
+        ad_embeds = ad_embeds.view(batch_size, self.max_ads, -1)  # (batch, max_ads, hidden_dim)
+        ad_pooled = ad_embeds.mean(dim=1)  # (batch, hidden_dim)
+
+        # Concatenate billboard + ad state for value prediction
+        state_repr = torch.cat([billboard_pooled, ad_pooled], dim=-1)
+
+        values = self.critic(state_repr).squeeze(-1)
 
         return values
         

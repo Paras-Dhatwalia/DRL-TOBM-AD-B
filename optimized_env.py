@@ -613,6 +613,7 @@ class OptimizedBillboardEnv(gym.Env):
 
         self.ads_completed_this_step: List[int] = []
         self.ads_failed_this_step: List[int] = []  # Track new failures
+        self._obs_active_ad_ids: List[int] = []  # Frozen ad ordering from last _get_obs()
 
         # Track used advertiser IDs within current episode.
         # This set acts as a "discard pile" - once an advertiser is used, they
@@ -807,6 +808,12 @@ class OptimizedBillboardEnv(gym.Env):
 
         for i, ad in enumerate(active_ads[:self.config.max_active_ads]):
             ad_features[i] = ad.get_feature_vector()
+
+        # Freeze ad ordering for action execution consistency.
+        # _execute_action() uses this to map action indices to the same ads
+        # that the model saw when it chose the action, preventing misalignment
+        # when ads complete between observation and execution.
+        self._obs_active_ad_ids = [ad.aid for ad in active_ads[:self.config.max_active_ads]]
 
         obs['ad_features'] = ad_features
 
@@ -1046,14 +1053,19 @@ class OptimizedBillboardEnv(gym.Env):
                            f"{len(self.used_advertiser_ids)} used")
     
     def _execute_action(self, action):
-        """Execute the selected action with validation."""
+        """Execute the selected action with validation.
+
+        Iterates over the frozen snapshot indices from _get_obs() so that
+        action[i] always pairs with the ad that was at slot i during
+        observation. If that ad completed since observation, the slot is
+        skipped — no index shifting occurs.
+        """
         try:
-            # Recompute mask for current state (may differ from observation mask
-            # due to influence/board changes since _get_obs was called)
-            mask = self.get_mask()  # Shape: (max_active_ads, n_nodes)
+            # O(1) lookup map for currently-alive ads
+            current_ad_map = {ad.aid: ad for ad in self.ads if ad.state == 0}
 
             if self.action_mode == 'na':
-                # Node Action: (max_ads,) — one billboard per ad, ads sorted by urgency
+                # Node Action: (max_ads,) — one billboard per ad, ads in obs ordering
                 if isinstance(action, (list, np.ndarray, torch.Tensor)):
                     action = np.asarray(action).flatten()
 
@@ -1062,25 +1074,22 @@ class OptimizedBillboardEnv(gym.Env):
                                        f"expected ({self.config.max_active_ads},)")
                         return
 
-                    active_ads = [ad for ad in self.ads if ad.state == 0]
-                    # Same urgency sort as _get_obs and get_mask
-                    active_ads = sorted(active_ads,
-                                        key=lambda ad: (ad.ttl / max(ad.original_ttl, 1), ad.aid))
                     used_billboards = set()
 
-                    for ad_idx in range(min(len(active_ads), self.config.max_active_ads)):
-                        bb_idx = int(action[ad_idx])
+                    for obs_idx, aid in enumerate(self._obs_active_ad_ids):
+                        bb_idx = int(action[obs_idx])
 
-                        if not (0 <= bb_idx < self.n_nodes):
+                        # Ad died since observation — skip this slot
+                        if aid not in current_ad_map:
                             continue
-                        if mask[ad_idx, bb_idx] == 0:
+                        if not (0 <= bb_idx < self.n_nodes):
                             continue
                         if bb_idx in used_billboards:
                             continue
                         if not self.billboards[bb_idx].is_free():
                             continue
 
-                        ad_to_assign = active_ads[ad_idx]
+                        ad_to_assign = current_ad_map[aid]
                         billboard = self.billboards[bb_idx]
 
                         duration = random.randint(*self.config.slot_duration_range)
@@ -1109,22 +1118,21 @@ class OptimizedBillboardEnv(gym.Env):
                                        f"expected ({self.config.max_active_ads},)")
                         return
 
-                    active_ads = [ad for ad in self.ads if ad.state == 0]
                     used_billboards = set()
 
-                    for ad_idx in range(min(len(active_ads), self.config.max_active_ads)):
-                        bb_idx = int(action[ad_idx])
+                    for obs_idx, aid in enumerate(self._obs_active_ad_ids):
+                        bb_idx = int(action[obs_idx])
 
-                        if not (0 <= bb_idx < self.n_nodes):
+                        if aid not in current_ad_map:
                             continue
-                        if mask[ad_idx, bb_idx] == 0:
+                        if not (0 <= bb_idx < self.n_nodes):
                             continue
                         if bb_idx in used_billboards:
                             continue
                         if not self.billboards[bb_idx].is_free():
                             continue
 
-                        ad_to_assign = active_ads[ad_idx]
+                        ad_to_assign = current_ad_map[aid]
                         billboard = self.billboards[bb_idx]
 
                         duration = random.randint(*self.config.slot_duration_range)
@@ -1153,7 +1161,6 @@ class OptimizedBillboardEnv(gym.Env):
                         logger.warning(f"Invalid MH action length: {len(action)}, expected {expected_len}")
                         return
 
-                    active_ads = [ad for ad in self.ads if ad.state == 0]
                     used_ads = set()
                     used_billboards = set()
 
@@ -1161,22 +1168,22 @@ class OptimizedBillboardEnv(gym.Env):
                         ad_idx = int(action[round_idx * 2])
                         bb_idx = int(action[round_idx * 2 + 1])
 
-                        if not (0 <= ad_idx < len(active_ads)):
+                        # ad_idx indexes into the snapshot list
+                        if not (0 <= ad_idx < len(self._obs_active_ad_ids)):
+                            continue
+                        aid = self._obs_active_ad_ids[ad_idx]
+                        if aid not in current_ad_map:
                             continue
                         if ad_idx in used_ads:
                             continue
                         if not (0 <= bb_idx < self.n_nodes):
-                            continue
-                        if ad_idx >= mask.shape[0] or bb_idx >= mask.shape[1]:
-                            continue
-                        if mask[ad_idx, bb_idx] == 0:
                             continue
                         if bb_idx in used_billboards:
                             continue
                         if not self.billboards[bb_idx].is_free():
                             continue
 
-                        ad_to_assign = active_ads[ad_idx]
+                        ad_to_assign = current_ad_map[aid]
                         billboard = self.billboards[bb_idx]
 
                         duration = random.randint(*self.config.slot_duration_range)
