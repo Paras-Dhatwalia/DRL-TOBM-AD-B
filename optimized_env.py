@@ -817,38 +817,33 @@ class OptimizedBillboardEnv(gym.Env):
 
     def _compute_reward(self) -> float:
         """
-        Cost-based reward function (Begnardi-style) with mild progress shaping.
+        Cost-based reward function with direct influence progress shaping.
 
-        4 components:
-        1. Ongoing penalty: -C_ONGOING per active ad per step (very small)
-        2. Tardy penalty: -C_TARDY per newly-failed ad
-        3. Completion bonus: +C_COMPLETION per completed ad
-        4. Progress shaping: +C_PROGRESS * (influence_delta / demand) per active ad
-           Guides exploration by rewarding actual influence accumulation,
-           ~100x weaker than completion bonus.
+        3 components:
+        1. Tardy penalty: -C_TARDY per newly-failed ad
+        2. Completion bonus: +C_COMPLETION per completed ad
+        3. Progress shaping: +C_PROGRESS * influence_delta per active ad
+           Direct (unnormalized) influence reward gives dense per-step signal.
+           With typical delta 0.5-5.0 users/step, this yields +0.05 to +0.5
+           per ad per step — meaningful but not dominant over completion bonus.
         """
-        C_ONGOING = 0.001
         C_TARDY = 2.0
         C_COMPLETION = 10.0
-        C_PROGRESS = 5.0
+        C_PROGRESS = 0.1
 
         reward = 0.0
 
-        # 1. Small ongoing penalty per active ad
-        n_active = sum(1 for ad in self.ads if ad.state == 0)
-        reward -= n_active * C_ONGOING
-
-        # 2. Tardy penalty per newly-failed ad
+        # 1. Tardy penalty per newly-failed ad
         reward -= len(self.ads_failed_this_step) * C_TARDY
 
-        # 3. Completion bonus per completed ad
+        # 2. Completion bonus per completed ad
         reward += len(self.ads_completed_this_step) * C_COMPLETION
 
-        # 4. Mild progress shaping: reward actual influence toward demand
+        # 3. Direct progress shaping: reward actual influence accumulation
         for ad in self.ads:
             if ad.state == 0:
                 delta = getattr(ad, '_step_delta', 0.0)
-                reward += (delta / max(ad.demand, 1e-6)) * C_PROGRESS
+                reward += delta * C_PROGRESS
 
         return reward   
     
@@ -1054,6 +1049,10 @@ class OptimizedBillboardEnv(gym.Env):
     def _execute_action(self, action):
         """Execute the selected action with validation."""
         try:
+            # Recompute mask for current state (may differ from observation mask
+            # due to influence/board changes since _get_obs was called)
+            mask = self.get_mask()  # Shape: (max_active_ads, n_nodes)
+
             if self.action_mode == 'na':
                 # Node Action: (max_ads,) — one billboard per ad, ads sorted by urgency
                 if isinstance(action, (list, np.ndarray, torch.Tensor)):
@@ -1074,6 +1073,8 @@ class OptimizedBillboardEnv(gym.Env):
                         bb_idx = int(action[ad_idx])
 
                         if not (0 <= bb_idx < self.n_nodes):
+                            continue
+                        if mask[ad_idx, bb_idx] == 0:
                             continue
                         if bb_idx in used_billboards:
                             continue
@@ -1098,7 +1099,7 @@ class OptimizedBillboardEnv(gym.Env):
                                 'demand': ad_to_assign.demand,
                                 'cost': total_cost
                             })
-            
+
             elif self.action_mode == 'ea':
                 # Edge Action mode: action is (max_ads,) — one billboard index per ad
                 if isinstance(action, (list, np.ndarray, torch.Tensor)):
@@ -1116,6 +1117,8 @@ class OptimizedBillboardEnv(gym.Env):
                         bb_idx = int(action[ad_idx])
 
                         if not (0 <= bb_idx < self.n_nodes):
+                            continue
+                        if mask[ad_idx, bb_idx] == 0:
                             continue
                         if bb_idx in used_billboards:
                             continue
@@ -1164,6 +1167,10 @@ class OptimizedBillboardEnv(gym.Env):
                         if ad_idx in used_ads:
                             continue
                         if not (0 <= bb_idx < self.n_nodes):
+                            continue
+                        if ad_idx >= mask.shape[0] or bb_idx >= mask.shape[1]:
+                            continue
+                        if mask[ad_idx, bb_idx] == 0:
                             continue
                         if bb_idx in used_billboards:
                             continue

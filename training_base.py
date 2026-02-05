@@ -48,7 +48,7 @@ def setup_logging():
 DATA_PATHS = {
     "billboard_csv": r"C:\Coding Files\DRL-TOBM-AD-B\bb_nyc_updated2.csv",
     "advertiser_csv": r"C:\Coding Files\DRL-TOBM-AD-B\Advertiser_100_N.csv",
-    "trajectory_csv": r"C:\Coding Files\DRL-TOBM-AD-B\trajectory_augmented.csv",
+    "trajectory_csv": r"C:\Coding Files\DRL-TOBM-AD-B\trajectory_augmented_skewed.csv",
 }
 
 # Shared hyperparameters (mode-specific overrides in each script)
@@ -56,12 +56,12 @@ BASE_TRAIN_CONFIG = {
     "nr_envs": 4,
     "hidden_dim": 128,
     "n_graph_layers": 3,
-    "lr": 3e-4,
+    "lr": 1e-4,
     "gae_lambda": 0.95,
     "vf_coef": 0.5,
-    "ent_coef": 0.02,
-    "max_grad_norm": 0.1,
-    "eps_clip": 0.05,
+    "ent_coef": 0.05,
+    "max_grad_norm": 0.5,
+    "eps_clip": 0.2,
     "batch_size": 128,
     "max_epoch": 50,
     "repeat_per_collect": 4,
@@ -69,7 +69,7 @@ BASE_TRAIN_CONFIG = {
 
 MODE_DEFAULTS = {
     "na": {
-        "discount_factor": 0.995,
+        "discount_factor": 0.99,
         "step_per_collect": 11520,   # 8 full-step episodes x 1440 steps
         "step_per_epoch": 14400,    # 10 full-step episodes per epoch
         "buffer_size": 23040,
@@ -80,7 +80,7 @@ MODE_DEFAULTS = {
         "deterministic_eval": False,  # Stochastic to avoid billboard collisions
     },
     "mh": {
-        "discount_factor": 0.995,
+        "discount_factor": 0.99,
         "step_per_collect": 11520,   # 8 full-step episodes x 1440 steps
         "step_per_epoch": 14400,    # 10 full-step episodes per epoch
         "buffer_size": 23040,
@@ -91,7 +91,7 @@ MODE_DEFAULTS = {
         "deterministic_eval": False,  # Stochastic to avoid billboard collisions
     },
     "ea": {
-        "discount_factor": 0.995,
+        "discount_factor": 0.99,
         "step_per_collect": 11520,
         "step_per_epoch": 14400,
         "buffer_size": 11520,  # = step_per_collect (on-policy PPO needs 1 cycle)
@@ -104,9 +104,25 @@ MODE_DEFAULTS = {
 }
 
 
-def get_config(mode: str) -> dict:
-    """Get merged config for a given mode."""
+def get_config(mode: str, run_name: str = None) -> dict:
+    """Get merged config for a given mode.
+
+    Args:
+        mode: One of 'na', 'ea', 'mh'
+        run_name: Optional run name for unique model saves. If None, uses timestamp.
+                  Examples: 'v1', 'skewed_traj', '2024_01_30'
+    """
+    from datetime import datetime
+
     train_config = {**BASE_TRAIN_CONFIG, **MODE_DEFAULTS[mode]}
+
+    # Generate unique run identifier
+    if run_name is None:
+        run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Update save paths with run name
+    train_config["save_path"] = f"models/ppo_billboard_{mode}_{run_name}.pt"
+    train_config["log_path"] = f"logs/ppo_billboard_{mode}_{run_name}"
     env_config = {**DATA_PATHS, "action_mode": mode}
     return {"env": env_config, "train": train_config}
 
@@ -262,8 +278,7 @@ def run_post_training_eval(policy, env_factory, mode_name, best_model_path=None,
                                     map_location=next(shared_model.parameters()).device,
                                     weights_only=False)
             shared_model.load_state_dict(checkpoint['model_state_dict'])
-            saved_reward = checkpoint.get('best_reward', 'N/A')
-            logger.info(f"Loaded best checkpoint (reward={saved_reward}) from {best_model_path}")
+            logger.info(f"Loaded best checkpoint from {best_model_path}")
         except Exception as e:
             logger.warning(f"Could not load best checkpoint: {e}. Using final weights.")
     else:
@@ -397,19 +412,9 @@ def train(mode: str, env_config: dict = None, train_config: dict = None):
     writer = SummaryWriter(train_config["log_path"])
     tb_logger = TensorboardLogger(writer)
 
-    best_reward_so_far = [None]  # mutable container for closure
-
     def save_best_fn(policy):
         # Tianshou calls this ONLY when test reward improves — always save.
-        # Compute current test reward from collector buffer stats.
-        try:
-            buf = test_collector.buffer
-            rews = buf.rew[:len(buf)]
-            current_reward = float(rews.mean()) if len(rews) > 0 else 0.0
-        except Exception:
-            current_reward = 0.0
-        best_reward_so_far[0] = current_reward
-        logger.info(f"New best reward: {current_reward:.2f}, saving...")
+        logger.info(f"New best model, saving to {train_config['save_path']}")
         torch.save({
             'model_state_dict': shared_model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
@@ -417,7 +422,6 @@ def train(mode: str, env_config: dict = None, train_config: dict = None):
             'training_config': train_config,
             'graph': graph_numpy,
             'mode': mode,
-            'best_reward': current_reward,
         }, train_config["save_path"])
 
     env_factory = lambda: create_env(env_config)
