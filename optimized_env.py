@@ -823,13 +823,12 @@ class OptimizedBillboardEnv(gym.Env):
         1. Tardy penalty: -C_TARDY per newly-failed ad
         2. Completion bonus: +C_COMPLETION per completed ad
         3. Progress shaping: +C_PROGRESS * influence_delta per active ad
-           Direct (unnormalized) influence reward gives dense per-step signal.
-           With typical delta 0.5-5.0 users/step, this yields +0.05 to +0.5
-           per ad per step — meaningful but not dominant over completion bonus.
+           Dense per-step signal. Kept small relative to completion/tardy
+           so that policy optimization targets ad completions, not raw influence.
         """
         C_TARDY = 2.0
         C_COMPLETION = 10.0
-        C_PROGRESS = 0.1
+        C_PROGRESS = 0.001
 
         reward = 0.0
 
