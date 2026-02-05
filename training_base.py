@@ -10,6 +10,7 @@ import os
 import platform
 import logging
 import warnings
+import random
 
 import torch
 import numpy as np
@@ -52,6 +53,8 @@ DATA_PATHS = {
 }
 
 # Shared hyperparameters (mode-specific overrides in each script)
+SEED = 42
+
 BASE_TRAIN_CONFIG = {
     "nr_envs": 4,
     "hidden_dim": 128,
@@ -66,6 +69,14 @@ BASE_TRAIN_CONFIG = {
     "max_epoch": 50,
     "repeat_per_collect": 4,
 }
+
+
+def set_global_seed(seed: int):
+    """Seed all RNGs for reproducible training."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 MODE_DEFAULTS = {
     "na": {
@@ -353,6 +364,7 @@ def train(mode: str, env_config: dict = None, train_config: dict = None):
     if train_config is None:
         train_config = defaults["train"]
 
+    set_global_seed(SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     os.makedirs(os.path.dirname(train_config["save_path"]), exist_ok=True)
