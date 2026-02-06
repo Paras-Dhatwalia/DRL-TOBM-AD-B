@@ -112,6 +112,19 @@ MODE_DEFAULTS = {
         "dropout": 0.15,
         "deterministic_eval": False,  # Stochastic for TopK exploration
     },
+    "sequential": {
+        "discount_factor": 0.99,
+        "step_per_collect": 57600,   # ~2 episodes × 1440 × 20 sub-steps
+        "step_per_epoch": 72000,     # ~2.5 episodes per epoch
+        "buffer_size": 115200,       # 2x collect
+        "batch_size": 256,           # Larger batches for stability
+        "ent_coef": 0.01,            # Single Categorical(444) — much lower than summed
+        "save_path": "models/ppo_billboard_sequential.pt",
+        "log_path": "logs/ppo_billboard_sequential",
+        "use_attention": False,      # Simpler is better for single-ad scoring
+        "dropout": 0.1,
+        "deterministic_eval": False,
+    },
 }
 
 
@@ -141,14 +154,25 @@ def get_config(mode: str, run_name: str = None) -> dict:
 
 def create_env(env_config: dict):
     """Create a single wrapped environment."""
+    action_mode = env_config["action_mode"]
+
+    # Sequential mode uses 'na' internally (same env action format)
+    internal_mode = 'na' if action_mode == 'sequential' else action_mode
+
     base_env = OptimizedBillboardEnv(
         billboard_csv=env_config["billboard_csv"],
         advertiser_csv=env_config["advertiser_csv"],
         trajectory_csv=env_config["trajectory_csv"],
-        action_mode=env_config["action_mode"],
+        action_mode=internal_mode,
         config=EnvConfig()
     )
-    return NoGraphObsWrapper(base_env)
+    wrapped = NoGraphObsWrapper(base_env)
+
+    if action_mode == 'sequential':
+        from sequential_wrapper import SequentialAdWrapper
+        wrapped = SequentialAdWrapper(wrapped)
+
+    return wrapped
 
 
 def create_vectorized_envs(env_config: dict, n_envs: int, force_dummy: bool = False):
@@ -179,6 +203,11 @@ def get_dist_fn(mode: str, max_ads: int, n_billboards: int = 0):
     elif mode == 'ea':
         from distributions import create_per_ad_dist_fn
         return create_per_ad_dist_fn(max_ads, n_billboards)
+
+    elif mode == 'sequential':
+        # Standard Categorical — single billboard choice per sub-step
+        import torch
+        return lambda logits: torch.distributions.Categorical(logits=logits)
 
     raise ValueError(f"Unknown mode: {mode}")
 
@@ -252,7 +281,10 @@ def eval_business_metrics(policy, env_factory, epoch, step_idx,
         total_reward += reward
         done = terminated or truncated
 
-    base_env = eval_env.env if hasattr(eval_env, 'env') else eval_env
+    # Traverse wrapper chain to get the base OptimizedBillboardEnv
+    base_env = eval_env
+    while hasattr(base_env, 'env'):
+        base_env = base_env.env
     m = base_env.performance_metrics
     completed = m['total_ads_completed']
     processed = m['total_ads_processed']
@@ -324,7 +356,10 @@ def run_post_training_eval(policy, env_factory, mode_name, best_model_path=None,
         logger.info("Environment Performance Metrics:")
         logger.info("-" * 40)
 
-        base_env = eval_env.env if hasattr(eval_env, 'env') else eval_env
+        # Traverse wrapper chain to get the base OptimizedBillboardEnv
+        base_env = eval_env
+        while hasattr(base_env, 'env'):
+            base_env = base_env.env
         base_env.render_summary()
 
         logger.info("")

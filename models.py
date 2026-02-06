@@ -342,8 +342,8 @@ class BillboardAllocatorGNN(nn.Module):
         super().__init__()
         
         self.mode = mode.lower()
-        if self.mode not in ['na', 'ea', 'mh']:
-            raise ValueError(f"Unsupported mode: {self.mode}. Must be 'na', 'ea', or 'mh'")
+        if self.mode not in ['na', 'ea', 'mh', 'sequential']:
+            raise ValueError(f"Unsupported mode: {self.mode}. Must be 'na', 'ea', 'mh', or 'sequential'")
             
         self.n_billboards = n_billboards
         self.max_ads = max_ads
@@ -479,6 +479,20 @@ class BillboardAllocatorGNN(nn.Module):
                 Linear(hidden_dim, 1)
             )
 
+        elif self.mode == 'sequential':
+            # Sequential: Score individual billboards for a SINGLE ad
+            # Input: billboard_embed + ad_embed per billboard
+            input_dim = self.billboard_embed_dim + hidden_dim
+            self.sequential_scorer = nn.Sequential(
+                Linear(input_dim, 2 * hidden_dim),
+                LayerNorm(2 * hidden_dim),
+                ReLU(),
+                Dropout(dropout),
+                Linear(2 * hidden_dim, hidden_dim),
+                ReLU(),
+                Linear(hidden_dim, 1)
+            )
+
         # Critic network (shared across all modes)
         # Input: billboard embeddings (pooled) + ad embeddings (pooled)
         critic_input_dim = self.billboard_embed_dim + hidden_dim
@@ -563,10 +577,11 @@ class BillboardAllocatorGNN(nn.Module):
         # PERFORMANCE: Only validate on first forward pass to catch dimension bugs early
         # After first successful validation, skip to avoid CPU overhead on every call
         if not self._validation_done:
-            node_feat_dim = observations['graph_nodes'].shape[-1]
-            ad_feat_dim = self.ad_encoder[0].in_features
-            validate_observations(observations, self.mode, self.n_billboards,
-                                self.max_ads, node_feat_dim, ad_feat_dim)
+            if self.mode != 'sequential':
+                node_feat_dim = observations['graph_nodes'].shape[-1]
+                ad_feat_dim = self.ad_encoder[0].in_features
+                validate_observations(observations, self.mode, self.n_billboards,
+                                    self.max_ads, node_feat_dim, ad_feat_dim)
             self._validation_done = True
             logger.info("Input validation passed - skipping future validations for performance")
 
@@ -603,6 +618,8 @@ class BillboardAllocatorGNN(nn.Module):
             probs, new_state = self._forward_ea_fixed(billboard_embeds, observations, mask, batch_size, state, info)
         elif self.mode == 'mh':
             probs, new_state = self._forward_mh_fixed(billboard_embeds, observations, mask, batch_size, state, info)
+        elif self.mode == 'sequential':
+            probs, new_state = self._forward_sequential(billboard_embeds, observations, mask, batch_size, state, info)
         else:
             raise ValueError(f"Unsupported mode: {self.mode}")
         
@@ -822,7 +839,57 @@ class BillboardAllocatorGNN(nn.Module):
         concatenated = torch.cat([ad_logits, all_bb_logits.view(batch_size, -1)], dim=-1)
 
         return concatenated, None
-        
+
+    def _forward_sequential(self, billboard_embeds: torch.Tensor, observations: Dict[str, torch.Tensor],
+                            mask: torch.Tensor, batch_size: int, state: Optional[torch.Tensor],
+                            info: Dict[str, Any]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Sequential mode: Score all billboards for a SINGLE ad.
+
+        Input observations have:
+          - ad_features: (batch, ad_feat_dim) — single ad, NOT (batch, max_ads, ad_feat_dim)
+          - mask: (batch, n_billboards) — 1D mask, NOT (batch, max_ads, n_billboards)
+
+        Returns: (batch, n_billboards) logits for standard Categorical distribution.
+        """
+        ad_features = observations['ad_features']  # (batch, ad_feat_dim)
+
+        # Handle case where ad_features might have an extra dim
+        if ad_features.dim() == 3:
+            ad_features = ad_features.squeeze(1)  # (batch, 1, feat) -> (batch, feat)
+
+        ad_embed = self.ad_encoder(ad_features)  # (batch, hidden_dim)
+
+        # Expand ad embedding to match billboard count
+        ad_expanded = ad_embed.unsqueeze(1).expand(-1, self.n_billboards, -1)  # (batch, N, hidden)
+
+        # Concatenate billboard embeddings with ad embedding
+        combined = torch.cat([billboard_embeds, ad_expanded], dim=-1)  # (batch, N, embed+hidden)
+
+        # Score each billboard
+        scores = self.sequential_scorer(
+            combined.view(-1, combined.shape[-1])
+        ).view(batch_size, self.n_billboards)  # (batch, N)
+
+        # Apply mask — mask is (batch, n_billboards) for sequential mode
+        if mask.dim() == 2:
+            scores[~mask] = self.min_val
+        elif mask.dim() == 3:
+            # Fallback: if mask is still 3D, use first ad's mask
+            scores[~mask[:, 0]] = self.min_val
+
+        # Handle all-masked rows
+        no_valid = ~mask.any(dim=-1) if mask.dim() == 2 else ~mask[:, 0].any(dim=-1)
+        if no_valid.any():
+            scores = torch.where(
+                no_valid.unsqueeze(-1).expand_as(scores),
+                torch.zeros_like(scores),
+                scores
+            )
+
+        scores = torch.nan_to_num(scores, nan=0.0)
+        return scores, state
+
     def critic_forward(self, observations: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
         Forward pass for critic network.
@@ -856,11 +923,19 @@ class BillboardAllocatorGNN(nn.Module):
         billboard_pooled = torch.cat(all_billboard_pooled, dim=0)  # (batch, billboard_embed_dim)
 
         # Ad encoding (shared ad_encoder)
-        ad_features = observations['ad_features'].float()  # (batch, max_ads, ad_feat_dim)
-        ad_flat = ad_features.view(-1, ad_features.shape[-1])  # (batch*max_ads, ad_feat_dim)
-        ad_embeds = self.ad_encoder(ad_flat)  # (batch*max_ads, hidden_dim)
-        ad_embeds = ad_embeds.view(batch_size, self.max_ads, -1)  # (batch, max_ads, hidden_dim)
-        ad_pooled = ad_embeds.mean(dim=1)  # (batch, hidden_dim)
+        ad_features = observations['ad_features'].float()
+
+        if self.mode == 'sequential':
+            # Sequential mode: ad_features is (batch, ad_feat_dim) — single ad
+            if ad_features.dim() == 3:
+                ad_features = ad_features.squeeze(1)
+            ad_pooled = self.ad_encoder(ad_features)  # (batch, hidden_dim)
+        else:
+            # Other modes: ad_features is (batch, max_ads, ad_feat_dim)
+            ad_flat = ad_features.view(-1, ad_features.shape[-1])  # (batch*max_ads, ad_feat_dim)
+            ad_embeds = self.ad_encoder(ad_flat)  # (batch*max_ads, hidden_dim)
+            ad_embeds = ad_embeds.view(batch_size, self.max_ads, -1)  # (batch, max_ads, hidden_dim)
+            ad_pooled = ad_embeds.mean(dim=1)  # (batch, hidden_dim)
 
         # Concatenate billboard + ad state for value prediction
         state_repr = torch.cat([billboard_pooled, ad_pooled], dim=-1)
