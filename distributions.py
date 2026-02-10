@@ -83,15 +83,18 @@ class PerAdCategorical:
         if actions.dim() == 1:
             actions = actions.unsqueeze(0)
         per_ad_lp = self._dists.log_prob(actions.long())  # (batch, max_ads)
-        result = per_ad_lp.sum(dim=-1)  # (batch,)
+        # Normalize by MAX_ADS to keep PPO ratio exp(new-old) in clippable range.
+        # Without this, 20 summed terms cause ratio explosion: exp(20*0.3)=403 >> clip [0.8, 1.2]
+        # After RC6 ghost slot fix, inactive slots contribute 0, so /MAX_ADS correctly scales active portion.
+        result = per_ad_lp.sum(dim=-1) / self.MAX_ADS  # (batch,)
         if self._was_1d:
             result = result.squeeze(0)
         return result
 
     def entropy(self):
-        """Sum of per-ad entropies."""
+        """Mean of per-ad entropies (normalized by MAX_ADS to match log_prob scale)."""
         per_ad_ent = self._dists.entropy()  # (batch, max_ads)
-        result = per_ad_ent.sum(dim=-1)  # (batch,)
+        result = per_ad_ent.sum(dim=-1) / self.MAX_ADS  # (batch,)
         if self._was_1d:
             result = result.squeeze(0)
         return result
@@ -261,6 +264,10 @@ class MultiHeadCategorical:
             bb_dist = torch.distributions.Categorical(logits=bb_logits)
             total_lp = total_lp + bb_dist.log_prob(bb_action)
 
+        # Normalize by 2*MAX_ADS (20 ad decisions + 20 billboard decisions = 40 terms)
+        # to keep PPO ratio in clippable range (RC2 fix)
+        total_lp = total_lp / (2 * self.MAX_ADS)
+
         if self._was_1d:
             total_lp = total_lp.squeeze(0)
         return total_lp
@@ -296,6 +303,9 @@ class MultiHeadCategorical:
             # Advance masking using greedy selection (non-inplace)
             greedy_ad = ad_dist.probs.argmax(dim=-1)
             used_ads = used_ads | F.one_hot(greedy_ad, self.MAX_ADS).bool()
+
+        # Normalize by 2*MAX_ADS to match log_prob scale (RC2 fix)
+        total_ent = total_ent / (2 * self.MAX_ADS)
 
         if self._was_1d:
             total_ent = total_ent.squeeze(0)
