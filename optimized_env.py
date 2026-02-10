@@ -851,7 +851,19 @@ class OptimizedBillboardEnv(gym.Env):
                 delta = getattr(ad, '_step_delta', 0.0)
                 reward += delta * C_PROGRESS
 
-        return reward   
+        # 4. Immediate allocation shaping: credit for expected future influence
+        #    of billboards assigned THIS step (uses precomputed slot influence)
+        C_ALLOCATION = 0.005
+        for rec in self.placement_history:
+            if rec.get('allocated_step') == self.current_step:
+                bb_idx = self.billboard_id_to_node_idx.get(rec['billboard_id'])
+                if bb_idx is not None:
+                    expected = self._get_allocation_expected_influence(
+                        bb_idx, rec['duration']
+                    )
+                    reward += expected * C_ALLOCATION
+
+        return reward
     
     def _apply_influence_for_current_minute(self):
         """
@@ -1275,14 +1287,14 @@ class OptimizedBillboardEnv(gym.Env):
         self.ads_completed_this_step.clear()
         self.ads_failed_this_step.clear()
 
-        # 1. Apply influence (from previous assignments)
-        self._apply_influence_for_current_minute()
-
-        # 2. Tick and release expired billboards
+        # 1. Tick and release expired billboards (frees slots for new assignments)
         self._tick_and_release_boards()
 
-        # 3. Execute agent action (BEFORE TTL tick so agent can act on TTL=1 ads)
+        # 2. Execute agent action FIRST (so new assignments are included in influence)
         self._execute_action(action)
+
+        # 3. Apply influence (NOW includes this step's new assignments)
+        self._apply_influence_for_current_minute()
 
         # 4. Tick ad TTLs
         for ad in self.ads:

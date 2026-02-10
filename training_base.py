@@ -59,10 +59,10 @@ BASE_TRAIN_CONFIG = {
     "nr_envs": 4,
     "hidden_dim": 128,
     "n_graph_layers": 3,
-    "lr": 3e-4,
+    "lr": 1e-3,
     "gae_lambda": 0.95,
     "vf_coef": 0.5,
-    "ent_coef": 0.1,
+    "ent_coef": 0.001,
     "max_grad_norm": 1.0,
     "eps_clip": 0.2,
     "batch_size": 128,
@@ -118,7 +118,7 @@ MODE_DEFAULTS = {
         "step_per_epoch": 72000,     # ~2.5 episodes per epoch
         "buffer_size": 115200,       # 2x collect
         "batch_size": 256,           # Larger batches for stability
-        "ent_coef": 0.01,            # Single Categorical(444) — much lower than summed
+        "ent_coef": 0.0001,          # Single Categorical(444): log(444)*0.0001=0.0006 vs reward ~0.025
         "save_path": "models/ppo_billboard_sequential.pt",
         "log_path": "logs/ppo_billboard_sequential",
         "use_attention": False,      # Simpler is better for single-ad scoring

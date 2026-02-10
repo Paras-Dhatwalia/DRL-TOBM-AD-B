@@ -363,12 +363,12 @@ class BillboardAllocatorGNN(nn.Module):
             conv_type=conv_type,
             dropout=dropout
         )
-        self.billboard_embed_dim = self.graph_encoder.output_dim
+        self.raw_feat_dim = node_feat_dim  # Store for raw-feature bypass
+        self.billboard_embed_dim = self.graph_encoder.output_dim + node_feat_dim  # 394 + 10 = 404
 
-        # INFERENCE-STABLE NORMALIZATION: LayerNorm on latent embeddings (not raw features)
-        # This is applied AFTER graph encoding, ensuring sample-independent normalization
-        # that works identically for batch_size=1 (inference) and batch_size=64 (training)
-        self.billboard_norm = LayerNorm(self.billboard_embed_dim)
+        # INFERENCE-STABLE NORMALIZATION: LayerNorm on GNN output only (before raw bypass concat)
+        # Raw features bypass normalization so the agent has direct access to influence/cost/size
+        self.billboard_norm = LayerNorm(self.graph_encoder.output_dim)  # 394, NOT 404
 
         self.ad_encoder = nn.Sequential(
             Linear(ad_feat_dim, hidden_dim),
@@ -533,8 +533,11 @@ class BillboardAllocatorGNN(nn.Module):
 
         # Single-sample path (no super-graph needed)
         if batch_size == 1:
-            flat_out = self.graph_encoder(nodes.squeeze(0), edge_index)
+            raw_features = nodes.squeeze(0)  # (N, 10)
+            flat_out = self.graph_encoder(raw_features, edge_index)
             flat_out = self.billboard_norm(flat_out)
+            # Raw-feature bypass: concat original features after normalization
+            flat_out = torch.cat([flat_out, raw_features], dim=-1)  # (N, 394+10)
             return flat_out.unsqueeze(0)
 
         # Chunk large batches to prevent OOM on dense graphs
@@ -558,6 +561,9 @@ class BillboardAllocatorGNN(nn.Module):
         out_flat = self.graph_encoder(x_flat, edge_batch)  # (B*N, D)
 
         out_flat = self.billboard_norm(out_flat)
+
+        # Raw-feature bypass: concat original features after normalization
+        out_flat = torch.cat([out_flat, x_flat], dim=-1)  # (B*N, 394+10)
 
         # 4. Reshape back: (B*N, D) -> (B, N, D)
         return out_flat.reshape(batch_size, n_nodes, -1)
@@ -914,10 +920,11 @@ class BillboardAllocatorGNN(nn.Module):
         # Billboard encoding (per-sample GNN to avoid OOM)
         all_billboard_pooled = []
         for b in range(batch_size):
-            sample_embeds = self.graph_encoder(
-                observations['graph_nodes'][b].float(), edge_index
-            )
+            raw_features_b = observations['graph_nodes'][b].float()
+            sample_embeds = self.graph_encoder(raw_features_b, edge_index)
             sample_embeds = self.billboard_norm(sample_embeds)
+            # Raw-feature bypass: concat original features after normalization
+            sample_embeds = torch.cat([sample_embeds, raw_features_b], dim=-1)
             all_billboard_pooled.append(sample_embeds.mean(dim=0, keepdim=True))
 
         billboard_pooled = torch.cat(all_billboard_pooled, dim=0)  # (batch, billboard_embed_dim)
