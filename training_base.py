@@ -89,6 +89,7 @@ MODE_DEFAULTS = {
         "use_attention": True,
         "dropout": 0.1,
         "deterministic_eval": False,  # Stochastic to avoid billboard collisions
+        "ent_coef": 0.01,  # Compensate for /MAX_ADS normalization in log_prob (base 0.001 * 20 / 2)
     },
     "mh": {
         "discount_factor": 0.99,
@@ -100,6 +101,7 @@ MODE_DEFAULTS = {
         "use_attention": True,
         "dropout": 0.1,
         "deterministic_eval": False,  # Stochastic to avoid billboard collisions
+        "ent_coef": 0.02,  # Compensate for /(2*MAX_ADS) normalization in log_prob (base 0.001 * 40 / 2)
     },
     "ea": {
         "discount_factor": 0.99,
@@ -111,6 +113,7 @@ MODE_DEFAULTS = {
         "use_attention": False,  # Attention causes OOM with large EA action space
         "dropout": 0.15,
         "deterministic_eval": False,  # Stochastic for TopK exploration
+        "ent_coef": 0.01,  # Compensate for /MAX_ADS normalization in log_prob (base 0.001 * 20 / 2)
     },
     "sequential": {
         "discount_factor": 0.99,
