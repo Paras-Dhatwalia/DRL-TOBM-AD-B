@@ -171,25 +171,9 @@ def preprocess_obs(obs: Dict, device: torch.device) -> Dict[str, torch.Tensor]:
     return result
 
 
-def select_action_na(model: BillboardAllocatorGNN, obs_torch: Dict,
-                     max_ads: int, n_bb: int, deterministic: bool) -> np.ndarray:
-    """Select action for NA mode."""
-    with torch.no_grad():
-        logits, _ = model(obs_torch)
-        per_ad_logits = logits[0].view(max_ads, n_bb)
-
-        if deterministic:
-            action = per_ad_logits.argmax(dim=-1).cpu().numpy()
-        else:
-            probs = torch.softmax(per_ad_logits, dim=-1)
-            action = torch.multinomial(probs, 1).squeeze(-1).cpu().numpy()
-
-    return action
-
-
-def select_action_ea(model: BillboardAllocatorGNN, obs_torch: Dict,
-                     max_ads: int, n_bb: int, deterministic: bool) -> np.ndarray:
-    """Select action for EA mode."""
+def select_action_per_ad(model: BillboardAllocatorGNN, obs_torch: Dict,
+                         max_ads: int, n_bb: int, deterministic: bool) -> np.ndarray:
+    """Select action for NA/EA modes (one billboard per ad)."""
     with torch.no_grad():
         logits, _ = model(obs_torch)
         per_ad_logits = logits[0].view(max_ads, n_bb)
@@ -249,8 +233,7 @@ def select_action_greedy(env: OptimizedBillboardEnv) -> np.ndarray:
     n_bb = env.n_nodes
 
     # Get current expected influence
-    minute_key = (env.start_time_min + env.current_step) % 1440
-    expected_inf = env.get_expected_slot_influence(minute_key)
+    expected_inf = env.get_expected_slot_influence()
 
     costs = np.array([b.b_cost for b in env.billboards])
     is_free = np.array([b.is_free() for b in env.billboards])
@@ -324,12 +307,9 @@ def run_episode(env: OptimizedBillboardEnv, mode: str, model: Optional[Billboard
             action = select_action_greedy(env)
         elif mode == 'random':
             action = select_action_random(env)
-        elif mode == 'na':
+        elif mode in ('na', 'ea'):
             obs_torch = preprocess_obs(obs, device)
-            action = select_action_na(model, obs_torch, max_ads, n_bb, deterministic)
-        elif mode == 'ea':
-            obs_torch = preprocess_obs(obs, device)
-            action = select_action_ea(model, obs_torch, max_ads, n_bb, deterministic)
+            action = select_action_per_ad(model, obs_torch, max_ads, n_bb, deterministic)
         elif mode == 'mh':
             obs_torch = preprocess_obs(obs, device)
             action = select_action_mh(model, obs_torch, max_ads, n_bb, deterministic)
@@ -469,7 +449,7 @@ def save_results(all_results: Dict[str, ModeResults], output_path: str):
     """Save results to JSON file."""
     output = {
         'timestamp': datetime.now().isoformat(),
-        'data_paths': DATA_PATHS,
+        'data_paths': DEFAULT_DATA_PATHS,
         'results': {mode: r.to_dict() for mode, r in all_results.items()}
     }
 

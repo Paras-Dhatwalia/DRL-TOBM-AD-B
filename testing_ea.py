@@ -15,7 +15,6 @@ from datetime import datetime
 
 from optimized_env import OptimizedBillboardEnv, EnvConfig
 from models import BillboardAllocatorGNN
-from pettingzoo.utils import BaseWrapper
 
 
 class EATestMetrics:
@@ -142,20 +141,18 @@ class EATestMetrics:
         }
 
 
-class EAWrapper(BaseWrapper):
-    """Minimal wrapper for EA mode testing"""
+class EAWrapper:
+    """Minimal wrapper for EA mode testing — passes through Gym-style returns."""
+
+    def __init__(self, env):
+        self.env = env
 
     def reset(self, *args, **kwargs):
-        obs, info = self.env.reset(*args, **kwargs)
-        return obs, info
+        return self.env.reset(*args, **kwargs)
 
     def step(self, action):
-        obs, rewards, terms, truncs, infos = self.env.step(action)
-        reward = list(rewards.values())[0] if rewards else 0
-        term = list(terms.values())[0] if terms else False
-        trunc = list(truncs.values())[0] if truncs else False
-        info = list(infos.values())[0] if infos else {}
-        return obs, reward, term, trunc, info
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return obs, float(reward), bool(terminated), bool(truncated), info
 
 
 def load_ea_model(model_path: str, device: torch.device, n_billboards: int, max_ads: int) -> BillboardAllocatorGNN:

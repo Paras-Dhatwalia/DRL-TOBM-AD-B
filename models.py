@@ -20,25 +20,7 @@ logger = logging.getLogger(__name__)
 def validate_observations(observations: Dict[str, torch.Tensor], mode: str, 
                          n_billboards: int, max_ads: int, 
                          node_feat_dim: int, ad_feat_dim: int) -> None:
-    """
-    Comprehensive validation of observation dictionary to ensure it conforms 
-    to expected specifications for the given action mode.
-    
-    Args:
-        observations: Dictionary containing batched observations
-        mode: Action mode ('na', 'ea', or 'mh')
-        n_billboards: Number of billboards in the environment
-        max_ads: Maximum number of ads per batch
-        node_feat_dim: Expected node feature dimension
-        ad_feat_dim: Expected ad feature dimension
-        
-    Raises:
-        ValueError: If any validation check fails with detailed error message
-        
-    This function is critical for catching data format issues early that would
-    otherwise cause silent failures or cryptic tensor dimension errors during
-    training. Each validation provides specific error messages to aid debugging.
-    """
+    """Validate observation shapes and keys for the given action mode."""
     
     required_keys = ['graph_nodes', 'graph_edge_links', 'mask']
     missing_keys = [key for key in required_keys if key not in observations]
@@ -85,70 +67,6 @@ def validate_observations(observations: Dict[str, torch.Tensor], mode: str,
     else:
         raise ValueError(f"Unknown mode '{mode}'. Supported modes: 'na', 'ea', 'mh'")
 
-def log_input_statistics(observations: Dict[str, torch.Tensor], mode: str) -> None:
-    """
-    Log detailed statistics about input observations for debugging and monitoring.
-    
-    This function provides comprehensive logging of input tensor statistics which
-    is crucial for:
-    1. Detecting data distribution issues
-    2. Monitoring for NaN/Inf values that would break training
-    3. Understanding mask sparsity which affects action space coverage
-    4. Debugging gradient flow issues
-    
-    Args:
-        observations: Dictionary containing batched observations
-        mode: Action mode for mode-specific analysis
-    """
-    
-    logger.debug("=== Input Statistics ===")
-    
-    for key, tensor in observations.items():
-        if isinstance(tensor, torch.Tensor):
-            min_val = tensor.min().item()
-            max_val = tensor.max().item()
-            mean_val = tensor.mean().item()
-            std_val = tensor.std().item()
-            
-            has_nan = torch.isnan(tensor).any().item()
-            has_inf = torch.isinf(tensor).any().item()
-            
-            logger.debug(f"{key}: shape={tensor.shape}, dtype={tensor.dtype}")
-            logger.debug(f"  Stats: min={min_val:.4f}, max={max_val:.4f}, "
-                        f"mean={mean_val:.4f}, std={std_val:.4f}")
-            
-            if has_nan or has_inf:
-                logger.warning(f"  WARNING: {key} contains NaN={has_nan}, Inf={has_inf}")
-    
-    mask = observations['mask']
-    
-    if mode == 'na':
-        coverage = mask.float().mean().item()
-        per_batch_coverage = mask.float().mean(dim=1)
-        min_coverage = per_batch_coverage.min().item()
-        max_coverage = per_batch_coverage.max().item()
-        
-        logger.debug(f"NA mask coverage: {coverage:.2%} of billboards available")
-        logger.debug(f"  Per-batch coverage range: {min_coverage:.2%} - {max_coverage:.2%}")
-        
-        if coverage < 0.1:
-            logger.warning("Very low billboard availability may limit learning")
-            
-    elif mode == 'ea':
-        coverage = mask.float().mean().item()
-        logger.debug(f"EA mask coverage: {coverage:.2%} of ad-billboard pairs available")
-        
-        if coverage < 0.01:
-            logger.warning("Very low pair availability may cause training instability")
-            
-    elif mode == 'mh':
-        ad_coverage = mask[:, :, 0].float().mean().item()
-        bb_coverage = mask[:, 0, :].float().mean().item()
-        
-        logger.debug(f"MH mask coverage: {ad_coverage:.2%} ads, {bb_coverage:.2%} billboards available")
-        
-        if ad_coverage < 0.1 or bb_coverage < 0.1:
-            logger.warning("Low availability in MH mode may cause sequential selection issues")
 
 def preprocess_observations(observations: Dict[str, torch.Tensor],
                            device: Optional[torch.device] = None) -> Dict[str, torch.Tensor]:
@@ -175,20 +93,7 @@ def preprocess_observations(observations: Dict[str, torch.Tensor],
     return processed
 
 class AttentionModule(nn.Module):
-    """
-    Multi-head attention module for ad-billboard matching with proper parameter management.
-    
-    This module is critical for learning complex relationships between ads and billboards.
-    Key design decisions:
-    1. Uses PyTorch's native MultiheadAttention for efficiency and stability
-    2. Includes residual connection to prevent gradient vanishing
-    3. Layer normalization for training stability
-    4. Configurable number of heads for different complexity needs
-    
-    The attention mechanism allows the model to focus on relevant billboard features
-    when making allocation decisions for specific ads, which is crucial for the
-    billboard allocation problem where context matters significantly.
-    """
+    """Multi-head attention with residual connection and LayerNorm for ad-billboard matching."""
     
     def __init__(self, embed_dim: int, num_heads: int = 4):
         super().__init__()
@@ -210,20 +115,8 @@ class AttentionModule(nn.Module):
         
         logger.debug(f"Initialized AttentionModule: embed_dim={embed_dim}, num_heads={num_heads}")
         
-    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, 
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Apply multi-head attention with residual connection.
-        
-        Args:
-            query: Query tensor (batch_size, query_len, embed_dim)
-            key: Key tensor (batch_size, key_len, embed_dim)  
-            value: Value tensor (batch_size, value_len, embed_dim)
-            mask: Optional attention mask
-            
-        Returns:
-            Attended features with residual connection and normalization
-        """
         
         attn_out, attn_weights = self.attention(query, key, value, key_padding_mask=mask)
         
@@ -233,21 +126,7 @@ class AttentionModule(nn.Module):
         return output
 
 class GraphEncoder(nn.Module):
-    """
-    Graph encoder using GIN/GAT layers for billboard network representation.
-    
-    This encoder is responsible for learning spatial relationships between billboards
-    which is crucial for the allocation problem. Key features:
-    1. Skip connections preserve information across layers
-    2. Supports both GIN and GAT convolution types
-    3. Layer normalization and dropout for training stability
-    4. Configurable depth for different problem complexities
-    
-    The graph structure captures important spatial relationships like:
-    - Physical proximity between billboards
-    - Traffic flow patterns
-    - Demographic similarities of billboard locations
-    """
+    """GIN/GAT graph encoder with skip connections for billboard spatial relationships."""
     
     def __init__(self, input_dim: int, hidden_dim: int, n_layers: int, 
                  conv_type: str = 'gin', dropout: float = 0.1):
@@ -288,16 +167,7 @@ class GraphEncoder(nn.Module):
                    f"output_dim={self.output_dim}")
         
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass with skip connections for information preservation.
-        
-        Args:
-            x: Node features (num_nodes, input_dim)
-            edge_index: Edge connectivity (2, num_edges)
-            
-        Returns:
-            Enhanced node features with skip connections
-        """
+        """Forward pass with skip connections. Returns (num_nodes, output_dim)."""
         
         outputs = [x]
         
@@ -312,19 +182,7 @@ class GraphEncoder(nn.Module):
         return final_output
 
 class BillboardAllocatorGNN(nn.Module):
-    """
-    Unified Billboard Allocation GNN supporting multiple action modes.
-
-    This model addresses the multi-agent billboard allocation problem with three
-    different action modes, each requiring different input/output structures and
-    attention mechanisms.
-
-    Architecture features:
-    - Shared graph encoder for spatial billboard relationships
-    - Mode-specific attention and projection layers
-    - Proper parameter management for all learnable components
-    - Comprehensive validation and debugging capabilities
-    """
+    """Unified GNN for billboard allocation supporting NA, EA, MH, and sequential action modes."""
     
     def __init__(self, 
                  node_feat_dim: int,
@@ -399,12 +257,7 @@ class BillboardAllocatorGNN(nn.Module):
                    f"{trainable_params} trainable")
         
     def _build_mode_specific_layers(self, hidden_dim: int, dropout: float) -> None:
-        """
-        Build layers specific to each action mode with proper parameter registration.
-        
-        This method ensures all learnable parameters are created during initialization
-        and properly registered with PyTorch's parameter system for optimization.
-        """
+        """Build actor head, critic, and mode-specific layers."""
         
         if self.mode == 'na':
             # Node Action: Score individual billboards for a given ad
@@ -578,12 +431,7 @@ class BillboardAllocatorGNN(nn.Module):
     def forward(self, observations: Dict[str, torch.Tensor], 
                 state: Optional[torch.Tensor] = None, 
                 info: Dict[str, Any] = {}) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Forward pass with comprehensive validation and proper parameter usage.
-        
-        This method now uses only pre-initialized parameters and layers, ensuring
-        proper gradient flow and optimization.
-        """
+        """Forward pass: encode graph + ads, dispatch to mode-specific head, return logits."""
         device = next(self.parameters()).device
 
         # Input validation with proper dimension inference
@@ -598,10 +446,6 @@ class BillboardAllocatorGNN(nn.Module):
             self._validation_done = True
             logger.info("Input validation passed - skipping future validations for performance")
 
-        # Optional debugging statistics
-        if logger.isEnabledFor(logging.DEBUG):
-            log_input_statistics(observations, self.mode)
-        
         batch_size = observations['graph_nodes'].shape[0]
         
         if info.get('preprocess', True):
@@ -635,10 +479,6 @@ class BillboardAllocatorGNN(nn.Module):
             probs, new_state = self._forward_sequential(billboard_embeds, observations, mask, batch_size, state, info)
         else:
             raise ValueError(f"Unsupported mode: {self.mode}")
-        
-        # Optional output statistics logging
-        if logger.isEnabledFor(logging.DEBUG):
-            self._log_output_statistics(probs, mask)
         
         return probs, new_state
     
@@ -678,7 +518,7 @@ class BillboardAllocatorGNN(nn.Module):
             # entropy/log_prob noise that drowns the learning signal (RC6 fix)
             fix_rows = ~ad_mask.any(dim=-1) | torch.isnan(scores).any(dim=-1)
             if fix_rows.any():
-                deterministic_logits = torch.full_like(scores, self.min_val)  # -1e8 everywhere
+                deterministic_logits = torch.full_like(scores, self.min_val)  # min_val everywhere
                 deterministic_logits[:, 0] = 0.0  # all mass on billboard 0
                 scores = torch.where(
                     fix_rows.unsqueeze(-1).expand_as(scores),
@@ -1043,158 +883,3 @@ class BillboardAllocatorGNN(nn.Module):
 
         return values
         
-    def _log_output_statistics(self, probs: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], 
-                              mask: torch.Tensor) -> None:
-        """
-        Log detailed statistics about output probabilities for debugging.
-        
-        This is crucial for monitoring training progress and detecting issues like:
-        - Probability collapse (all mass on single action)
-        - Uniform distributions (no learning)
-        - Mask violations (probability on invalid actions)
-        """
-        
-        logger.debug("=== Output Statistics ===")
-        
-        if isinstance(probs, tuple):  # MH mode
-            ad_probs, bb_probs = probs
-            
-            ad_entropy = (-ad_probs * torch.log(ad_probs + 1e-8)).sum(dim=1).mean().item()
-            bb_entropy = (-bb_probs * torch.log(bb_probs + 1e-8)).sum(dim=1).mean().item()
-            
-            logger.debug(f"Ad probabilities: shape={ad_probs.shape}, entropy={ad_entropy:.4f}")
-            logger.debug(f"Billboard probabilities: shape={bb_probs.shape}, entropy={bb_entropy:.4f}")
-            
-            ad_max_prob = ad_probs.max(dim=1)[0].mean().item()
-            bb_max_prob = bb_probs.max(dim=1)[0].mean().item()
-            
-            if ad_max_prob > 0.95 or bb_max_prob > 0.95:
-                logger.warning("High probability concentration detected - possible overconfidence")
-                
-        else:
-            # Single output modes (NA, EA)
-            entropy = (-probs * torch.log(probs + 1e-8)).sum(dim=1).mean().item()
-            max_probs, _ = probs.max(dim=1)
-            avg_max_prob = max_probs.mean().item()
-            
-            logger.debug(f"Action probabilities: shape={probs.shape}, entropy={entropy:.4f}")
-            logger.debug(f"Max probability: mean={avg_max_prob:.4f}")
-            
-            # Check mask adherence
-            if isinstance(mask, torch.Tensor):
-                mask_usage = (probs * mask.float()).sum(dim=1) / mask.float().sum(dim=1)
-                logger.debug(f"Probability mass on valid actions: {mask_usage.mean().item():.4f}")
-                
-                if mask_usage.min().item() < 0.99:
-                    logger.warning("Probability leakage to invalid actions detected!")
-            
-            # Check for degenerate distributions
-            if entropy < 0.1:
-                logger.warning("Very low entropy - model may be overconfident")
-            elif avg_max_prob < 0.1:
-                logger.warning("Very uniform distribution - model may not be learning")
-                
-    def get_parameter_summary(self) -> Dict[str, Any]:
-        """
-        Get comprehensive parameter summary for debugging and analysis.
-        
-        This is crucial for:
-        1. Verifying all parameters are properly registered
-        2. Monitoring parameter magnitudes for gradient issues
-        3. Understanding model complexity
-        4. Debugging training problems
-        """
-        
-        total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        
-        # Parameter breakdown by component
-        component_params = {}
-        for name, module in self.named_modules():
-            if len(list(module.parameters())) > 0:
-                component_params[name] = sum(p.numel() for p in module.parameters())
-        
-        # Parameter statistics
-        param_stats = {}
-        for name, param in self.named_parameters():
-            param_stats[name] = {
-                'shape': tuple(param.shape),
-                'numel': param.numel(),
-                'requires_grad': param.requires_grad,
-                'mean': param.data.mean().item(),
-                'std': param.data.std().item(),
-                'abs_max': param.data.abs().max().item()
-            }
-        
-        summary = {
-            'total_parameters': total_params,
-            'trainable_parameters': trainable_params,
-            'model_size_mb': total_params * 4 / (1024 ** 2),  # Assuming float32
-            'component_parameters': component_params,
-            'parameter_statistics': param_stats,
-            'mode': self.mode,
-            'architecture': {
-                'n_billboards': self.n_billboards,
-                'max_ads': self.max_ads,
-                'hidden_dim': self.hidden_dim,
-                'use_attention': self.use_attention,
-                'billboard_embed_dim': self.billboard_embed_dim
-            }
-        }
-        
-        return summary
-    
-    def check_gradient_flow(self) -> Dict[str, Any]:
-        """
-        Check gradient magnitudes for debugging training issues.
-        
-        This function is essential for identifying:
-        1. Vanishing gradients (gradients too small)
-        2. Exploding gradients (gradients too large)
-        3. Dead neurons (no gradients)
-        4. Parameter/gradient ratio issues
-        """
-        
-        grad_info = {
-            'has_gradients': {},
-            'gradient_norms': {},
-            'parameter_norms': {},
-            'grad_param_ratios': {},
-            'grad_statistics': {}
-        }
-        
-        total_grad_norm = 0.0
-        param_count = 0
-        
-        for name, param in self.named_parameters():
-            if param.grad is not None:
-                grad_norm = param.grad.norm().item()
-                param_norm = param.norm().item()
-                grad_param_ratio = grad_norm / (param_norm + 1e-8)
-                
-                grad_info['has_gradients'][name] = True
-                grad_info['gradient_norms'][name] = grad_norm
-                grad_info['parameter_norms'][name] = param_norm
-                grad_info['grad_param_ratios'][name] = grad_param_ratio
-                
-                total_grad_norm += grad_norm ** 2
-                param_count += 1
-                
-                # Flag potential issues
-                if grad_norm < 1e-7:
-                    logger.warning(f"Very small gradient for {name}: {grad_norm}")
-                elif grad_norm > 10.0:
-                    logger.warning(f"Large gradient for {name}: {grad_norm}")
-                    
-            else:
-                grad_info['has_gradients'][name] = False
-        
-        # Overall gradient statistics
-        total_grad_norm = (total_grad_norm ** 0.5) if param_count > 0 else 0.0
-        grad_info['grad_statistics'] = {
-            'total_gradient_norm': total_grad_norm,
-            'parameters_with_gradients': param_count,
-            'parameters_without_gradients': len(list(self.parameters())) - param_count
-        }
-        
-        return grad_info

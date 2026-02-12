@@ -89,7 +89,7 @@ MODE_DEFAULTS = {
         "use_attention": True,
         "dropout": 0.1,
         "deterministic_eval": False,  # Stochastic to avoid billboard collisions
-        "ent_coef": 0.01,  # Compensate for /MAX_ADS normalization in log_prob (base 0.001 * 20 / 2)
+        "ent_coef": 0.001,  # Base entropy coefficient
     },
     "mh": {
         "discount_factor": 0.99,
@@ -101,7 +101,7 @@ MODE_DEFAULTS = {
         "use_attention": True,
         "dropout": 0.1,
         "deterministic_eval": False,  # Stochastic to avoid billboard collisions
-        "ent_coef": 0.02,  # Compensate for /(2*MAX_ADS) normalization in log_prob (base 0.001 * 40 / 2)
+        "ent_coef": 0.001,  # Base entropy coefficient
     },
     "ea": {
         "discount_factor": 0.99,
@@ -113,7 +113,7 @@ MODE_DEFAULTS = {
         "use_attention": False,  # Attention causes OOM with large EA action space
         "dropout": 0.15,
         "deterministic_eval": False,  # Stochastic for TopK exploration
-        "ent_coef": 0.01,  # Compensate for /MAX_ADS normalization in log_prob (base 0.001 * 20 / 2)
+        "ent_coef": 0.001,  # Base entropy coefficient
     },
     "sequential": {
         "discount_factor": 0.99,
@@ -195,7 +195,7 @@ def create_vectorized_envs(env_config: dict, n_envs: int, force_dummy: bool = Fa
 
 def get_dist_fn(mode: str, max_ads: int, n_billboards: int = 0):
     """Get the distribution function for a given mode."""
-    if mode == 'na':
+    if mode in ('na', 'ea'):
         from distributions import create_per_ad_dist_fn
         return create_per_ad_dist_fn(max_ads, n_billboards)
 
@@ -203,12 +203,7 @@ def get_dist_fn(mode: str, max_ads: int, n_billboards: int = 0):
         from distributions import create_multi_head_dist_fn
         return create_multi_head_dist_fn(max_ads, n_billboards)
 
-    elif mode == 'ea':
-        from distributions import create_per_ad_dist_fn
-        return create_per_ad_dist_fn(max_ads, n_billboards)
-
     elif mode == 'sequential':
-        # Standard Categorical — single billboard choice per sub-step
         import torch
         return lambda logits: torch.distributions.Categorical(logits=logits)
 
@@ -379,7 +374,6 @@ def run_post_training_eval(policy, env_factory, mode_name, best_model_path=None,
     except Exception as e:
         logger.error(f"Post-training evaluation failed: {e}")
         import traceback
-        traceback.print_exc()
         traceback.print_exc()
 
 

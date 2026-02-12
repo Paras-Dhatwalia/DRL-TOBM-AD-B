@@ -95,20 +95,7 @@ def _add_graph_to_batch(
     obs: Union[Dict, ts.data.Batch],
     graph: torch.Tensor
 ) -> Union[Dict, ts.data.Batch]:
-    """
-    Inject graph_edge_links into observation batch.
-
-    The graph is stored once in the model (as a registered buffer) and
-    injected into observations during the forward pass. This avoids
-    storing the graph redundantly in every replay buffer entry.
-
-    Args:
-        obs: Observation dict or Tianshou Batch (without graph_edge_links)
-        graph: Graph edge index tensor (2, E)
-
-    Returns:
-        Observation with graph_edge_links added
-    """
+    """Inject graph_edge_links into observation batch (graph stored once, not per buffer entry)."""
     def get(obj, key):
         if isinstance(obj, dict):
             return obj.get(key)

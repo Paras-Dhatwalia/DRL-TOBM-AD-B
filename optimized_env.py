@@ -3,8 +3,6 @@ from __future__ import annotations
 import math
 import random
 import logging
-import time
-from functools import wraps
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Any, Optional, Set
 import numpy as np
@@ -28,61 +26,7 @@ class EnvConfig:
     ad_ttl: int = 720  # Ad time-to-live in timesteps
     graph_connection_distance: float = 500.0
     cache_ttl: int = 1
-    enable_profiling: bool = False
     debug: bool = False
-
-class PerformanceMonitor:
-    """Track performance metrics and timing"""
-    def __init__(self):
-        self.reset()
-    
-    def reset(self):
-        self.step_times = []
-        self.influence_calc_times = []
-        self.cache_hits = 0
-        self.cache_misses = 0
-        self.step_count = 0
-    
-    def time_function(self, category='general'):
-        """Decorator to time function execution"""
-        def decorator(func):
-            @wraps(func)
-            def wrapper(*args, **kwargs):
-                start = time.perf_counter()
-                result = func(*args, **kwargs)
-                elapsed = (time.perf_counter() - start) * 1000  # ms
-                
-                if category == 'step':
-                    self.step_times.append(elapsed)
-                elif category == 'influence':
-                    self.influence_calc_times.append(elapsed)
-                
-                if self.step_count % 100 == 0 and self.step_count > 0:
-                    self.print_stats()
-                    
-                return result
-            return wrapper
-        return decorator
-    
-    def record_cache_hit(self):
-        self.cache_hits += 1
-    
-    def record_cache_miss(self):
-        self.cache_misses += 1
-    
-    def print_stats(self):
-        """Print performance statistics"""
-        if self.step_times:
-            avg_step = np.mean(self.step_times)
-            logger.info(f"Avg step time: {avg_step:.2f}ms")
-        
-        if self.influence_calc_times:
-            avg_influence = np.mean(self.influence_calc_times)
-            logger.info(f"Avg influence calc time: {avg_influence:.2f}ms")
-        
-        if self.cache_hits + self.cache_misses > 0:
-            hit_rate = self.cache_hits / (self.cache_hits + self.cache_misses)
-            logger.info(f"Cache hit rate: {hit_rate:.2%}")
 
 def time_str_to_minutes(v: Any) -> int:
     """Convert time string to minutes since midnight."""
@@ -272,16 +216,7 @@ class Billboard:
 
 
 class OptimizedBillboardEnv(gym.Env):
-    """
-    Optimized Dynamic Billboard Allocation Environment with vectorized operations.
-
-    Key optimizations:
-    - Vectorized influence calculations using NumPy broadcasting
-    - Cached per-minute billboard probabilities
-    - Precomputed billboard size ratios
-    - Efficient trajectory storage as NumPy arrays
-    - Performance monitoring and profiling
-    """
+    """Dynamic billboard allocation environment with vectorized influence calculations."""
 
     metadata = {"render_modes": ["human"], "name": "optimized_billboard_env"}
     
@@ -305,8 +240,6 @@ class OptimizedBillboardEnv(gym.Env):
         
         logger.info(f"Initializing OptimizedBillboardEnv with action_mode={self.action_mode}")
         
-        self.perf_monitor = PerformanceMonitor() if self.config.enable_profiling else None
-
         self._load_data(billboard_csv, advertiser_csv, trajectory_csv, start_time_min)
         
         self._precompute_billboard_properties()
@@ -620,16 +553,6 @@ class OptimizedBillboardEnv(gym.Env):
         # cannot be used again until reset() is called (new episode/game)
         self.used_advertiser_ids: set = set()
 
-        if self.perf_monitor:
-            self.perf_monitor.reset()
-    
-    def distance_factor(self, dist_meters: np.ndarray) -> np.ndarray:
-        """Vectorized distance effect on billboard influence.
-
-        All users within radius contribute equally.
-        """
-        return np.ones_like(dist_meters)
-    
     def get_mask(self) -> np.ndarray:
         """
         Get action mask based on current action mode with budget validation.
@@ -866,18 +789,7 @@ class OptimizedBillboardEnv(gym.Env):
         return reward
     
     def _apply_influence_for_current_minute(self):
-        """
-        Apply influence for current minute using GLOBAL MATRIX vectorization.
-
-        PERFORMANCE OPTIMIZATION: Single-pass computation for ALL billboards.
-        Instead of computing distances per-ad (20 NumPy calls), we compute ONE
-        global probability matrix and slice columns for each ad (O(1) lookup).
-
-        This eliminates Python dispatch overhead by calling NumPy C-API once
-        instead of N_ads times per timestep.
-
-        Track per-step delta for progress shaping.
-        """
+        """Compute influence for all active ads using a single global distance matrix."""
         minute_key = (self.start_time_min + self.current_step) % 1440
 
         if self.config.debug:
@@ -921,9 +833,6 @@ class OptimizedBillboardEnv(gym.Env):
             global_probabilities[within_radius] = np.broadcast_to(
                 self.billboard_size_ratios[None, :], (n_users, n_billboards)
             )[within_radius]
-
-            # Apply distance decay factor
-            global_probabilities[within_radius] *= self.distance_factor(global_distances[within_radius])
 
             # Numerical safety clamp
             global_probabilities = np.clip(global_probabilities, 0.0, 0.999999)
@@ -1076,57 +985,13 @@ class OptimizedBillboardEnv(gym.Env):
             # O(1) lookup map for currently-alive ads
             current_ad_map = {ad.aid: ad for ad in self.ads if ad.state == 0}
 
-            if self.action_mode == 'na':
-                # Node Action: (max_ads,) — one billboard per ad, ads in obs ordering
+            if self.action_mode in ('na', 'ea'):
+                # NA/EA: (max_ads,) — one billboard per ad, ads in obs ordering
                 if isinstance(action, (list, np.ndarray, torch.Tensor)):
                     action = np.asarray(action).flatten()
 
                     if action.shape[0] != self.config.max_active_ads:
-                        logger.warning(f"Invalid NA action shape: {action.shape}, "
-                                       f"expected ({self.config.max_active_ads},)")
-                        return
-
-                    used_billboards = set()
-
-                    for obs_idx, aid in enumerate(self._obs_active_ad_ids):
-                        bb_idx = int(action[obs_idx])
-
-                        # Ad died since observation — skip this slot
-                        if aid not in current_ad_map:
-                            continue
-                        if not (0 <= bb_idx < self.n_nodes):
-                            continue
-                        if bb_idx in used_billboards:
-                            continue
-                        if not self.billboards[bb_idx].is_free():
-                            continue
-
-                        ad_to_assign = current_ad_map[aid]
-                        billboard = self.billboards[bb_idx]
-
-                        duration = random.randint(*self.config.slot_duration_range)
-                        total_cost = billboard.b_cost * duration
-                        if ad_to_assign.assign_billboard(billboard.b_id, total_cost):
-                            billboard.assign(ad_to_assign.aid, duration)
-                            used_billboards.add(bb_idx)
-
-                            self.placement_history.append({
-                                'spawn_step': ad_to_assign.spawn_step,
-                                'allocated_step': self.current_step,
-                                'ad_id': ad_to_assign.aid,
-                                'billboard_id': billboard.b_id,
-                                'duration': duration,
-                                'demand': ad_to_assign.demand,
-                                'cost': total_cost
-                            })
-
-            elif self.action_mode == 'ea':
-                # Edge Action mode: action is (max_ads,) — one billboard index per ad
-                if isinstance(action, (list, np.ndarray, torch.Tensor)):
-                    action = np.asarray(action).flatten()
-
-                    if action.shape[0] != self.config.max_active_ads:
-                        logger.warning(f"Invalid EA action shape: {action.shape}, "
+                        logger.warning(f"Invalid {self.action_mode.upper()} action shape: {action.shape}, "
                                        f"expected ({self.config.max_active_ads},)")
                         return
 
@@ -1263,9 +1128,6 @@ class OptimizedBillboardEnv(gym.Env):
         # All advertisers become available again
         self.used_advertiser_ids.clear()
 
-        if self.perf_monitor:
-            self.perf_monitor.reset()
-
         # Spawn initial ads
         self._spawn_ads()
 
@@ -1275,15 +1137,6 @@ class OptimizedBillboardEnv(gym.Env):
     
     def step(self, action):
         """Execute one environment step (Gym-style)."""
-        return self._step_internal(action)
-    
-    
-    def _step_internal(self, action):
-        """Internal step dispatch. All modes use full-step."""
-        return self._full_step(action)
-
-    def _full_step(self, action):
-        """Full-step logic for EA and NA modes."""
         self.ads_completed_this_step.clear()
         self.ads_failed_this_step.clear()
 
@@ -1408,11 +1261,7 @@ class OptimizedBillboardEnv(gym.Env):
         avg_util = self.utilization_sum / max(1, self.current_step) * 100
         print(f"Average Billboard Utilization: {avg_util:.1f}%")
         print(f"Total Placements: {len(self.placement_history)}")
-        
-        # Performance stats if profiling enabled
-        if self.perf_monitor:
-            self.perf_monitor.print_stats()
-    
+
     def close(self):
         """Clean up environment."""
         pass
