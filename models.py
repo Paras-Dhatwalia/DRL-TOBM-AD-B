@@ -337,7 +337,7 @@ class BillboardAllocatorGNN(nn.Module):
                  conv_type: str = 'gin',
                  use_attention: bool = True,
                  dropout: float = 0.1,
-                 min_val: float = -1e8):
+                 min_val: float = -30):
         
         super().__init__()
         
@@ -986,6 +986,11 @@ class BillboardAllocatorGNN(nn.Module):
         for b in range(batch_size):
             raw_features_b = observations['graph_nodes'][b].float()
             sample_embeds = self.graph_encoder(raw_features_b, edge_index)
+            # Guard against inf/NaN from GNN — same protection as actor forward pass.
+            # GIN sum aggregation on dense graphs can produce inf after many gradient
+            # updates, and LayerNorm converts inf to NaN for the entire vector.
+            if torch.isnan(sample_embeds).any() or torch.isinf(sample_embeds).any():
+                sample_embeds = torch.nan_to_num(sample_embeds, nan=0.0, posinf=1e6, neginf=-1e6)
             sample_embeds = self.billboard_norm(sample_embeds)
             # Raw-feature bypass: concat original features after normalization
             sample_embeds = torch.cat([sample_embeds, raw_features_b], dim=-1)
@@ -1021,6 +1026,11 @@ class BillboardAllocatorGNN(nn.Module):
         state_repr = torch.cat([billboard_pooled, ad_pooled], dim=-1)
 
         values = self.critic(state_repr).squeeze(-1)
+        # Final safety net: clamp values and replace NaN to prevent GAE contamination.
+        # If any NaN/inf slipped through, this prevents the catastrophic chain:
+        # NaN value → NaN advantage → NaN for entire batch → model death
+        values = torch.nan_to_num(values, nan=0.0, posinf=1e4, neginf=-1e4)
+        values = values.clamp(-1e4, 1e4)
 
         return values
         
