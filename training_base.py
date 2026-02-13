@@ -417,10 +417,7 @@ def train(mode: str, env_config: dict = None, train_config: dict = None):
     graph_numpy = sample_env.get_graph()
     action_space = sample_env.action_space
 
-    # MH mode uses DummyVectorEnv to avoid SubprocVectorEnv segfaults —
-    # MH's heavy autoregressive forward pass causes subprocess pipe crashes on Linux
-    force_dummy_train = (mode == 'mh')
-    train_envs = create_vectorized_envs(env_config, n_envs=train_config["nr_envs"], force_dummy=force_dummy_train)
+    train_envs = create_vectorized_envs(env_config, n_envs=train_config["nr_envs"])
     test_envs = create_vectorized_envs(env_config, n_envs=2, force_dummy=True)
 
     shared_model, actor, critic, optimizer, lr_scheduler, model_config = \
