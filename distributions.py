@@ -187,8 +187,11 @@ class MultiHeadCategorical:
 
         Uses non-inplace ops to preserve autograd graph for PPO backprop.
         """
-        neg_inf = torch.tensor(float('-inf'), device=ad_logits.device, dtype=ad_logits.dtype)
-        masked = torch.where(used_ads_mask, neg_inf, ad_logits)
+        # Use -30 instead of -inf to prevent NaN in PPO ratio computation.
+        # -inf causes: log_prob(-inf) = -inf, then (-inf) - (-inf) = NaN in ratio = exp(new - old).
+        # exp(-30) ≈ 1e-13 is sufficient for softmax zeroing while keeping log_prob finite.
+        mask_val = torch.tensor(-30.0, device=ad_logits.device, dtype=ad_logits.dtype)
+        masked = torch.where(used_ads_mask, mask_val, ad_logits)
         # If all masked, use uniform to prevent NaN
         all_masked = used_ads_mask.all(dim=-1, keepdim=True)
         masked = torch.where(all_masked.expand_as(masked), torch.zeros_like(masked), masked)

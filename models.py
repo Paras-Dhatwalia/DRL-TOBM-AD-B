@@ -786,18 +786,27 @@ class BillboardAllocatorGNN(nn.Module):
         mask_flat = mask.reshape(batch_size, -1)
         scores[~mask_flat] = self.min_val
 
-        # Fix ghost ad slots: for each ad slot where ALL billboards are masked,
-        # create deterministic distribution (all mass on billboard 0) so log_prob=0, entropy=0
-        # This prevents phantom entropy/log_prob noise from inactive ad slots (RC6 fix)
+        # Fix ghost ad slots AND NaN rows: for each ad slot where ALL billboards are masked
+        # OR scores contain NaN, create deterministic distribution (all mass on billboard 0)
+        # so log_prob=0, entropy=0. Prevents phantom entropy/log_prob noise (RC6 fix)
+        # and NaN propagation from GNN weight drift (RC7 fix — matches NA line 679 / MH line 888)
+        scores_per_ad = scores.view(batch_size, self.max_ads, self.n_billboards)
         per_ad_mask = mask.any(dim=-1)  # (batch, max_ads) — True if ad has any valid billboard
-        ghost_ad_mask = ~per_ad_mask  # (batch, max_ads) — True for ghost ad slots
-        if ghost_ad_mask.any():
+        has_nan = torch.isnan(scores_per_ad).any(dim=-1)  # (batch, max_ads)
+        fix_mask = ~per_ad_mask | has_nan  # (batch, max_ads) — True for ghost or NaN-contaminated slots
+        if fix_mask.any():
+            deterministic_logits = torch.full(
+                (self.n_billboards,), self.min_val, device=scores.device, dtype=scores.dtype
+            )
+            deterministic_logits[0] = 0.0  # all mass on billboard 0
             for ad_idx in range(self.max_ads):
-                ghost_rows = ghost_ad_mask[:, ad_idx]  # (batch,) bool
-                if ghost_rows.any():
+                fix_rows = fix_mask[:, ad_idx]
+                if fix_rows.any():
                     offset = ad_idx * self.n_billboards
-                    # Billboard 0 gets all mass (logit=0), rest stay at min_val (-1e8)
-                    scores[ghost_rows, offset] = 0.0
+                    scores[fix_rows, offset:offset + self.n_billboards] = deterministic_logits
+
+        # Final NaN safety (matches NA line 692 / MH lines 903-904)
+        scores = torch.nan_to_num(scores, nan=0.0)
 
         return scores
 
@@ -997,7 +1006,7 @@ class BillboardAllocatorGNN(nn.Module):
             # Statistics pooling: [mean, max, std] — captures distribution of billboard states
             bb_mean = sample_embeds.mean(dim=0)        # (billboard_embed_dim,)
             bb_max = sample_embeds.max(dim=0).values   # (billboard_embed_dim,)
-            bb_std = sample_embeds.std(dim=0)          # (billboard_embed_dim,)
+            bb_std = sample_embeds.std(dim=0, correction=0)  # (billboard_embed_dim,) — correction=0 prevents NaN when N=1
             bb_pooled = torch.cat([bb_mean, bb_max, bb_std], dim=-1)  # (billboard_embed_dim * 3,)
             all_billboard_pooled.append(bb_pooled.unsqueeze(0))
 
@@ -1019,7 +1028,7 @@ class BillboardAllocatorGNN(nn.Module):
             # Statistics pooling: [mean, max, std] preserves urgency/priority information (RC3 fix)
             ad_mean = ad_embeds.mean(dim=1)        # (batch, hidden_dim)
             ad_max = ad_embeds.max(dim=1).values   # (batch, hidden_dim)
-            ad_std = ad_embeds.std(dim=1)          # (batch, hidden_dim)
+            ad_std = ad_embeds.std(dim=1, correction=0)  # (batch, hidden_dim) — correction=0 prevents NaN when all ads identical
             ad_pooled = torch.cat([ad_mean, ad_max, ad_std], dim=-1)  # (batch, hidden_dim * 3)
 
         # Concatenate billboard + ad state for value prediction
