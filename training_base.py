@@ -59,12 +59,12 @@ BASE_TRAIN_CONFIG = {
     "nr_envs": 4,
     "hidden_dim": 128,
     "n_graph_layers": 3,
-    "lr": 1e-3,
+    "lr": 3e-4,
     "gae_lambda": 0.95,
     "vf_coef": 0.5,
     "ent_coef": 0.001,
-    "max_grad_norm": 1.0,
-    "eps_clip": 0.2,
+    "max_grad_norm": 0.5,
+    "eps_clip": 0.1,
     "batch_size": 128,
     "max_epoch": 50,
     "repeat_per_collect": 4,
@@ -89,7 +89,8 @@ MODE_DEFAULTS = {
         "use_attention": True,
         "dropout": 0.1,
         "deterministic_eval": False,  # Stochastic to avoid billboard collisions
-        "ent_coef": 0.01,  # Compensate for /MAX_ADS normalization in log_prob (base 0.001 * 20 / 2)
+        "ent_coef": 0.003,           # Prevent entropy death at epoch 74+
+        "repeat_per_collect": 3,     # Fewer passes for stability
     },
     "mh": {
         "discount_factor": 0.99,
@@ -101,7 +102,6 @@ MODE_DEFAULTS = {
         "use_attention": True,
         "dropout": 0.1,
         "deterministic_eval": False,  # Stochastic to avoid billboard collisions
-        "ent_coef": 0.02,  # Compensate for /(2*MAX_ADS) normalization in log_prob (base 0.001 * 40 / 2)
     },
     "ea": {
         "discount_factor": 0.99,
@@ -113,7 +113,8 @@ MODE_DEFAULTS = {
         "use_attention": False,  # Attention causes OOM with large EA action space
         "dropout": 0.15,
         "deterministic_eval": False,  # Stochastic for TopK exploration
-        "ent_coef": 0.01,  # Compensate for /MAX_ADS normalization in log_prob (base 0.001 * 20 / 2)
+        "ent_coef": 0.005,           # EA without attention needs more exploration
+        "repeat_per_collect": 2,     # Fewer passes on stale data
     },
     "sequential": {
         "discount_factor": 0.99,

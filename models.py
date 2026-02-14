@@ -542,6 +542,7 @@ class BillboardAllocatorGNN(nn.Module):
         if batch_size == 1:
             raw_features = nodes.squeeze(0)  # (N, 10)
             flat_out = self.graph_encoder(raw_features, edge_index)
+            flat_out = flat_out.clamp(-1e4, 1e4)  # Prevent inf before LayerNorm
             flat_out = self.billboard_norm(flat_out)
             # Raw-feature bypass: concat original features after normalization
             flat_out = torch.cat([flat_out, raw_features], dim=-1)  # (N, 394+10)
@@ -566,7 +567,7 @@ class BillboardAllocatorGNN(nn.Module):
 
         # 3. Single GNN forward pass on super-graph
         out_flat = self.graph_encoder(x_flat, edge_batch)  # (B*N, D)
-
+        out_flat = out_flat.clamp(-1e4, 1e4)  # Prevent inf before LayerNorm
         out_flat = self.billboard_norm(out_flat)
 
         # Raw-feature bypass: concat original features after normalization
@@ -995,11 +996,7 @@ class BillboardAllocatorGNN(nn.Module):
         for b in range(batch_size):
             raw_features_b = observations['graph_nodes'][b].float()
             sample_embeds = self.graph_encoder(raw_features_b, edge_index)
-            # Guard against inf/NaN from GNN — same protection as actor forward pass.
-            # GIN sum aggregation on dense graphs can produce inf after many gradient
-            # updates, and LayerNorm converts inf to NaN for the entire vector.
-            if torch.isnan(sample_embeds).any() or torch.isinf(sample_embeds).any():
-                sample_embeds = torch.nan_to_num(sample_embeds, nan=0.0, posinf=1e6, neginf=-1e6)
+            sample_embeds = sample_embeds.clamp(-1e4, 1e4)  # Prevent inf before LayerNorm
             sample_embeds = self.billboard_norm(sample_embeds)
             # Raw-feature bypass: concat original features after normalization
             sample_embeds = torch.cat([sample_embeds, raw_features_b], dim=-1)
