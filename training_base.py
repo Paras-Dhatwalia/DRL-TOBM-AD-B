@@ -7,7 +7,6 @@ mode-specific configuration and calls train().
 """
 
 import os
-import platform
 import logging
 import warnings
 import random
@@ -56,7 +55,7 @@ DATA_PATHS = {
 SEED = 42
 
 BASE_TRAIN_CONFIG = {
-    "nr_envs": 4,
+    "nr_envs": 8,
     "hidden_dim": 128,
     "n_graph_layers": 3,
     "lr": 3e-4,
@@ -65,7 +64,7 @@ BASE_TRAIN_CONFIG = {
     "ent_coef": 0.001,
     "max_grad_norm": 0.5,
     "eps_clip": 0.1,
-    "batch_size": 128,
+    "batch_size": 512,
     "max_epoch": 50,
     "repeat_per_collect": 4,
 }
@@ -179,15 +178,28 @@ def create_env(env_config: dict):
     return wrapped
 
 
+class EnvFactory:
+    """Picklable environment factory for SubprocVectorEnv on Windows.
+
+    Lambdas are not picklable, which breaks Windows subprocess spawning.
+    This class wraps create_env() in a picklable callable.
+    """
+    def __init__(self, env_config: dict):
+        self.env_config = env_config
+
+    def __call__(self):
+        return create_env(self.env_config)
+
+
 def create_vectorized_envs(env_config: dict, n_envs: int, force_dummy: bool = False):
-    """Create vectorized environments with OS-appropriate backend.
+    """Create vectorized environments with subprocess parallelism.
 
     Args:
         force_dummy: If True, always use DummyVectorEnv (no subprocesses).
                      Recommended for test envs to avoid subprocess OOM crashes.
     """
-    factory = lambda: create_env(env_config)
-    if force_dummy or platform.system() == "Windows":
+    factory = EnvFactory(env_config)
+    if force_dummy:
         return ts.env.DummyVectorEnv([factory for _ in range(n_envs)])
     else:
         return ts.env.SubprocVectorEnv([factory for _ in range(n_envs)])
@@ -380,7 +392,6 @@ def run_post_training_eval(policy, env_factory, mode_name, best_model_path=None,
     except Exception as e:
         logger.error(f"Post-training evaluation failed: {e}")
         import traceback
-        traceback.print_exc()
         traceback.print_exc()
 
 

@@ -408,6 +408,75 @@ class OptimizedBillboardEnv(gym.Env):
             b.b_size / self.max_billboard_size for b in self.billboards
         ], dtype=np.float32)
 
+        # Static billboard features — indices 0,2,3,5,8,9 never change
+        # Only indices 1 (occupied), 4 (influence), 6 (occupied_until), 7 (total_usage) are dynamic
+        self._bb_static_features = np.array(
+            [b.get_feature_vector() for b in self.billboards], dtype=np.float32
+        )  # (n_nodes, 10)
+        self._bb_costs = np.array([b.b_cost for b in self.billboards], dtype=np.float32)
+
+        # Proximity caches — persist across episodes (trajectory_map never changes)
+        # Tier A: users_per_billboard (444,) float32 per minute — for slot influence
+        # Tier B: within_radius (n_users, 444) bool per minute — for apply_influence
+        self._users_per_bb_cache = {}   # minute_key → (n_nodes,) float32
+        self._within_radius_cache = {}  # minute_key → (n_users, n_nodes) bool or None
+
+    def _get_users_per_billboard(self, minute_key: int) -> np.ndarray:
+        """Cached user count per billboard for a given minute (Tier A).
+
+        Lazily computes and caches the haversine distance matrix on first access.
+        Cross-populates Tier B (within_radius) to avoid redundant computation.
+        """
+        if minute_key in self._users_per_bb_cache:
+            return self._users_per_bb_cache[minute_key]
+
+        user_locs = self.trajectory_map.get(minute_key, np.array([]))
+        if len(user_locs) == 0:
+            result = np.zeros(self.n_nodes, dtype=np.float32)
+            self._users_per_bb_cache[minute_key] = result
+            self._within_radius_cache[minute_key] = None
+            return result
+
+        distances = haversine_distance_vectorized(
+            user_locs[:, 0:1], user_locs[:, 1:2],
+            self.billboard_coords[:, 0:1].T, self.billboard_coords[:, 1:2].T
+        )
+        within = distances <= self.config.influence_radius_meters
+
+        # Cross-populate Tier B
+        self._within_radius_cache[minute_key] = within
+
+        result = within.sum(axis=0).astype(np.float32)
+        self._users_per_bb_cache[minute_key] = result
+        return result
+
+    def _get_cached_within_radius(self, minute_key: int):
+        """Cached within-radius boolean mask (Tier B).
+
+        Returns (n_users, n_nodes) bool array, or None if no users at this minute.
+        Cross-populates Tier A (users_per_billboard) to avoid redundant computation.
+        """
+        if minute_key in self._within_radius_cache:
+            return self._within_radius_cache[minute_key]
+
+        user_locs = self.trajectory_map.get(minute_key, np.array([]))
+        if len(user_locs) == 0:
+            self._within_radius_cache[minute_key] = None
+            self._users_per_bb_cache[minute_key] = np.zeros(self.n_nodes, dtype=np.float32)
+            return None
+
+        distances = haversine_distance_vectorized(
+            user_locs[:, 0:1], user_locs[:, 1:2],
+            self.billboard_coords[:, 0:1].T, self.billboard_coords[:, 1:2].T
+        )
+        within = distances <= self.config.influence_radius_meters
+        self._within_radius_cache[minute_key] = within
+
+        # Cross-populate Tier A
+        self._users_per_bb_cache[minute_key] = within.sum(axis=0).astype(np.float32)
+
+        return within
+
     def _precompute_slot_influence(self, start_step: int) -> np.ndarray:
         """Compute expected influence for each billboard slot starting at current step.
 
@@ -431,23 +500,15 @@ class OptimizedBillboardEnv(gym.Env):
         for d in range(max_duration):
             future_step = start_step + d + 1
             minute_key = (self.start_time_min + future_step) % 1440
-            user_locs = self.trajectory_map.get(minute_key, np.array([]))
 
-            if len(user_locs) == 0:
+            # CACHED: uses Tier A (users_per_billboard) — no haversine after first access
+            users_per_billboard = self._get_users_per_billboard(minute_key)
+
+            if users_per_billboard.sum() == 0:
                 # No users at this minute - carry forward previous cumulative value
                 if d > 0:
                     slot_influence[:, d] = slot_influence[:, d-1]
                 continue
-
-            # Vectorized distance: (n_users, n_billboards)
-            distances = haversine_distance_vectorized(
-                user_locs[:, 0:1], user_locs[:, 1:2],
-                self.billboard_coords[:, 0:1].T, self.billboard_coords[:, 1:2].T
-            )
-
-            # Count users within influence radius for each billboard
-            within_radius = distances <= self.config.influence_radius_meters
-            users_per_billboard = within_radius.sum(axis=0).astype(np.float32)  # (n_billboards,)
 
             # Cumulative: slot_influence[b, d] = total users over steps 1..d+1
             if d == 0:
@@ -600,6 +661,8 @@ class OptimizedBillboardEnv(gym.Env):
         self.current_step = 0
         self.ads: List[Ad] = []
         self.placement_history: List[Dict[str, Any]] = []
+        self._active_placements: Dict[tuple, Dict] = {}  # (ad_id, bb_id) → rec for O(1) release lookup
+        self._current_step_placements: List[Dict] = []  # placements made this step (for reward shaping)
         self.performance_metrics = {
             'total_ads_processed': 0,
             'total_ads_completed': 0,
@@ -636,7 +699,7 @@ class OptimizedBillboardEnv(gym.Env):
         """
         # Precompute billboard properties once (used by all modes)
         free_mask = np.array([b.is_free() for b in self.billboards], dtype=bool)
-        costs = np.array([b.b_cost for b in self.billboards], dtype=np.float32)
+        costs = self._bb_costs  # precomputed in _precompute_billboard_properties
 
         # INFLUENCE MASKING: Mask out billboards with zero influence at current time
         # This prevents wasting allocations on "dead" billboards with no traffic
@@ -753,8 +816,7 @@ class OptimizedBillboardEnv(gym.Env):
 
         # Precompute billboard properties (vectorized)
         max_duration = self.config.slot_duration_range[1]
-        billboard_costs = np.array([b.b_cost * max_duration for b in self.billboards],
-                                   dtype=np.float32)
+        billboard_costs = self._bb_costs * max_duration
         # DYNAMIC: Expected influence based on trajectory data for current time
         # This replaces static billboard.influence with time-varying expected users
         # Real-world analogy: Advertising companies use historical traffic data
@@ -782,17 +844,17 @@ class OptimizedBillboardEnv(gym.Env):
         # This replaces static CSV influence with time-varying expected users
         dynamic_influence = self.get_expected_slot_influence()  # Shape: (n_billboards,)
 
-        # Node features (billboards)
-        nodes = np.zeros((self.n_nodes, self.n_node_features), dtype=np.float32)
+        # Node features — copy static base, overwrite dynamic columns only
+        nodes = self._bb_static_features.copy()  # single memcpy vs 444 method calls
+        nodes[:, 4] = dynamic_influence           # overwrite influence (vectorized)
         for i, b in enumerate(self.billboards):
-            feat = b.get_feature_vector()
-            # Overwrite static influence with dynamic traffic data
-            feat[4] = dynamic_influence[i]
-            nodes[i] = feat
-        
+            nodes[i, 1] = 0.0 if b.is_free() else 1.0                        # occupied
+            nodes[i, 6] = min(b.occupied_until / Billboard.MAX_DURATION, 1.0) # time left
+            nodes[i, 7] = min(b.total_usage / Billboard.MAX_USAGE, 1.0)      # usage count
+
         obs = {
             'graph_nodes': nodes,
-            'graph_edge_links': self.edge_index.copy(),
+            'graph_edge_links': self.edge_index,  # read-only, no copy needed
             'mask': self.get_mask()
         }
         
@@ -854,27 +916,23 @@ class OptimizedBillboardEnv(gym.Env):
         # 4. Immediate allocation shaping: credit for expected future influence
         #    of billboards assigned THIS step (uses precomputed slot influence)
         C_ALLOCATION = 0.005
-        for rec in self.placement_history:
-            if rec.get('allocated_step') == self.current_step:
-                bb_idx = self.billboard_id_to_node_idx.get(rec['billboard_id'])
-                if bb_idx is not None:
-                    expected = self._get_allocation_expected_influence(
-                        bb_idx, rec['duration']
-                    )
-                    reward += expected * C_ALLOCATION
+        for rec in self._current_step_placements:
+            bb_idx = self.billboard_id_to_node_idx.get(rec['billboard_id'])
+            if bb_idx is not None:
+                expected = self._get_allocation_expected_influence(
+                    bb_idx, rec['duration']
+                )
+                reward += expected * C_ALLOCATION
 
         return reward
     
     def _apply_influence_for_current_minute(self):
         """
-        Apply influence for current minute using GLOBAL MATRIX vectorization.
+        Apply influence for current minute using CACHED proximity data.
 
-        PERFORMANCE OPTIMIZATION: Single-pass computation for ALL billboards.
-        Instead of computing distances per-ad (20 NumPy calls), we compute ONE
-        global probability matrix and slice columns for each ad (O(1) lookup).
-
-        This eliminates Python dispatch overhead by calling NumPy C-API once
-        instead of N_ads times per timestep.
+        Uses precomputed within_radius boolean masks (Tier B cache) to avoid
+        haversine recomputation. The cache persists across episodes since
+        trajectory_map and billboard_coords are fixed.
 
         Track per-step delta for progress shaping.
         """
@@ -888,45 +946,18 @@ class OptimizedBillboardEnv(gym.Env):
         if not active_ads:
             return
 
-        # Get user locations for current time
-        user_locs = self.trajectory_map.get(minute_key, np.array([]))
-        if len(user_locs) == 0:
+        # ========== CACHED PROXIMITY LOOKUP (replaces haversine) ==========
+        within_radius = self._get_cached_within_radius(minute_key)
+        if within_radius is None:
             # No users at this minute - no influence to apply
             for ad in active_ads:
                 ad._step_delta = 0.0
             return
 
-        # ========== GLOBAL MATRIX COMPUTATION (Single NumPy call) ==========
-        # Compute distance from ALL users to ALL billboards in one operation
-        n_users = len(user_locs)
-        n_billboards = len(self.billboard_coords)
-
-        # Extract coordinates for broadcasting
-        user_lats = user_locs[:, 0:1]  # Shape: (n_users, 1)
-        user_lons = user_locs[:, 1:2]  # Shape: (n_users, 1)
-        bb_lats = self.billboard_coords[:, 0].reshape(1, -1)  # Shape: (1, n_billboards)
-        bb_lons = self.billboard_coords[:, 1].reshape(1, -1)  # Shape: (1, n_billboards)
-
-        # SINGLE Haversine call: (n_users, n_billboards) distance matrix
-        global_distances = haversine_distance_vectorized(user_lats, user_lons, bb_lats, bb_lons)
-
-        # Apply influence radius mask globally
-        within_radius = global_distances <= self.config.influence_radius_meters
-
-        # Compute global probability matrix
-        global_probabilities = np.zeros_like(global_distances)
-
-        if np.any(within_radius):
-            # Base probability from size ratios: broadcast (1, n_billboards) across users
-            global_probabilities[within_radius] = np.broadcast_to(
-                self.billboard_size_ratios[None, :], (n_users, n_billboards)
-            )[within_radius]
-
-            # Apply distance decay factor
-            global_probabilities[within_radius] *= self.distance_factor(global_distances[within_radius])
-
-            # Numerical safety clamp
-            global_probabilities = np.clip(global_probabilities, 0.0, 0.999999)
+        # Reconstruct probabilities from cached within_radius + precomputed size_ratios
+        # distance_factor() returns np.ones_like, so: prob = within_radius * size_ratio
+        global_probabilities = within_radius.astype(np.float32) * self.billboard_size_ratios[None, :]
+        global_probabilities = np.clip(global_probabilities, 0.0, 0.999999)
 
         # ========== PER-AD COLUMN SLICING (O(1) lookups) ==========
         for ad in active_ads:
@@ -969,6 +1000,7 @@ class OptimizedBillboardEnv(gym.Env):
                         billboard = self.billboard_map[b_id]
                         billboard.revenue_generated += ad.payment / max(1, len(ad.assigned_billboards))
                         billboard.release()
+                    self._active_placements.pop((ad.aid, b_id), None)
                     ad.release_billboard(b_id)
 
                 if self.config.debug:
@@ -976,24 +1008,24 @@ class OptimizedBillboardEnv(gym.Env):
     
     def _tick_and_release_boards(self):
         """Tick billboard timers and release expired ones."""
+        # O(1) ad lookup dict — rebuilt each call (20 ads, negligible cost)
+        ad_by_id = {ad.aid: ad for ad in self.ads}
+
         for b in self.billboards:
             if not b.is_free():
                 b.occupied_until -= 1
-                
+
                 if b.occupied_until <= 0:
                     ad_id = b.release()
                     if ad_id is not None:
-                        ad = next((a for a in self.ads if a.aid == ad_id), None)
+                        ad = ad_by_id.get(ad_id)
                         if ad:
                             ad.release_billboard(b.b_id)
-                            
-                            # Update placement history
-                            for rec in self.placement_history:
-                                if (rec['ad_id'] == ad.aid and
-                                    rec['billboard_id'] == b.b_id and
-                                    'fulfilled_by_end' not in rec):
-                                    rec['fulfilled_by_end'] = ad.cumulative_influence
-                                    break
+
+                            # Update placement history via index (O(1) vs O(n) scan)
+                            rec = self._active_placements.pop((ad_id, b.b_id), None)
+                            if rec is not None:
+                                rec['fulfilled_by_end'] = ad.cumulative_influence
     
     def _spawn_ads(self):
         """Spawn new ads based on configuration with HYSTERESIS.
@@ -1110,7 +1142,7 @@ class OptimizedBillboardEnv(gym.Env):
                             billboard.assign(ad_to_assign.aid, duration)
                             used_billboards.add(bb_idx)
 
-                            self.placement_history.append({
+                            rec = {
                                 'spawn_step': ad_to_assign.spawn_step,
                                 'allocated_step': self.current_step,
                                 'ad_id': ad_to_assign.aid,
@@ -1118,7 +1150,10 @@ class OptimizedBillboardEnv(gym.Env):
                                 'duration': duration,
                                 'demand': ad_to_assign.demand,
                                 'cost': total_cost
-                            })
+                            }
+                            self.placement_history.append(rec)
+                            self._active_placements[(ad_to_assign.aid, billboard.b_id)] = rec
+                            self._current_step_placements.append(rec)
 
             elif self.action_mode == 'ea':
                 # Edge Action mode: action is (max_ads,) — one billboard index per ad
@@ -1153,7 +1188,7 @@ class OptimizedBillboardEnv(gym.Env):
                             billboard.assign(ad_to_assign.aid, duration)
                             used_billboards.add(bb_idx)
 
-                            self.placement_history.append({
+                            rec = {
                                 'spawn_step': ad_to_assign.spawn_step,
                                 'allocated_step': self.current_step,
                                 'ad_id': ad_to_assign.aid,
@@ -1161,7 +1196,10 @@ class OptimizedBillboardEnv(gym.Env):
                                 'duration': duration,
                                 'demand': ad_to_assign.demand,
                                 'cost': total_cost
-                            })
+                            }
+                            self.placement_history.append(rec)
+                            self._active_placements[(ad_to_assign.aid, billboard.b_id)] = rec
+                            self._current_step_placements.append(rec)
 
             elif self.action_mode == 'mh':
                 # Multi-Head: (max_ads * 2,) = [ad_0, bb_0, ad_1, bb_1, ..., ad_7, bb_7]
@@ -1206,7 +1244,7 @@ class OptimizedBillboardEnv(gym.Env):
                             used_ads.add(ad_idx)
                             used_billboards.add(bb_idx)
 
-                            self.placement_history.append({
+                            rec = {
                                 'spawn_step': ad_to_assign.spawn_step,
                                 'allocated_step': self.current_step,
                                 'ad_id': ad_to_assign.aid,
@@ -1214,7 +1252,10 @@ class OptimizedBillboardEnv(gym.Env):
                                 'duration': duration,
                                 'demand': ad_to_assign.demand,
                                 'cost': total_cost
-                            })
+                            }
+                            self.placement_history.append(rec)
+                            self._active_placements[(ad_to_assign.aid, billboard.b_id)] = rec
+                            self._current_step_placements.append(rec)
 
         except Exception as e:
             logger.error(f"Error executing action: {e}")
@@ -1247,6 +1288,8 @@ class OptimizedBillboardEnv(gym.Env):
 
         # Reset tracking
         self.placement_history.clear()
+        self._active_placements.clear()
+        self._current_step_placements.clear()
         self.performance_metrics = {
             'total_ads_processed': 0,
             'total_ads_completed': 0,
@@ -1286,6 +1329,7 @@ class OptimizedBillboardEnv(gym.Env):
         """Full-step logic for EA and NA modes."""
         self.ads_completed_this_step.clear()
         self.ads_failed_this_step.clear()
+        self._current_step_placements.clear()
 
         # 1. Tick and release expired billboards (frees slots for new assignments)
         self._tick_and_release_boards()
@@ -1303,6 +1347,12 @@ class OptimizedBillboardEnv(gym.Env):
             if ad.state == 2 and prev_state != 2:
                 self.performance_metrics['total_ads_tardy'] += 1
                 self.ads_failed_this_step.append(ad.aid)
+                # Clean _active_placements for tardy ad's billboards
+                # (billboards release naturally via _tick_and_release_boards timers)
+                for b_id in list(ad.assigned_billboards):
+                    rec = self._active_placements.pop((ad.aid, b_id), None)
+                    if rec is not None:
+                        rec['fulfilled_by_end'] = ad.cumulative_influence
 
         # 5. Compute reward
         reward = self._compute_reward()

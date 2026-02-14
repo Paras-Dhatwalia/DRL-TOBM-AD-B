@@ -989,25 +989,20 @@ class BillboardAllocatorGNN(nn.Module):
         batch_size = observations['graph_nodes'].shape[0]
         edge_index = observations['graph_edge_links'][0].to(device).long()
 
-        # Billboard encoding (per-sample GNN to avoid OOM)
+        # Billboard encoding — batched GNN via super-graph chunking
+        # _batch_gnn_encode handles: chunking (32 samples), clamp(-1e4,1e4),
+        # billboard_norm, and raw-feature bypass concat internally.
+        # Output: (batch, 444, 404) where 404 = hidden_dim(394) + raw_feat(10)
+        billboard_embeds = self._batch_gnn_encode(
+            observations['graph_nodes'].float(), edge_index
+        )  # (batch, n_nodes, billboard_embed_dim)
+
         # Statistics pooling: [mean, max, std] preserves spatial/occupancy information
         # that mean-only pooling destroys (RC3 fix)
-        all_billboard_pooled = []
-        for b in range(batch_size):
-            raw_features_b = observations['graph_nodes'][b].float()
-            sample_embeds = self.graph_encoder(raw_features_b, edge_index)
-            sample_embeds = sample_embeds.clamp(-1e4, 1e4)  # Prevent inf before LayerNorm
-            sample_embeds = self.billboard_norm(sample_embeds)
-            # Raw-feature bypass: concat original features after normalization
-            sample_embeds = torch.cat([sample_embeds, raw_features_b], dim=-1)
-            # Statistics pooling: [mean, max, std] — captures distribution of billboard states
-            bb_mean = sample_embeds.mean(dim=0)        # (billboard_embed_dim,)
-            bb_max = sample_embeds.max(dim=0).values   # (billboard_embed_dim,)
-            bb_std = sample_embeds.std(dim=0, correction=0)  # (billboard_embed_dim,) — correction=0 prevents NaN when N=1
-            bb_pooled = torch.cat([bb_mean, bb_max, bb_std], dim=-1)  # (billboard_embed_dim * 3,)
-            all_billboard_pooled.append(bb_pooled.unsqueeze(0))
-
-        billboard_pooled = torch.cat(all_billboard_pooled, dim=0)  # (batch, billboard_embed_dim * 3)
+        bb_mean = billboard_embeds.mean(dim=1)                    # (batch, billboard_embed_dim)
+        bb_max = billboard_embeds.max(dim=1).values               # (batch, billboard_embed_dim)
+        bb_std = billboard_embeds.std(dim=1, correction=0)        # (batch, billboard_embed_dim)
+        billboard_pooled = torch.cat([bb_mean, bb_max, bb_std], dim=-1)  # (batch, billboard_embed_dim * 3)
 
         # Ad encoding (shared ad_encoder)
         ad_features = observations['ad_features'].float()
