@@ -89,6 +89,7 @@ MODE_DEFAULTS = {
         "use_attention": True,
         "dropout": 0.1,
         "deterministic_eval": False,  # Stochastic to avoid billboard collisions
+        "ent_coef": 0.01,  # Compensate for /MAX_ADS normalization in log_prob (base 0.001 * 20 / 2)
     },
     "mh": {
         "discount_factor": 0.99,
@@ -100,6 +101,7 @@ MODE_DEFAULTS = {
         "use_attention": True,
         "dropout": 0.1,
         "deterministic_eval": False,  # Stochastic to avoid billboard collisions
+        "ent_coef": 0.02,  # Compensate for /(2*MAX_ADS) normalization in log_prob (base 0.001 * 40 / 2)
     },
     "ea": {
         "discount_factor": 0.99,
@@ -111,6 +113,7 @@ MODE_DEFAULTS = {
         "use_attention": False,  # Attention causes OOM with large EA action space
         "dropout": 0.15,
         "deterministic_eval": False,  # Stochastic for TopK exploration
+        "ent_coef": 0.01,  # Compensate for /MAX_ADS normalization in log_prob (base 0.001 * 20 / 2)
     },
     "sequential": {
         "discount_factor": 0.99,
@@ -414,7 +417,10 @@ def train(mode: str, env_config: dict = None, train_config: dict = None):
     graph_numpy = sample_env.get_graph()
     action_space = sample_env.action_space
 
-    train_envs = create_vectorized_envs(env_config, n_envs=train_config["nr_envs"])
+    # MH mode uses DummyVectorEnv to avoid SubprocVectorEnv segfaults —
+    # MH's heavy autoregressive forward pass causes subprocess pipe crashes on Linux
+    force_dummy_train = (mode == 'mh')
+    train_envs = create_vectorized_envs(env_config, n_envs=train_config["nr_envs"], force_dummy=force_dummy_train)
     test_envs = create_vectorized_envs(env_config, n_envs=2, force_dummy=True)
 
     shared_model, actor, critic, optimizer, lr_scheduler, model_config = \
