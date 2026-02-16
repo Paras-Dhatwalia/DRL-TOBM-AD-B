@@ -83,18 +83,15 @@ class PerAdCategorical:
         if actions.dim() == 1:
             actions = actions.unsqueeze(0)
         per_ad_lp = self._dists.log_prob(actions.long())  # (batch, max_ads)
-        # Normalize by MAX_ADS to keep PPO ratio exp(new-old) in clippable range.
-        # Without this, 20 summed terms cause ratio explosion: exp(20*0.3)=403 >> clip [0.8, 1.2]
-        # After RC6 ghost slot fix, inactive slots contribute 0, so /MAX_ADS correctly scales active portion.
-        result = per_ad_lp.sum(dim=-1) / self.MAX_ADS  # (batch,)
+        result = per_ad_lp.sum(dim=-1)  # (batch,)
         if self._was_1d:
             result = result.squeeze(0)
         return result
 
     def entropy(self):
-        """Mean of per-ad entropies (normalized by MAX_ADS to match log_prob scale)."""
+        """Sum of per-ad entropies."""
         per_ad_ent = self._dists.entropy()  # (batch, max_ads)
-        result = per_ad_ent.sum(dim=-1) / self.MAX_ADS  # (batch,)
+        result = per_ad_ent.sum(dim=-1)  # (batch,)
         if self._was_1d:
             result = result.squeeze(0)
         return result
@@ -187,11 +184,8 @@ class MultiHeadCategorical:
 
         Uses non-inplace ops to preserve autograd graph for PPO backprop.
         """
-        # Use -30 instead of -inf to prevent NaN in PPO ratio computation.
-        # -inf causes: log_prob(-inf) = -inf, then (-inf) - (-inf) = NaN in ratio = exp(new - old).
-        # exp(-30) ≈ 1e-13 is sufficient for softmax zeroing while keeping log_prob finite.
-        mask_val = torch.tensor(-30.0, device=ad_logits.device, dtype=ad_logits.dtype)
-        masked = torch.where(used_ads_mask, mask_val, ad_logits)
+        neg_inf = torch.tensor(float('-inf'), device=ad_logits.device, dtype=ad_logits.dtype)
+        masked = torch.where(used_ads_mask, neg_inf, ad_logits)
         # If all masked, use uniform to prevent NaN
         all_masked = used_ads_mask.all(dim=-1, keepdim=True)
         masked = torch.where(all_masked.expand_as(masked), torch.zeros_like(masked), masked)
@@ -267,10 +261,6 @@ class MultiHeadCategorical:
             bb_dist = torch.distributions.Categorical(logits=bb_logits)
             total_lp = total_lp + bb_dist.log_prob(bb_action)
 
-        # Normalize by 2*MAX_ADS (20 ad decisions + 20 billboard decisions = 40 terms)
-        # to keep PPO ratio in clippable range (RC2 fix)
-        total_lp = total_lp / (2 * self.MAX_ADS)
-
         if self._was_1d:
             total_lp = total_lp.squeeze(0)
         return total_lp
@@ -306,9 +296,6 @@ class MultiHeadCategorical:
             # Advance masking using greedy selection (non-inplace)
             greedy_ad = ad_dist.probs.argmax(dim=-1)
             used_ads = used_ads | F.one_hot(greedy_ad, self.MAX_ADS).bool()
-
-        # Normalize by 2*MAX_ADS to match log_prob scale (RC2 fix)
-        total_ent = total_ent / (2 * self.MAX_ADS)
 
         if self._was_1d:
             total_ent = total_ent.squeeze(0)

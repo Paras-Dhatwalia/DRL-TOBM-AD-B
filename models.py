@@ -337,7 +337,7 @@ class BillboardAllocatorGNN(nn.Module):
                  conv_type: str = 'gin',
                  use_attention: bool = True,
                  dropout: float = 0.1,
-                 min_val: float = -30):
+                 min_val: float = -1e8):
         
         super().__init__()
         
@@ -494,15 +494,8 @@ class BillboardAllocatorGNN(nn.Module):
             )
 
         # Critic network (shared across all modes)
-        # Input: billboard embeddings (statistics-pooled) + ad embeddings (statistics-pooled)
-        # Statistics pooling: [mean, max, std] provides 3x the information vs mean-only,
-        # enabling the critic to distinguish states (e.g., high vs low occupancy) (RC3 fix)
-        bb_pooled_dim = self.billboard_embed_dim * 3  # 404 * 3 = 1212
-        if self.mode == 'sequential':
-            ad_pooled_dim = hidden_dim  # single ad, no pooling needed
-        else:
-            ad_pooled_dim = hidden_dim * 3  # 128 * 3 = 384
-        critic_input_dim = bb_pooled_dim + ad_pooled_dim
+        # Input: billboard embeddings (pooled) + ad embeddings (pooled)
+        critic_input_dim = self.billboard_embed_dim + hidden_dim
         self.critic = nn.Sequential(
             Linear(critic_input_dim, 2 * hidden_dim),
             LayerNorm(2 * hidden_dim),
@@ -542,7 +535,6 @@ class BillboardAllocatorGNN(nn.Module):
         if batch_size == 1:
             raw_features = nodes.squeeze(0)  # (N, 10)
             flat_out = self.graph_encoder(raw_features, edge_index)
-            flat_out = flat_out.clamp(-1e4, 1e4)  # Prevent inf before LayerNorm
             flat_out = self.billboard_norm(flat_out)
             # Raw-feature bypass: concat original features after normalization
             flat_out = torch.cat([flat_out, raw_features], dim=-1)  # (N, 394+10)
@@ -567,7 +559,7 @@ class BillboardAllocatorGNN(nn.Module):
 
         # 3. Single GNN forward pass on super-graph
         out_flat = self.graph_encoder(x_flat, edge_batch)  # (B*N, D)
-        out_flat = out_flat.clamp(-1e4, 1e4)  # Prevent inf before LayerNorm
+
         out_flat = self.billboard_norm(out_flat)
 
         # Raw-feature bypass: concat original features after normalization
@@ -674,16 +666,12 @@ class BillboardAllocatorGNN(nn.Module):
             ad_mask = mask[:, ad_idx].bool()
             scores[~ad_mask] = self.min_val
 
-            # Handle ghost ad slots (all-masked rows): deterministic distribution on billboard 0
-            # This ensures log_prob=0 and entropy=0 for inactive slots, preventing phantom
-            # entropy/log_prob noise that drowns the learning signal (RC6 fix)
+            # Handle all-masked rows
             fix_rows = ~ad_mask.any(dim=-1) | torch.isnan(scores).any(dim=-1)
             if fix_rows.any():
-                deterministic_logits = torch.full_like(scores, self.min_val)  # -1e8 everywhere
-                deterministic_logits[:, 0] = 0.0  # all mass on billboard 0
                 scores = torch.where(
                     fix_rows.unsqueeze(-1).expand_as(scores),
-                    deterministic_logits,
+                    torch.zeros_like(scores),
                     scores
                 )
 
@@ -693,7 +681,7 @@ class BillboardAllocatorGNN(nn.Module):
         all_scores = torch.nan_to_num(all_scores, nan=0.0)
 
         return all_scores, state
-
+        
     def _forward_ea_fixed(self, billboard_embeds: torch.Tensor, observations: Dict[str, torch.Tensor],
                          mask: torch.Tensor, batch_size: int, state: Optional[torch.Tensor],
                          info: Dict[str, Any]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -787,76 +775,21 @@ class BillboardAllocatorGNN(nn.Module):
         mask_flat = mask.reshape(batch_size, -1)
         scores[~mask_flat] = self.min_val
 
-        # Fix ghost ad slots AND NaN rows: for each ad slot where ALL billboards are masked
-        # OR scores contain NaN, create deterministic distribution (all mass on billboard 0)
-        # so log_prob=0, entropy=0. Prevents phantom entropy/log_prob noise (RC6 fix)
-        # and NaN propagation from GNN weight drift (RC7 fix — matches NA line 679 / MH line 888)
-        scores_per_ad = scores.view(batch_size, self.max_ads, self.n_billboards)
-        per_ad_mask = mask.any(dim=-1)  # (batch, max_ads) — True if ad has any valid billboard
-        has_nan = torch.isnan(scores_per_ad).any(dim=-1)  # (batch, max_ads)
-        fix_mask = ~per_ad_mask | has_nan  # (batch, max_ads) — True for ghost or NaN-contaminated slots
-        if fix_mask.any():
-            deterministic_logits = torch.full(
-                (self.n_billboards,), self.min_val, device=scores.device, dtype=scores.dtype
-            )
-            deterministic_logits[0] = 0.0  # all mass on billboard 0
-            for ad_idx in range(self.max_ads):
-                fix_rows = fix_mask[:, ad_idx]
-                if fix_rows.any():
-                    offset = ad_idx * self.n_billboards
-                    scores[fix_rows, offset:offset + self.n_billboards] = deterministic_logits
-
-        # Final NaN safety (matches NA line 692 / MH lines 903-904)
-        scores = torch.nan_to_num(scores, nan=0.0)
-
         return scores
-
+        
     def _forward_mh_fixed(self, billboard_embeds: torch.Tensor, observations: Dict[str, torch.Tensor],
                          mask: torch.Tensor, batch_size: int, state: Optional[torch.Tensor],
                          info: Dict[str, Any]) -> Tuple[torch.Tensor, None]:
         """
-        Autoregressive Multi-Head forward pass with chunked processing.
+        Autoregressive Multi-Head forward pass.
 
-        Uses CHUNK_SIZE=32 to prevent OOM during GAE when Tianshou passes
-        the entire buffer (23040+ samples) through the model at once (RC5 fix).
+        Computes billboard logits for ALL ads so the distribution can properly
+        handle the sequential (ad → billboard|ad) sampling and log_prob.
 
         Returns concatenated logits: [ad_logits, all_bb_logits_flat]
         Shape: (batch, max_ads + max_ads * n_billboards)
         """
-        CHUNK_SIZE = 32
 
-        if batch_size > CHUNK_SIZE:
-            # Large batch (GAE phase) — process in chunks to prevent OOM
-            all_logits = []
-            for start_idx in range(0, batch_size, CHUNK_SIZE):
-                end_idx = min(start_idx + CHUNK_SIZE, batch_size)
-                chunk_size = end_idx - start_idx
-
-                chunk_billboard = billboard_embeds[start_idx:end_idx]
-                chunk_obs = {
-                    'ad_features': observations['ad_features'][start_idx:end_idx],
-                }
-                chunk_mask = mask[start_idx:end_idx]
-
-                chunk_logits = self._forward_mh_single_chunk(
-                    chunk_billboard, chunk_obs, chunk_mask, chunk_size
-                )
-                all_logits.append(chunk_logits)
-
-            return torch.cat(all_logits, dim=0), None
-        else:
-            # Small batch (normal inference) — process directly
-            return self._forward_mh_single_chunk(
-                billboard_embeds, observations, mask, batch_size
-            ), None
-
-    def _forward_mh_single_chunk(self, billboard_embeds: torch.Tensor,
-                                  observations: Dict[str, torch.Tensor],
-                                  mask: torch.Tensor, batch_size: int) -> torch.Tensor:
-        """Process a single chunk of MH forward pass.
-
-        Extracted from _forward_mh_fixed to enable chunked processing for large batches.
-        """
         ad_features = observations['ad_features']  # (batch_size, max_ads, ad_feat_dim)
         ad_embeds = self.ad_encoder(ad_features.view(-1, ad_features.shape[-1]))
         ad_embeds = ad_embeds.view(batch_size, self.max_ads, -1)
@@ -867,19 +800,17 @@ class BillboardAllocatorGNN(nn.Module):
         ad_mask = mask.any(dim=-1).bool()  # ad is valid if ANY billboard is available
         ad_logits[~ad_mask] = self.min_val
 
-        # When ALL ads are masked, use deterministic (all mass on ad 0) to prevent NaN
-        # and ensure log_prob=0, entropy=0 for this degenerate case (RC6 fix)
+        # When ALL ads are masked, replace with uniform to prevent NaN
         no_valid_ads = ~ad_mask.any(dim=-1)
         if no_valid_ads.any():
-            deterministic_ad_logits = torch.full_like(ad_logits, self.min_val)
-            deterministic_ad_logits[:, 0] = 0.0
             ad_logits = torch.where(
                 no_valid_ads.unsqueeze(-1).expand_as(ad_logits),
-                deterministic_ad_logits,
+                torch.zeros_like(ad_logits),
                 ad_logits
             )
 
         # Head 2: Billboard logits for EVERY ad (autoregressive)
+        # Loop to avoid OOM from materializing (B, max_ads, N_bb, 2*hidden)
         all_bb_logits = []
         for ad_idx in range(self.max_ads):
             ad_embed = ad_embeds[:, ad_idx]  # (batch, hidden)
@@ -893,15 +824,12 @@ class BillboardAllocatorGNN(nn.Module):
             bb_mask = mask[:, ad_idx].bool()
             bb_logits[~bb_mask] = self.min_val
 
-            # Handle ghost ad slots: deterministic distribution on billboard 0
-            # Ensures log_prob=0, entropy=0 for inactive billboard selections (RC6 fix)
+            # Handle all-masked or NaN rows
             fix_rows = ~bb_mask.any(dim=-1) | torch.isnan(bb_logits).any(dim=-1)
             if fix_rows.any():
-                deterministic_logits = torch.full_like(bb_logits, self.min_val)
-                deterministic_logits[:, 0] = 0.0
                 bb_logits = torch.where(
                     fix_rows.unsqueeze(-1).expand_as(bb_logits),
-                    deterministic_logits,
+                    torch.zeros_like(bb_logits),
                     bb_logits
                 )
 
@@ -916,7 +844,7 @@ class BillboardAllocatorGNN(nn.Module):
         # Concatenate: [ad_logits, all_bb_logits_flat]
         concatenated = torch.cat([ad_logits, all_bb_logits.view(batch_size, -1)], dim=-1)
 
-        return concatenated
+        return concatenated, None
 
     def _forward_sequential(self, billboard_embeds: torch.Tensor, observations: Dict[str, torch.Tensor],
                             mask: torch.Tensor, batch_size: int, state: Optional[torch.Tensor],
@@ -989,20 +917,17 @@ class BillboardAllocatorGNN(nn.Module):
         batch_size = observations['graph_nodes'].shape[0]
         edge_index = observations['graph_edge_links'][0].to(device).long()
 
-        # Billboard encoding — batched GNN via super-graph chunking
-        # _batch_gnn_encode handles: chunking (32 samples), clamp(-1e4,1e4),
-        # billboard_norm, and raw-feature bypass concat internally.
-        # Output: (batch, 444, 404) where 404 = hidden_dim(394) + raw_feat(10)
-        billboard_embeds = self._batch_gnn_encode(
-            observations['graph_nodes'].float(), edge_index
-        )  # (batch, n_nodes, billboard_embed_dim)
+        # Billboard encoding (per-sample GNN to avoid OOM)
+        all_billboard_pooled = []
+        for b in range(batch_size):
+            raw_features_b = observations['graph_nodes'][b].float()
+            sample_embeds = self.graph_encoder(raw_features_b, edge_index)
+            sample_embeds = self.billboard_norm(sample_embeds)
+            # Raw-feature bypass: concat original features after normalization
+            sample_embeds = torch.cat([sample_embeds, raw_features_b], dim=-1)
+            all_billboard_pooled.append(sample_embeds.mean(dim=0, keepdim=True))
 
-        # Statistics pooling: [mean, max, std] preserves spatial/occupancy information
-        # that mean-only pooling destroys (RC3 fix)
-        bb_mean = billboard_embeds.mean(dim=1)                    # (batch, billboard_embed_dim)
-        bb_max = billboard_embeds.max(dim=1).values               # (batch, billboard_embed_dim)
-        bb_std = billboard_embeds.std(dim=1, correction=0)        # (batch, billboard_embed_dim)
-        billboard_pooled = torch.cat([bb_mean, bb_max, bb_std], dim=-1)  # (batch, billboard_embed_dim * 3)
+        billboard_pooled = torch.cat(all_billboard_pooled, dim=0)  # (batch, billboard_embed_dim)
 
         # Ad encoding (shared ad_encoder)
         ad_features = observations['ad_features'].float()
@@ -1017,21 +942,12 @@ class BillboardAllocatorGNN(nn.Module):
             ad_flat = ad_features.view(-1, ad_features.shape[-1])  # (batch*max_ads, ad_feat_dim)
             ad_embeds = self.ad_encoder(ad_flat)  # (batch*max_ads, hidden_dim)
             ad_embeds = ad_embeds.view(batch_size, self.max_ads, -1)  # (batch, max_ads, hidden_dim)
-            # Statistics pooling: [mean, max, std] preserves urgency/priority information (RC3 fix)
-            ad_mean = ad_embeds.mean(dim=1)        # (batch, hidden_dim)
-            ad_max = ad_embeds.max(dim=1).values   # (batch, hidden_dim)
-            ad_std = ad_embeds.std(dim=1, correction=0)  # (batch, hidden_dim) — correction=0 prevents NaN when all ads identical
-            ad_pooled = torch.cat([ad_mean, ad_max, ad_std], dim=-1)  # (batch, hidden_dim * 3)
+            ad_pooled = ad_embeds.mean(dim=1)  # (batch, hidden_dim)
 
         # Concatenate billboard + ad state for value prediction
         state_repr = torch.cat([billboard_pooled, ad_pooled], dim=-1)
 
         values = self.critic(state_repr).squeeze(-1)
-        # Final safety net: clamp values and replace NaN to prevent GAE contamination.
-        # If any NaN/inf slipped through, this prevents the catastrophic chain:
-        # NaN value → NaN advantage → NaN for entire batch → model death
-        values = torch.nan_to_num(values, nan=0.0, posinf=1e4, neginf=-1e4)
-        values = values.clamp(-1e4, 1e4)
 
         return values
         
