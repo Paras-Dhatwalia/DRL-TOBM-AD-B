@@ -10,6 +10,7 @@ Implements deterministic heuristic policies for performance comparison:
 These establish reference points for evaluating learned policies.
 """
 
+import time
 import logging
 import numpy as np
 from optimized_env import OptimizedBillboardEnv, EnvConfig
@@ -75,10 +76,12 @@ def _run_eval(name, description, policy_fn, n_episodes=5):
 
     all_metrics = {
         'success_rate': [], 'revenue': [], 'utilization': [],
-        'completed': [], 'processed': []
+        'completed': [], 'processed': [], 'reward': [],
+        'influence': [], 'profit': [], 'episode_time': [],
     }
 
     for ep in range(n_episodes):
+        ep_start = time.time()
         obs, info = env.reset(seed=42 + ep)
         done = False
         step_count = 0
@@ -91,22 +94,35 @@ def _run_eval(name, description, policy_fn, n_episodes=5):
             step_count += 1
             done = terminated or truncated
 
+        ep_time = time.time() - ep_start
         m = env.performance_metrics
         completed = m['total_ads_completed']
         processed = m['total_ads_processed']
         success_rate = (completed / max(1, processed)) * 100.0
         revenue = m['total_revenue']
         util = env.utilization_sum / max(1, env.current_step) * 100
+        influence = sum(a['cumulative_influence'] for a in env._completed_ads_log)
+        cost_completed = sum(a['total_cost_spent'] for a in env._completed_ads_log)
+        cost_tardy = sum(a['total_cost_spent'] for a in env._tardy_ads_log)
+        cost_active = sum(ad.total_cost_spent for ad in env.ads if ad.state == 0)
+        total_cost = cost_completed + cost_tardy + cost_active
+        profit = revenue - total_cost
 
         all_metrics['success_rate'].append(success_rate)
         all_metrics['revenue'].append(revenue)
         all_metrics['utilization'].append(util)
         all_metrics['completed'].append(completed)
         all_metrics['processed'].append(processed)
+        all_metrics['reward'].append(total_reward)
+        all_metrics['influence'].append(influence)
+        all_metrics['profit'].append(profit)
+        all_metrics['episode_time'].append(ep_time)
 
         logger.info(
             f"Ep {ep+1}: Success={success_rate:.1f}% ({completed}/{processed}), "
-            f"Rev=${revenue:.0f}, Util={util:.1f}%, Reward={total_reward:.1f}"
+            f"Rev=${revenue:.0f}, Profit=${profit:.0f}, "
+            f"Influence={influence:.0f}, Util={util:.1f}%, "
+            f"Reward={total_reward:.1f}, Time={ep_time:.1f}s"
         )
 
     logger.info("=" * 60)
@@ -114,7 +130,11 @@ def _run_eval(name, description, policy_fn, n_episodes=5):
     logger.info("=" * 60)
     logger.info(f"Average Success Rate: {np.mean(all_metrics['success_rate']):.1f}%")
     logger.info(f"Average Revenue:      ${np.mean(all_metrics['revenue']):.0f}")
+    logger.info(f"Average Profit:       ${np.mean(all_metrics['profit']):.0f}")
+    logger.info(f"Average Influence:    {np.mean(all_metrics['influence']):.0f}")
     logger.info(f"Average Utilization:  {np.mean(all_metrics['utilization']):.1f}%")
+    logger.info(f"Average Reward:       {np.mean(all_metrics['reward']):.1f}")
+    logger.info(f"Average Ep Time:      {np.mean(all_metrics['episode_time']):.1f}s")
     logger.info("=" * 60)
 
     return all_metrics

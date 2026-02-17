@@ -29,6 +29,7 @@ class PerAdCategorical:
     # Defaults - overwritten by create_per_ad_dist_fn() during training
     MAX_ADS = 20  # Must match EnvConfig.max_active_ads
     N_BILLBOARDS = 444
+    ENTROPY_FLOOR = 0.0  # Set by create_per_ad_dist_fn(); 0.0 = disabled
 
     def __init__(self, logits: torch.Tensor):
         self._logits = logits
@@ -92,9 +93,16 @@ class PerAdCategorical:
         return result
 
     def entropy(self):
-        """Mean of per-ad entropies (normalized by MAX_ADS to match log_prob scale)."""
+        """Mean of per-ad entropies (normalized by MAX_ADS to match log_prob scale).
+
+        Applies entropy floor to prevent policy sharpness collapse.
+        When entropy drops below floor, the PPO entropy bonus gradient
+        pushes the policy back toward exploration.
+        """
         per_ad_ent = self._dists.entropy()  # (batch, max_ads)
         result = per_ad_ent.sum(dim=-1) / self.MAX_ADS  # (batch,)
+        if self.ENTROPY_FLOOR > 0:
+            result = torch.clamp(result, min=self.ENTROPY_FLOOR)
         if self._was_1d:
             result = result.squeeze(0)
         return result
@@ -150,6 +158,7 @@ class MultiHeadCategorical:
     # Defaults - overwritten by create_multi_head_dist_fn() during training
     MAX_ADS = 20  # Must match EnvConfig.max_active_ads
     N_BILLBOARDS = 444
+    ENTROPY_FLOOR = 0.0  # Set by create_multi_head_dist_fn(); 0.0 = disabled
 
     def __init__(self, logits: torch.Tensor):
         self._logits = logits
@@ -307,6 +316,12 @@ class MultiHeadCategorical:
         # Normalize by 2*MAX_ADS to match log_prob scale (RC2 fix)
         total_ent = total_ent / (2 * self.MAX_ADS)
 
+        # Entropy floor prevents policy sharpness collapse in late training.
+        # When entropy drops below floor, PPO entropy bonus gradient pushes
+        # the policy back toward exploration, preventing catastrophic updates.
+        if self.ENTROPY_FLOOR > 0:
+            total_ent = torch.clamp(total_ent, min=self.ENTROPY_FLOOR)
+
         if self._was_1d:
             total_ent = total_ent.squeeze(0)
         return total_ent
@@ -375,10 +390,11 @@ class MultiHeadCategorical:
         return self.variance.sqrt()
 
 
-def create_multi_head_dist_fn(max_ads: int, n_billboards: int):
+def create_multi_head_dist_fn(max_ads: int, n_billboards: int, entropy_floor: float = 0.0):
     """Create a distribution function for MH mode with the correct split."""
     MultiHeadCategorical.MAX_ADS = max_ads
     MultiHeadCategorical.N_BILLBOARDS = n_billboards
+    MultiHeadCategorical.ENTROPY_FLOOR = entropy_floor
 
     def multi_head_dist_fn(logits):
         if isinstance(logits, torch.Tensor) and logits.dim() >= 1:
@@ -388,10 +404,11 @@ def create_multi_head_dist_fn(max_ads: int, n_billboards: int):
     return multi_head_dist_fn
 
 
-def create_per_ad_dist_fn(max_ads: int, n_billboards: int):
+def create_per_ad_dist_fn(max_ads: int, n_billboards: int, entropy_floor: float = 0.0):
     """Create a distribution function for EA mode (one billboard per ad)."""
     PerAdCategorical.MAX_ADS = max_ads
     PerAdCategorical.N_BILLBOARDS = n_billboards
+    PerAdCategorical.ENTROPY_FLOOR = entropy_floor
 
     def per_ad_dist_fn(logits):
         return PerAdCategorical(logits)

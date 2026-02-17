@@ -613,6 +613,10 @@ class OptimizedBillboardEnv(gym.Env):
 
         self.ads_completed_this_step: List[int] = []
         self.ads_failed_this_step: List[int] = []  # Track new failures
+
+        # Per-ad logs preserved across the episode (completed/tardy ads are removed from self.ads)
+        self._completed_ads_log: List[Dict[str, Any]] = []
+        self._tardy_ads_log: List[Dict[str, Any]] = []
         self._obs_active_ad_ids: List[int] = []  # Frozen ad ordering from last _get_obs()
 
         # Track used advertiser IDs within current episode.
@@ -962,6 +966,11 @@ class OptimizedBillboardEnv(gym.Env):
 
                 # Track completion event
                 self.ads_completed_this_step.append(ad.aid)
+                self._completed_ads_log.append({
+                    'aid': ad.aid, 'demand': ad.demand,
+                    'cumulative_influence': ad.cumulative_influence,
+                    'payment': ad.payment, 'total_cost_spent': ad.total_cost_spent,
+                })
 
                 # Release billboards and generate revenue
                 for b_id in list(ad.assigned_billboards):
@@ -1257,6 +1266,8 @@ class OptimizedBillboardEnv(gym.Env):
 
         self.ads_completed_this_step.clear()
         self.ads_failed_this_step.clear()
+        self._completed_ads_log.clear()
+        self._tardy_ads_log.clear()
 
         self.utilization_sum = 0.0
 
@@ -1303,6 +1314,11 @@ class OptimizedBillboardEnv(gym.Env):
             if ad.state == 2 and prev_state != 2:
                 self.performance_metrics['total_ads_tardy'] += 1
                 self.ads_failed_this_step.append(ad.aid)
+                self._tardy_ads_log.append({
+                    'aid': ad.aid, 'demand': ad.demand,
+                    'cumulative_influence': ad.cumulative_influence,
+                    'payment': ad.payment, 'total_cost_spent': ad.total_cost_spent,
+                })
 
         # 5. Compute reward
         reward = self._compute_reward()
@@ -1405,6 +1421,15 @@ class OptimizedBillboardEnv(gym.Env):
         success_rate = (metrics['total_ads_completed'] / max(1, metrics['total_ads_processed'])) * 100.0
         print(f"Success Rate: {success_rate:.1f}%")
         print(f"Total Revenue Generated: ${metrics['total_revenue']:.2f}")
+        influence_fulfilled = sum(a['cumulative_influence'] for a in self._completed_ads_log)
+        print(f"Total Influence Fulfilled: {influence_fulfilled:.2f}")
+        cost_completed = sum(a['total_cost_spent'] for a in self._completed_ads_log)
+        cost_tardy = sum(a['total_cost_spent'] for a in self._tardy_ads_log)
+        cost_active = sum(ad.total_cost_spent for ad in self.ads if ad.state == 0)
+        total_cost = cost_completed + cost_tardy + cost_active
+        profit = metrics['total_revenue'] - total_cost
+        print(f"Total Cost Spent (all ads): ${total_cost:.2f}")
+        print(f"Profit (Revenue - Total Cost): ${profit:.2f}")
         avg_util = self.utilization_sum / max(1, self.current_step) * 100
         print(f"Average Billboard Utilization: {avg_util:.1f}%")
         print(f"Total Placements: {len(self.placement_history)}")

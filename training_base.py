@@ -7,18 +7,22 @@ mode-specific configuration and calls train().
 """
 
 import os
+import time
 import platform
 import logging
 import warnings
 import random
 
 import torch
+from torch import nn
 import numpy as np
 import tianshou as ts
 from torch.utils.tensorboard import SummaryWriter
 from tianshou.utils import TensorboardLogger
 from tianshou.trainer import OnpolicyTrainer
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from tianshou.data import to_torch_as
+from tianshou.policy.modelfree.ppo import PPOTrainingStats
 
 from optimized_env import OptimizedBillboardEnv, EnvConfig
 from models import BillboardAllocatorGNN
@@ -26,6 +30,90 @@ from wrappers import NoGraphObsWrapper, GraphAwareActor, GraphAwareCritic
 
 logger = logging.getLogger(__name__)
 
+
+class RatioClampedPPOPolicy(ts.policy.PPOPolicy):
+    """PPOPolicy with hard ratio clamping to prevent catastrophic updates.
+
+    Standard PPO clips the *objective* but not the ratio itself. When policy
+    distributions become very sharp (near convergence), a single gradient step
+    can produce ratios of 1000+ that overwhelm the clipping mechanism.
+
+    This subclass hard-clamps the ratio BEFORE the surrogate loss computation,
+    preventing the catastrophic single-step policy death observed in MH mode
+    at epoch 95 (3190 → -13 in 2 epochs).
+    """
+
+    def __init__(self, *, ratio_clamp: float = 5.0, **kwargs):
+        super().__init__(**kwargs)
+        self.ratio_clamp = ratio_clamp
+
+    def learn(self, batch, batch_size, repeat, *args, **kwargs):
+        losses, clip_losses, vf_losses, ent_losses = [], [], [], []
+        gradient_steps = 0
+        split_batch_size = batch_size or -1
+        for step in range(repeat):
+            if self.recompute_adv and step > 0:
+                batch = self._compute_returns(batch, self._buffer, self._indices)
+            for minibatch in batch.split(split_batch_size, merge_last=True):
+                gradient_steps += 1
+                # Calculate loss for actor
+                advantages = minibatch.adv
+                dist = self(minibatch).dist
+                if self.norm_adv:
+                    mean, std = advantages.mean(), advantages.std()
+                    advantages = (advantages - mean) / (std + self._eps)
+                ratios = (dist.log_prob(minibatch.act) - minibatch.logp_old).exp().float()
+
+                # === HARD RATIO CLAMP (collapse prevention) ===
+                # Clamp ratio to [1/ratio_clamp, ratio_clamp] before loss.
+                # This prevents catastrophic updates when sharp distributions
+                # produce ratios >> eps_clip range [0.8, 1.2].
+                ratios = ratios.clamp(1.0 / self.ratio_clamp, self.ratio_clamp)
+
+                ratios = ratios.reshape(ratios.size(0), -1).transpose(0, 1)
+                surr1 = ratios * advantages
+                surr2 = ratios.clamp(1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantages
+                if self.dual_clip:
+                    clip1 = torch.min(surr1, surr2)
+                    clip2 = torch.max(clip1, self.dual_clip * advantages)
+                    clip_loss = -torch.where(advantages < 0, clip2, clip1).mean()
+                else:
+                    clip_loss = -torch.min(surr1, surr2).mean()
+                # Calculate loss for critic
+                value = self.critic(minibatch.obs).flatten()
+                if self.value_clip:
+                    v_clip = minibatch.v_s + (value - minibatch.v_s).clamp(
+                        -self.eps_clip,
+                        self.eps_clip,
+                    )
+                    vf1 = (minibatch.returns - value).pow(2)
+                    vf2 = (minibatch.returns - v_clip).pow(2)
+                    vf_loss = torch.max(vf1, vf2).mean()
+                else:
+                    vf_loss = (minibatch.returns - value).pow(2).mean()
+                # Calculate regularization and overall loss
+                ent_loss = dist.entropy().mean()
+                loss = clip_loss + self.vf_coef * vf_loss - self.ent_coef * ent_loss
+                self.optim.zero_grad()
+                loss.backward()
+                if self.max_grad_norm:
+                    nn.utils.clip_grad_norm_(
+                        self._actor_critic.parameters(),
+                        max_norm=self.max_grad_norm,
+                    )
+                self.optim.step()
+                clip_losses.append(clip_loss.item())
+                vf_losses.append(vf_loss.item())
+                ent_losses.append(ent_loss.item())
+                losses.append(loss.item())
+
+        return PPOTrainingStats.from_sequences(
+            losses=losses,
+            clip_losses=clip_losses,
+            vf_losses=vf_losses,
+            ent_losses=ent_losses,
+            gradient_steps=gradient_steps,
+        )
 
 
 def setup_logging():
@@ -90,6 +178,9 @@ MODE_DEFAULTS = {
         "dropout": 0.1,
         "deterministic_eval": False,  # Stochastic to avoid billboard collisions
         "ent_coef": 0.01,  # Compensate for /MAX_ADS normalization in log_prob (base 0.001 * 20 / 2)
+        "entropy_floor": 0.05,      # Moderate: 20 decisions, lower collapse risk than MH
+        "ratio_clamp": 10.0,        # Moderate: wider than MH since NA is more stable
+        "lr_eta_min_mult": 0.1,     # CosineAnnealingLR eta_min = lr * this
     },
     "mh": {
         "discount_factor": 0.99,
@@ -102,6 +193,9 @@ MODE_DEFAULTS = {
         "dropout": 0.1,
         "deterministic_eval": False,  # Stochastic to avoid billboard collisions
         "ent_coef": 0.02,  # Compensate for /(2*MAX_ADS) normalization in log_prob (base 0.001 * 40 / 2)
+        "entropy_floor": 0.1,       # Aggressive: 40 decisions, highest collapse risk
+        "ratio_clamp": 5.0,         # Aggressive: tightest clamp for autoregressive structure
+        "lr_eta_min_mult": 0.05,    # Deeper LR decay: cosine to lr * 0.05 (5e-5 from 1e-3)
     },
     "ea": {
         "discount_factor": 0.99,
@@ -114,6 +208,9 @@ MODE_DEFAULTS = {
         "dropout": 0.15,
         "deterministic_eval": False,  # Stochastic for TopK exploration
         "ent_coef": 0.01,  # Compensate for /MAX_ADS normalization in log_prob (base 0.001 * 20 / 2)
+        "entropy_floor": 0.05,      # Moderate: same as NA (20 decisions)
+        "ratio_clamp": 10.0,        # Moderate: same as NA
+        "lr_eta_min_mult": 0.1,     # Standard LR decay
     },
     "sequential": {
         "discount_factor": 0.99,
@@ -127,6 +224,9 @@ MODE_DEFAULTS = {
         "use_attention": False,      # Simpler is better for single-ad scoring
         "dropout": 0.1,
         "deterministic_eval": False,
+        "entropy_floor": 0.0,       # None: single decision, no ratio explosion
+        "ratio_clamp": 0.0,         # 0.0 = disabled (use standard PPOPolicy)
+        "lr_eta_min_mult": 0.1,
     },
 }
 
@@ -193,19 +293,19 @@ def create_vectorized_envs(env_config: dict, n_envs: int, force_dummy: bool = Fa
 
 
 
-def get_dist_fn(mode: str, max_ads: int, n_billboards: int = 0):
+def get_dist_fn(mode: str, max_ads: int, n_billboards: int = 0, entropy_floor: float = 0.0):
     """Get the distribution function for a given mode."""
     if mode == 'na':
         from distributions import create_per_ad_dist_fn
-        return create_per_ad_dist_fn(max_ads, n_billboards)
+        return create_per_ad_dist_fn(max_ads, n_billboards, entropy_floor=entropy_floor)
 
     elif mode == 'mh':
         from distributions import create_multi_head_dist_fn
-        return create_multi_head_dist_fn(max_ads, n_billboards)
+        return create_multi_head_dist_fn(max_ads, n_billboards, entropy_floor=entropy_floor)
 
     elif mode == 'ea':
         from distributions import create_per_ad_dist_fn
-        return create_per_ad_dist_fn(max_ads, n_billboards)
+        return create_per_ad_dist_fn(max_ads, n_billboards, entropy_floor=entropy_floor)
 
     elif mode == 'sequential':
         # Standard Categorical — single billboard choice per sub-step
@@ -248,10 +348,11 @@ def create_model(mode: str, train_config: dict, n_billboards: int,
         lr=train_config["lr"],
         eps=1e-5
     )
+    lr_eta_min_mult = train_config.get("lr_eta_min_mult", 0.1)
     lr_scheduler = CosineAnnealingLR(
         optimizer,
         T_max=train_config["max_epoch"],
-        eta_min=train_config["lr"] * 0.1
+        eta_min=train_config["lr"] * lr_eta_min_mult
     )
 
     return shared_model, actor, critic, optimizer, lr_scheduler, model_config
@@ -306,15 +407,23 @@ def eval_business_metrics(policy, env_factory, epoch, step_idx,
     eval_env.close()
 
 
+def _get_base_env(env):
+    """Traverse wrapper chain to get the base OptimizedBillboardEnv."""
+    base = env
+    while hasattr(base, 'env'):
+        base = base.env
+    return base
+
+
 def run_post_training_eval(policy, env_factory, mode_name, best_model_path=None,
-                           shared_model=None):
-    """Run a full post-training evaluation episode using the best saved model.
+                           shared_model=None, n_episodes=5):
+    """Run multi-episode post-training evaluation using the best saved model.
 
     If best_model_path is provided and exists, loads those weights before eval
     so we evaluate the best checkpoint, not the potentially degraded final weights.
     """
     logger.info("=" * 60)
-    logger.info("POST-TRAINING EVALUATION")
+    logger.info(f"POST-TRAINING EVALUATION ({n_episodes} episodes)")
     logger.info("=" * 60)
 
     # Load best checkpoint weights if available
@@ -330,56 +439,96 @@ def run_post_training_eval(policy, env_factory, mode_name, best_model_path=None,
     else:
         logger.info("No best checkpoint available — evaluating final weights.")
 
-    logger.info("Running full episode with trained policy...")
+    all_metrics = {
+        'reward': [], 'success_rate': [], 'revenue': [],
+        'utilization': [], 'influence': [], 'profit': [],
+        'completed': [], 'processed': [], 'episode_time': [],
+    }
 
     try:
         eval_env = env_factory()
-        obs, info = eval_env.reset()
 
-        total_reward = 0.0
-        step_count = 0
-        done = False
+        for ep in range(n_episodes):
+            ep_start = time.time()
+            obs, info = eval_env.reset(seed=42 + ep)
 
-        while not done:
-            with torch.no_grad():
-                batch = ts.data.Batch(obs=[obs], info=[{}])
-                result_batch = policy(batch)
-                action = result_batch.act[0]
-                if hasattr(action, 'cpu'):
-                    action = action.cpu().numpy()
-                if hasattr(action, 'item') and action.size == 1:
-                    action = action.item()
+            total_reward = 0.0
+            step_count = 0
+            done = False
 
-            obs, reward, terminated, truncated, info = eval_env.step(action)
-            total_reward += reward
-            step_count += 1
-            done = terminated or truncated
+            while not done:
+                with torch.no_grad():
+                    batch = ts.data.Batch(obs=[obs], info=[{}])
+                    result_batch = policy(batch)
+                    action = result_batch.act[0]
+                    if hasattr(action, 'cpu'):
+                        action = action.cpu().numpy()
+                    if hasattr(action, 'item') and action.size == 1:
+                        action = action.item()
 
-        logger.info("")
-        logger.info("Environment Performance Metrics:")
-        logger.info("-" * 40)
+                obs, reward, terminated, truncated, info = eval_env.step(action)
+                total_reward += reward
+                step_count += 1
+                done = terminated or truncated
 
-        # Traverse wrapper chain to get the base OptimizedBillboardEnv
-        base_env = eval_env
-        while hasattr(base_env, 'env'):
-            base_env = base_env.env
-        base_env.render_summary()
+            ep_time = time.time() - ep_start
+            base_env = _get_base_env(eval_env)
+            m = base_env.performance_metrics
+            completed = m['total_ads_completed']
+            processed = m['total_ads_processed']
+            success_rate = (completed / max(1, processed)) * 100.0
+            revenue = m['total_revenue']
+            util = base_env.utilization_sum / max(1, base_env.current_step) * 100
+            influence = sum(a['cumulative_influence'] for a in base_env._completed_ads_log)
+            cost_completed = sum(a['total_cost_spent'] for a in base_env._completed_ads_log)
+            cost_tardy = sum(a['total_cost_spent'] for a in base_env._tardy_ads_log)
+            cost_active = sum(ad.total_cost_spent for ad in base_env.ads if ad.state == 0)
+            total_cost = cost_completed + cost_tardy + cost_active
+            profit = revenue - total_cost
 
-        logger.info("")
-        logger.info("Episode Statistics:")
-        logger.info(f"  - Total steps: {step_count}")
-        logger.info(f"  - Total reward: {total_reward:.4f}")
-        logger.info(f"  - Avg reward/step: {total_reward / max(1, step_count):.6f}")
+            all_metrics['reward'].append(total_reward)
+            all_metrics['success_rate'].append(success_rate)
+            all_metrics['revenue'].append(revenue)
+            all_metrics['utilization'].append(util)
+            all_metrics['influence'].append(influence)
+            all_metrics['profit'].append(profit)
+            all_metrics['completed'].append(completed)
+            all_metrics['processed'].append(processed)
+            all_metrics['episode_time'].append(ep_time)
 
-        if info:
-            logger.info(f"  - Final info: {info}")
+            logger.info(
+                f"Ep {ep+1}: Success={success_rate:.1f}% ({completed}/{processed}), "
+                f"Rev=${revenue:.0f}, Profit=${profit:.0f}, "
+                f"Influence={influence:.0f}, Util={util:.1f}%, "
+                f"Reward={total_reward:.1f}, Time={ep_time:.1f}s"
+            )
+
+            # Print full summary for last episode only
+            if ep == n_episodes - 1:
+                logger.info("")
+                logger.info("Last Episode Details:")
+                logger.info("-" * 40)
+                base_env.render_summary()
 
         eval_env.close()
+
+        # Averaged summary
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info(f"EVALUATION SUMMARY ({n_episodes} episodes)")
+        logger.info("=" * 60)
+        logger.info(f"  Reward:       {np.mean(all_metrics['reward']):.1f} ± {np.std(all_metrics['reward']):.1f}")
+        logger.info(f"  Success Rate: {np.mean(all_metrics['success_rate']):.1f}% ± {np.std(all_metrics['success_rate']):.1f}%")
+        logger.info(f"  Revenue:      ${np.mean(all_metrics['revenue']):.0f} ± ${np.std(all_metrics['revenue']):.0f}")
+        logger.info(f"  Profit:       ${np.mean(all_metrics['profit']):.0f} ± ${np.std(all_metrics['profit']):.0f}")
+        logger.info(f"  Influence:    {np.mean(all_metrics['influence']):.0f} ± {np.std(all_metrics['influence']):.0f}")
+        logger.info(f"  Utilization:  {np.mean(all_metrics['utilization']):.1f}% ± {np.std(all_metrics['utilization']):.1f}%")
+        logger.info(f"  Avg Ep Time:  {np.mean(all_metrics['episode_time']):.1f}s")
+        logger.info("=" * 60)
 
     except Exception as e:
         logger.error(f"Post-training evaluation failed: {e}")
         import traceback
-        traceback.print_exc()
         traceback.print_exc()
 
 
@@ -426,9 +575,11 @@ def train(mode: str, env_config: dict = None, train_config: dict = None):
     shared_model, actor, critic, optimizer, lr_scheduler, model_config = \
         create_model(mode, train_config, n_billboards, max_ads, graph_numpy, device)
 
-    dist_fn = get_dist_fn(mode, max_ads, n_billboards)
+    entropy_floor = train_config.get("entropy_floor", 0.0)
+    dist_fn = get_dist_fn(mode, max_ads, n_billboards, entropy_floor=entropy_floor)
 
-    policy = ts.policy.PPOPolicy(
+    ratio_clamp = train_config.get("ratio_clamp", 0.0)
+    ppo_kwargs = dict(
         actor=actor,
         critic=critic,
         optim=optimizer,
@@ -443,8 +594,17 @@ def train(mode: str, env_config: dict = None, train_config: dict = None):
         eps_clip=train_config["eps_clip"],
         value_clip=True,
         deterministic_eval=train_config.get("deterministic_eval", True),
-        lr_scheduler=lr_scheduler
+        lr_scheduler=lr_scheduler,
     )
+
+    if ratio_clamp > 0:
+        policy = RatioClampedPPOPolicy(ratio_clamp=ratio_clamp, **ppo_kwargs)
+        logger.info(f"  Using RatioClampedPPOPolicy (clamp={ratio_clamp})")
+    else:
+        policy = ts.policy.PPOPolicy(**ppo_kwargs)
+
+    if entropy_floor > 0:
+        logger.info(f"  Entropy floor: {entropy_floor}")
 
     train_collector = ts.data.Collector(
         policy,
