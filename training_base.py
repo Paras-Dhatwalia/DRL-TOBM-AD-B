@@ -31,21 +31,28 @@ from wrappers import NoGraphObsWrapper, GraphAwareActor, GraphAwareCritic
 logger = logging.getLogger(__name__)
 
 
-class RatioClampedPPOPolicy(ts.policy.PPOPolicy):
-    """PPOPolicy with hard ratio clamping to prevent catastrophic updates.
+class EntropySafePPOPolicy(ts.policy.PPOPolicy):
+    """PPOPolicy with an entropy penalty that maintains gradient when entropy is low.
 
-    Standard PPO clips the *objective* but not the ratio itself. When policy
-    distributions become very sharp (near convergence), a single gradient step
-    can produce ratios of 1000+ that overwhelm the clipping mechanism.
+    Standard PPO includes an entropy bonus (-ent_coef * entropy) that encourages
+    exploration. However when entropy drops near zero (sharp policy), the entropy
+    bonus contribution to the gradient is tiny (ent_coef * near-zero entropy ≈ 0)
+    and does not prevent further sharpening.
 
-    This subclass hard-clamps the ratio BEFORE the surrogate loss computation,
-    preventing the catastrophic single-step policy death observed in MH mode
-    at epoch 95 (3190 → -13 in 2 epochs).
+    This subclass adds a separate penalty term to the loss:
+        loss += entropy_penalty_coef * relu(entropy_floor - entropy)
+
+    This penalty is zero above the floor (no interference with normal training)
+    and provides an ADDITIONAL gradient push when entropy drops below the floor.
+    Critically, it uses the raw unmodified entropy, so the gradient always flows
+    through the model parameters — unlike torch.clamp(entropy, min=floor) which
+    returns a constant and kills the gradient entirely.
     """
 
-    def __init__(self, *, ratio_clamp: float = 5.0, **kwargs):
+    def __init__(self, *, entropy_floor: float = 0.0, entropy_penalty_coef: float = 1.0, **kwargs):
         super().__init__(**kwargs)
-        self.ratio_clamp = ratio_clamp
+        self.entropy_floor = entropy_floor
+        self.entropy_penalty_coef = entropy_penalty_coef
 
     def learn(self, batch, batch_size, repeat, *args, **kwargs):
         losses, clip_losses, vf_losses, ent_losses = [], [], [], []
@@ -63,13 +70,6 @@ class RatioClampedPPOPolicy(ts.policy.PPOPolicy):
                     mean, std = advantages.mean(), advantages.std()
                     advantages = (advantages - mean) / (std + self._eps)
                 ratios = (dist.log_prob(minibatch.act) - minibatch.logp_old).exp().float()
-
-                # === HARD RATIO CLAMP (collapse prevention) ===
-                # Clamp ratio to [1/ratio_clamp, ratio_clamp] before loss.
-                # This prevents catastrophic updates when sharp distributions
-                # produce ratios >> eps_clip range [0.8, 1.2].
-                ratios = ratios.clamp(1.0 / self.ratio_clamp, self.ratio_clamp)
-
                 ratios = ratios.reshape(ratios.size(0), -1).transpose(0, 1)
                 surr1 = ratios * advantages
                 surr2 = ratios.clamp(1.0 - self.eps_clip, 1.0 + self.eps_clip) * advantages
@@ -91,9 +91,17 @@ class RatioClampedPPOPolicy(ts.policy.PPOPolicy):
                     vf_loss = torch.max(vf1, vf2).mean()
                 else:
                     vf_loss = (minibatch.returns - value).pow(2).mean()
-                # Calculate regularization and overall loss
+                # Entropy: raw value (gradient flows through model params)
                 ent_loss = dist.entropy().mean()
                 loss = clip_loss + self.vf_coef * vf_loss - self.ent_coef * ent_loss
+                # Entropy penalty: kicks in only below floor, maintains gradient.
+                # relu(floor - ent_loss) is > 0 when entropy too low, providing
+                # an extra push (beyond ent_coef) to restore exploration.
+                if self.entropy_floor > 0:
+                    entropy_penalty = torch.relu(
+                        torch.tensor(self.entropy_floor, device=ent_loss.device) - ent_loss
+                    )
+                    loss = loss + self.entropy_penalty_coef * entropy_penalty
                 self.optim.zero_grad()
                 loss.backward()
                 if self.max_grad_norm:
@@ -178,9 +186,9 @@ MODE_DEFAULTS = {
         "dropout": 0.1,
         "deterministic_eval": False,  # Stochastic to avoid billboard collisions
         "ent_coef": 0.01,  # Compensate for /MAX_ADS normalization in log_prob (base 0.001 * 20 / 2)
-        "entropy_floor": 0.05,      # Moderate: 20 decisions, lower collapse risk than MH
-        "ratio_clamp": 10.0,        # Moderate: wider than MH since NA is more stable
-        "lr_eta_min_mult": 0.1,     # CosineAnnealingLR eta_min = lr * this
+        "entropy_floor": 0.05,          # Penalty kicks in when entropy drops below this
+        "entropy_penalty_coef": 1.0,    # Penalty strength (adds to loss: coef * relu(floor - entropy))
+        "lr_eta_min_mult": 0.1,         # CosineAnnealingLR eta_min = lr * this
     },
     "mh": {
         "discount_factor": 0.99,
@@ -193,9 +201,9 @@ MODE_DEFAULTS = {
         "dropout": 0.1,
         "deterministic_eval": False,  # Stochastic to avoid billboard collisions
         "ent_coef": 0.02,  # Compensate for /(2*MAX_ADS) normalization in log_prob (base 0.001 * 40 / 2)
-        "entropy_floor": 0.1,       # Aggressive: 40 decisions, highest collapse risk
-        "ratio_clamp": 5.0,         # Aggressive: tightest clamp for autoregressive structure
-        "lr_eta_min_mult": 0.05,    # Deeper LR decay: cosine to lr * 0.05 (5e-5 from 1e-3)
+        "entropy_floor": 0.1,           # Higher floor: 40 decisions, highest collapse risk
+        "entropy_penalty_coef": 1.0,    # Same coefficient; floor difference drives stronger protection
+        "lr_eta_min_mult": 0.05,        # Deeper LR decay: cosine to lr * 0.05 (5e-5 from 1e-3)
     },
     "ea": {
         "discount_factor": 0.99,
@@ -208,9 +216,9 @@ MODE_DEFAULTS = {
         "dropout": 0.15,
         "deterministic_eval": False,  # Stochastic for TopK exploration
         "ent_coef": 0.01,  # Compensate for /MAX_ADS normalization in log_prob (base 0.001 * 20 / 2)
-        "entropy_floor": 0.05,      # Moderate: same as NA (20 decisions)
-        "ratio_clamp": 10.0,        # Moderate: same as NA
-        "lr_eta_min_mult": 0.1,     # Standard LR decay
+        "entropy_floor": 0.05,          # Same as NA (20 decisions)
+        "entropy_penalty_coef": 1.0,
+        "lr_eta_min_mult": 0.1,         # Standard LR decay
     },
     "sequential": {
         "discount_factor": 0.99,
@@ -224,8 +232,8 @@ MODE_DEFAULTS = {
         "use_attention": False,      # Simpler is better for single-ad scoring
         "dropout": 0.1,
         "deterministic_eval": False,
-        "entropy_floor": 0.0,       # None: single decision, no ratio explosion
-        "ratio_clamp": 0.0,         # 0.0 = disabled (use standard PPOPolicy)
+        "entropy_floor": 0.0,        # Disabled: single decision, no collapse risk
+        "entropy_penalty_coef": 0.0,
         "lr_eta_min_mult": 0.1,
     },
 }
@@ -293,22 +301,21 @@ def create_vectorized_envs(env_config: dict, n_envs: int, force_dummy: bool = Fa
 
 
 
-def get_dist_fn(mode: str, max_ads: int, n_billboards: int = 0, entropy_floor: float = 0.0):
+def get_dist_fn(mode: str, max_ads: int, n_billboards: int = 0):
     """Get the distribution function for a given mode."""
     if mode == 'na':
         from distributions import create_per_ad_dist_fn
-        return create_per_ad_dist_fn(max_ads, n_billboards, entropy_floor=entropy_floor)
+        return create_per_ad_dist_fn(max_ads, n_billboards)
 
     elif mode == 'mh':
         from distributions import create_multi_head_dist_fn
-        return create_multi_head_dist_fn(max_ads, n_billboards, entropy_floor=entropy_floor)
+        return create_multi_head_dist_fn(max_ads, n_billboards)
 
     elif mode == 'ea':
         from distributions import create_per_ad_dist_fn
-        return create_per_ad_dist_fn(max_ads, n_billboards, entropy_floor=entropy_floor)
+        return create_per_ad_dist_fn(max_ads, n_billboards)
 
     elif mode == 'sequential':
-        # Standard Categorical — single billboard choice per sub-step
         import torch
         return lambda logits: torch.distributions.Categorical(logits=logits)
 
@@ -580,10 +587,10 @@ def train(mode: str, env_config: dict = None, train_config: dict = None):
     shared_model, actor, critic, optimizer, lr_scheduler, model_config = \
         create_model(mode, train_config, n_billboards, max_ads, graph_numpy, device)
 
-    entropy_floor = train_config.get("entropy_floor", 0.0)
-    dist_fn = get_dist_fn(mode, max_ads, n_billboards, entropy_floor=entropy_floor)
+    dist_fn = get_dist_fn(mode, max_ads, n_billboards)
 
-    ratio_clamp = train_config.get("ratio_clamp", 0.0)
+    entropy_floor = train_config.get("entropy_floor", 0.0)
+    entropy_penalty_coef = train_config.get("entropy_penalty_coef", 0.0)
     ppo_kwargs = dict(
         actor=actor,
         critic=critic,
@@ -602,14 +609,15 @@ def train(mode: str, env_config: dict = None, train_config: dict = None):
         lr_scheduler=lr_scheduler,
     )
 
-    if ratio_clamp > 0:
-        policy = RatioClampedPPOPolicy(ratio_clamp=ratio_clamp, **ppo_kwargs)
-        logger.info(f"  Using RatioClampedPPOPolicy (clamp={ratio_clamp})")
+    if entropy_floor > 0:
+        policy = EntropySafePPOPolicy(
+            entropy_floor=entropy_floor,
+            entropy_penalty_coef=entropy_penalty_coef,
+            **ppo_kwargs
+        )
+        logger.info(f"  Using EntropySafePPOPolicy (floor={entropy_floor}, penalty_coef={entropy_penalty_coef})")
     else:
         policy = ts.policy.PPOPolicy(**ppo_kwargs)
-
-    if entropy_floor > 0:
-        logger.info(f"  Entropy floor: {entropy_floor}")
 
     train_collector = ts.data.Collector(
         policy,

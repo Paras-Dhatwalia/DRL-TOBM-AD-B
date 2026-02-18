@@ -20,7 +20,7 @@ import tianshou as ts
 
 from training_base import (
     setup_logging, get_config, create_env, create_model,
-    get_dist_fn, run_post_training_eval, RatioClampedPPOPolicy, set_global_seed, SEED
+    get_dist_fn, run_post_training_eval, EntropySafePPOPolicy, set_global_seed, SEED
 )
 
 
@@ -72,10 +72,10 @@ def main():
     shared_model, actor, critic, optimizer, lr_scheduler, model_config = \
         create_model(args.mode, train_config, n_billboards, max_ads, graph_numpy, device)
 
-    entropy_floor = train_config.get("entropy_floor", 0.0)
-    dist_fn = get_dist_fn(args.mode, max_ads, n_billboards, entropy_floor=entropy_floor)
+    dist_fn = get_dist_fn(args.mode, max_ads, n_billboards)
 
-    ratio_clamp = train_config.get("ratio_clamp", 0.0)
+    entropy_floor = train_config.get("entropy_floor", 0.0)
+    entropy_penalty_coef = train_config.get("entropy_penalty_coef", 0.0)
     ppo_kwargs = dict(
         actor=actor,
         critic=critic,
@@ -94,8 +94,12 @@ def main():
         lr_scheduler=lr_scheduler,
     )
 
-    if ratio_clamp > 0:
-        policy = RatioClampedPPOPolicy(ratio_clamp=ratio_clamp, **ppo_kwargs)
+    if entropy_floor > 0:
+        policy = EntropySafePPOPolicy(
+            entropy_floor=entropy_floor,
+            entropy_penalty_coef=entropy_penalty_coef,
+            **ppo_kwargs
+        )
     else:
         policy = ts.policy.PPOPolicy(**ppo_kwargs)
 
