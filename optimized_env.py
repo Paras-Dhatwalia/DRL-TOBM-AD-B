@@ -1,4 +1,3 @@
-# OPTIMIZED DYNABILLBOARD ENVIRONMENT
 from __future__ import annotations
 import math
 import random
@@ -101,7 +100,7 @@ def time_str_to_minutes(v: Any) -> int:
 def haversine_distance_vectorized(lat1: np.ndarray, lon1: np.ndarray, 
                                   lat2: np.ndarray, lon2: np.ndarray) -> np.ndarray:
     """Vectorized haversine distance calculation between points in meters."""
-    R = 6371000.0  # Earth radius in meters
+    R = 6371000.0
     
     # Convert to radians
     lat1_rad = np.radians(lat1)
@@ -122,20 +121,18 @@ def validate_csv(df: pd.DataFrame, required_columns: List[str], csv_name: str):
         raise ValueError(f"{csv_name} missing required columns: {missing}")
 
 class Ad:
-    """Represents an advertisement with demand and payment attributes."""
-
     def __init__(self, aid: int, demand: float, payment: float,
                  payment_demand_ratio: float, ttl: int = 15):
         self.aid = aid
         self.demand = float(demand)
-        self.payment = float(payment)  # Total budget available
+        self.payment = float(payment) 
         self.remaining_budget = float(payment)
         self.total_cost_spent = 0.0
         self.payment_demand_ratio = float(payment_demand_ratio)
         self.ttl = ttl
         self.original_ttl = ttl
-        self.state = 0  # 0: ongoing, 1: finished, 2: tardy/expired, 3: budget exhausted
-        self.assigned_billboards: Set[int] = set()  # Use set for O(1) operations
+        self.state = 0  
+        self.assigned_billboards: Set[int] = set()  
         self.time_active = 0
         self.cumulative_influence = 0.0
         self.spawn_step: Optional[int] = None
@@ -151,12 +148,7 @@ class Ad:
                 self.state = 2  # tardy / failed
 
     def assign_billboard(self, b_id: int, billboard_cost: float) -> bool:
-        """
-        Assign a billboard to this ad if budget allows.
-
-        Returns:
-            True if assignment successful, False if can't afford
-        """
+        """  Assign a billboard to this ad if budget allows."""
         if self.remaining_budget >= billboard_cost:
             self.assigned_billboards.add(b_id)
             self.remaining_budget -= billboard_cost
@@ -175,13 +167,11 @@ class Ad:
         """Normalized payment ratio using sigmoid function."""
         return 1.0 / (1.0 + math.exp(-(self.payment_demand_ratio - 1.0)))
 
-    # Scaling constants for inference-stable normalization
     # These ensure all features are in [0, 1] regardless of batch size
-    # Values from Advertiser_100.csv: Demand=100-149, Payment=90k-161k, Ratio=902-1099
-    MAX_DEMAND = 10000.0       # Demand range: ~6000 max
-    MAX_PAYMENT = 10000000.0   # Payment range: ~6M max
-    MAX_RATIO = 1500.0         # Ratio range: ~1100 max
-    MAX_BILLBOARDS = 50.0      # Max billboards per ad
+    MAX_DEMAND = 10000.0       
+    MAX_PAYMENT = 10000000.0  
+    MAX_RATIO = 1500.0     
+    MAX_BILLBOARDS = 50.0  
 
     def get_feature_vector(self) -> np.ndarray:
         """Get feature vector for this ad (12 features, all normalized to [0, 1]).

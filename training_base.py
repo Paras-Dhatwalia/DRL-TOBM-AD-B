@@ -365,6 +365,8 @@ def eval_business_metrics(policy, env_factory, epoch, step_idx,
     if epoch % eval_interval != 0:
         return
 
+    policy.eval()  # Disable dropout for evaluation
+
     eval_env = env_factory()
     obs, info = eval_env.reset()
 
@@ -405,6 +407,7 @@ def eval_business_metrics(policy, env_factory, epoch, step_idx,
     )
 
     eval_env.close()
+    policy.train()  # Restore training mode for ongoing training
 
 
 def _get_base_env(env):
@@ -444,6 +447,8 @@ def run_post_training_eval(policy, env_factory, mode_name, best_model_path=None,
         'utilization': [], 'influence': [], 'profit': [],
         'completed': [], 'processed': [], 'episode_time': [],
     }
+
+    policy.eval()  # Disable dropout for evaluation
 
     try:
         eval_env = env_factory()
