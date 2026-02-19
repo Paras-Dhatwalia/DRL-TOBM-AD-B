@@ -225,7 +225,9 @@ class AttentionModule(nn.Module):
             Attended features with residual connection and normalization
         """
         
-        attn_out, attn_weights = self.attention(query, key, value, key_padding_mask=mask)
+        # need_weights=False enables Flash Attention kernel (O(1) memory instead of O(n²))
+        # attn_weights was already discarded — pure memory saving, no behavioral change
+        attn_out, _ = self.attention(query, key, value, key_padding_mask=mask, need_weights=False)
         
         # Apply residual connection and layer normalization
         output = self.norm(query + attn_out)
@@ -518,6 +520,28 @@ class BillboardAllocatorGNN(nn.Module):
     # Max samples per super-graph chunk (prevents OOM on dense graphs)
     _GNN_CHUNK_SIZE = 32
 
+    def _get_forward_chunk_size(self) -> int:
+        """Compute chunk size for the top-level forward pass based on n_billboards and mode.
+
+        Keeps peak GPU memory under ~2GB per chunk:
+        - EA, NYC (444): 32 — identical to previous hardcoded CHUNK_SIZE
+        - EA, LA (1483): 9
+        - NA/MH, NYC: 64 (clamped)
+        - NA/MH, LA: 19
+
+        EA is heaviest: creates (chunk × max_ads × n_billboards × dim) all-pairs tensor.
+        NA/MH loop per-ad: only (chunk × n_billboards × dim) per iteration — 2× budget.
+        """
+        # Base calibration: 32 chunks × 444 billboards worked for EA on 16GB A4000
+        base_budget = 32 * 444  # ~14K "billboard-samples" fits in ~2GB for EA
+
+        if self.mode == 'ea':
+            chunk = base_budget // self.n_billboards
+        else:  # na, mh — lighter per-step, can afford 2× more
+            chunk = (base_budget * 2) // self.n_billboards
+
+        return max(4, min(chunk, 64))  # clamp to [4, 64]
+
     def _batch_gnn_encode(self, nodes: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         """
         Batched GNN encoding via super-graph construction.
@@ -547,11 +571,14 @@ class BillboardAllocatorGNN(nn.Module):
             flat_out = torch.cat([flat_out, raw_features], dim=-1)  # (N, 394+10)
             return flat_out.unsqueeze(0)
 
-        # Chunk large batches to prevent OOM on dense graphs
-        if batch_size > self._GNN_CHUNK_SIZE:
+        # Chunk large batches to prevent OOM on dense graphs.
+        # Dynamic chunk size: scales inversely with n_billboards (safety net —
+        # forward() already feeds small chunks, so this rarely triggers).
+        gnn_chunk = max(4, min(32, 32 * 444 // max(n_nodes, 1)))
+        if batch_size > gnn_chunk:
             chunks = []
-            for i in range(0, batch_size, self._GNN_CHUNK_SIZE):
-                chunk = self._batch_gnn_encode(nodes[i:i + self._GNN_CHUNK_SIZE], edge_index)
+            for i in range(0, batch_size, gnn_chunk):
+                chunk = self._batch_gnn_encode(nodes[i:i + gnn_chunk], edge_index)
                 chunks.append(chunk)
             return torch.cat(chunks, dim=0)
 
@@ -603,7 +630,7 @@ class BillboardAllocatorGNN(nn.Module):
             log_input_statistics(observations, self.mode)
         
         batch_size = observations['graph_nodes'].shape[0]
-        
+
         if info.get('preprocess', True):
             observations = preprocess_observations(observations)
 
@@ -613,34 +640,95 @@ class BillboardAllocatorGNN(nn.Module):
         # All samples share the same graph topology
         edge_index = observations['graph_edge_links'][0].to(device).long()
 
+        # TOP-LEVEL CHUNKING: Process GNN + actor together per chunk to prevent OOM.
+        # billboard_embeds is (batch, n_billboards, 404) — for LA (1483 billboards) with
+        # full buffer (11520+ samples), this would be 27.7 GB without chunking.
+        chunk_size = self._get_forward_chunk_size()
+
+        if batch_size <= chunk_size:
+            # Small batch (normal inference, single env step) — process directly
+            probs, new_state = self._forward_unchunked(
+                observations, edge_index, batch_size, state, info
+            )
+        elif self.mode == 'sequential':
+            # Sequential mode is unused — fallback to unchunked (no LA support needed)
+            probs, new_state = self._forward_unchunked(
+                observations, edge_index, batch_size, state, info
+            )
+        else:
+            # Large batch (GAE / PPO update) — chunk entire pipeline
+            all_outputs = []
+            nodes = observations['graph_nodes'].float()
+            mask = observations['mask'].bool()
+
+            for start in range(0, batch_size, chunk_size):
+                end = min(start + chunk_size, batch_size)
+                chunk_bs = end - start
+
+                # GNN encode this chunk only
+                chunk_bb_embeds = self._batch_gnn_encode(nodes[start:end], edge_index)
+
+                # Per-chunk NaN/inf clamp (aggr='mean' can still produce NaN on degenerate inputs)
+                if torch.isnan(chunk_bb_embeds).any() or torch.isinf(chunk_bb_embeds).any():
+                    chunk_bb_embeds = torch.nan_to_num(chunk_bb_embeds, nan=0.0, posinf=1e6, neginf=-1e6)
+
+                chunk_mask = mask[start:end]
+
+                # Slice mode-specific observations
+                chunk_obs = {'ad_features': observations['ad_features'][start:end]}
+                if self.mode == 'ea' and 'edge_features' in observations:
+                    chunk_obs['edge_features'] = observations['edge_features'][start:end]
+
+                # Actor forward on this chunk (no further sub-chunking needed)
+                if self.mode == 'na':
+                    out, _ = self._forward_na_fixed(
+                        chunk_bb_embeds, chunk_obs, chunk_mask, chunk_bs, state, info
+                    )
+                elif self.mode == 'ea':
+                    out, _ = self._forward_ea_fixed(
+                        chunk_bb_embeds, chunk_obs, chunk_mask, chunk_bs, state, info
+                    )
+                elif self.mode == 'mh':
+                    out, _ = self._forward_mh_fixed(
+                        chunk_bb_embeds, chunk_obs, chunk_mask, chunk_bs, state, info
+                    )
+
+                all_outputs.append(out)
+
+            probs = torch.cat(all_outputs, dim=0)
+            new_state = state  # PPO is non-recurrent
+
+        # Optional output statistics logging
+        if logger.isEnabledFor(logging.DEBUG):
+            self._log_output_statistics(probs, observations['mask'].bool())
+
+        return probs, new_state
+        
+    def _forward_unchunked(self, observations: Dict[str, torch.Tensor],
+                           edge_index: torch.Tensor, batch_size: int,
+                           state: Optional[torch.Tensor],
+                           info: Dict[str, Any]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Direct (unchunked) forward pass for small batches (inference, single env step)."""
         billboard_embeds = self._batch_gnn_encode(
             observations['graph_nodes'].float(), edge_index
         )
 
         # Clamp extreme values from GNN to prevent NaN propagation downstream.
-        # GIN convolutions sum neighbor features across high-degree nodes, which
-        # can produce inf/NaN after 3 layers on dense graphs (444 nodes, ~100K edges).
         if torch.isnan(billboard_embeds).any() or torch.isinf(billboard_embeds).any():
             billboard_embeds = torch.nan_to_num(billboard_embeds, nan=0.0, posinf=1e6, neginf=-1e6)
 
         mask = observations['mask'].bool()
-        
+
         if self.mode == 'na':
-            probs, new_state = self._forward_na_fixed(billboard_embeds, observations, mask, batch_size, state, info)
+            return self._forward_na_fixed(billboard_embeds, observations, mask, batch_size, state, info)
         elif self.mode == 'ea':
-            probs, new_state = self._forward_ea_fixed(billboard_embeds, observations, mask, batch_size, state, info)
+            return self._forward_ea_fixed(billboard_embeds, observations, mask, batch_size, state, info)
         elif self.mode == 'mh':
-            probs, new_state = self._forward_mh_fixed(billboard_embeds, observations, mask, batch_size, state, info)
+            return self._forward_mh_fixed(billboard_embeds, observations, mask, batch_size, state, info)
         elif self.mode == 'sequential':
-            probs, new_state = self._forward_sequential(billboard_embeds, observations, mask, batch_size, state, info)
+            return self._forward_sequential(billboard_embeds, observations, mask, batch_size, state, info)
         else:
             raise ValueError(f"Unsupported mode: {self.mode}")
-        
-        # Optional output statistics logging
-        if logger.isEnabledFor(logging.DEBUG):
-            self._log_output_statistics(probs, mask)
-        
-        return probs, new_state
     
     def _forward_na_fixed(self, billboard_embeds: torch.Tensor, observations: Dict[str, torch.Tensor],
                          mask: torch.Tensor, batch_size: int, state: Optional[torch.Tensor],
@@ -704,43 +792,11 @@ class BillboardAllocatorGNN(nn.Module):
         - influence_score: Billboard's reach potential
         - is_free: Is the billboard available?
 
-        Uses CHUNKED PROCESSING to prevent OOM during GAE when Tianshou passes
-        the entire buffer (2880+ samples) through the model at once.
+        Chunking is now handled by the top-level forward() method, which processes
+        GNN + actor together per chunk to prevent OOM on large billboard counts.
         """
-        # CHUNKED PROCESSING: Process in chunks of 32 to prevent OOM during GAE
-        # During GAE, batch_size can be entire buffer (2880+), causing 13GB+ allocation
-        # for pair_features tensor: batch × 8880 pairs × hidden_dim
-        CHUNK_SIZE = 32
-
-        if batch_size > CHUNK_SIZE:
-            # Large batch (GAE phase) - process in chunks and concatenate
-            all_scores = []
-            for start_idx in range(0, batch_size, CHUNK_SIZE):
-                end_idx = min(start_idx + CHUNK_SIZE, batch_size)
-                chunk_size = end_idx - start_idx
-
-                # Slice all inputs for this chunk
-                chunk_billboard = billboard_embeds[start_idx:end_idx]
-                chunk_obs = {
-                    'ad_features': observations['ad_features'][start_idx:end_idx],
-                    'edge_features': observations.get('edge_features')
-                }
-                if chunk_obs['edge_features'] is not None:
-                    chunk_obs['edge_features'] = chunk_obs['edge_features'][start_idx:end_idx]
-                chunk_mask = mask[start_idx:end_idx]
-
-                # Process this chunk
-                chunk_scores = self._forward_ea_single_chunk(
-                    chunk_billboard, chunk_obs, chunk_mask, chunk_size
-                )
-                all_scores.append(chunk_scores)
-
-            scores = torch.cat(all_scores, dim=0)
-            return scores, state
-        else:
-            # Small batch (normal inference) - process directly
-            scores = self._forward_ea_single_chunk(billboard_embeds, observations, mask, batch_size)
-            return scores, state
+        scores = self._forward_ea_single_chunk(billboard_embeds, observations, mask, batch_size)
+        return scores, state
 
     def _forward_ea_single_chunk(self, billboard_embeds: torch.Tensor, observations: Dict[str, torch.Tensor],
                                   mask: torch.Tensor, batch_size: int) -> torch.Tensor:
@@ -805,40 +861,17 @@ class BillboardAllocatorGNN(nn.Module):
                          mask: torch.Tensor, batch_size: int, state: Optional[torch.Tensor],
                          info: Dict[str, Any]) -> Tuple[torch.Tensor, None]:
         """
-        Autoregressive Multi-Head forward pass with chunked processing.
+        Autoregressive Multi-Head forward pass.
 
-        Uses CHUNK_SIZE=32 to prevent OOM during GAE when Tianshou passes
-        the entire buffer (23040+ samples) through the model at once (RC5 fix).
+        Chunking is now handled by the top-level forward() method, which processes
+        GNN + actor together per chunk to prevent OOM on large billboard counts.
 
         Returns concatenated logits: [ad_logits, all_bb_logits_flat]
         Shape: (batch, max_ads + max_ads * n_billboards)
         """
-        CHUNK_SIZE = 32
-
-        if batch_size > CHUNK_SIZE:
-            # Large batch (GAE phase) — process in chunks to prevent OOM
-            all_logits = []
-            for start_idx in range(0, batch_size, CHUNK_SIZE):
-                end_idx = min(start_idx + CHUNK_SIZE, batch_size)
-                chunk_size = end_idx - start_idx
-
-                chunk_billboard = billboard_embeds[start_idx:end_idx]
-                chunk_obs = {
-                    'ad_features': observations['ad_features'][start_idx:end_idx],
-                }
-                chunk_mask = mask[start_idx:end_idx]
-
-                chunk_logits = self._forward_mh_single_chunk(
-                    chunk_billboard, chunk_obs, chunk_mask, chunk_size
-                )
-                all_logits.append(chunk_logits)
-
-            return torch.cat(all_logits, dim=0), None
-        else:
-            # Small batch (normal inference) — process directly
-            return self._forward_mh_single_chunk(
-                billboard_embeds, observations, mask, batch_size
-            ), None
+        return self._forward_mh_single_chunk(
+            billboard_embeds, observations, mask, batch_size
+        ), None
 
     def _forward_mh_single_chunk(self, billboard_embeds: torch.Tensor,
                                   observations: Dict[str, torch.Tensor],
