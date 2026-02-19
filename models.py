@@ -9,6 +9,7 @@ and shared critic network.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 from torch_geometric.nn import GINConv, GATConv
 from torch.nn import Sequential, Linear, ReLU, LayerNorm, Dropout
 import numpy as np
@@ -660,37 +661,33 @@ class BillboardAllocatorGNN(nn.Module):
             all_outputs = []
             nodes = observations['graph_nodes'].float()
             mask = observations['mask'].bool()
+            ad_features = observations['ad_features']
+            edge_features = observations.get('edge_features') if self.mode == 'ea' else None
+
+            use_checkpointing = torch.is_grad_enabled()
 
             for start in range(0, batch_size, chunk_size):
                 end = min(start + chunk_size, batch_size)
-                chunk_bs = end - start
-
-                # GNN encode this chunk only
-                chunk_bb_embeds = self._batch_gnn_encode(nodes[start:end], edge_index)
-
-                # Per-chunk NaN/inf clamp (aggr='mean' can still produce NaN on degenerate inputs)
-                if torch.isnan(chunk_bb_embeds).any() or torch.isinf(chunk_bb_embeds).any():
-                    chunk_bb_embeds = torch.nan_to_num(chunk_bb_embeds, nan=0.0, posinf=1e6, neginf=-1e6)
-
+                chunk_nodes = nodes[start:end]
                 chunk_mask = mask[start:end]
+                chunk_ad = ad_features[start:end]
+                chunk_edge = edge_features[start:end] if edge_features is not None else None
 
-                # Slice mode-specific observations
-                chunk_obs = {'ad_features': observations['ad_features'][start:end]}
-                if self.mode == 'ea' and 'edge_features' in observations:
-                    chunk_obs['edge_features'] = observations['edge_features'][start:end]
-
-                # Actor forward on this chunk (no further sub-chunking needed)
-                if self.mode == 'na':
-                    out, _ = self._forward_na_fixed(
-                        chunk_bb_embeds, chunk_obs, chunk_mask, chunk_bs, state, info
+                if use_checkpointing:
+                    # GRADIENT CHECKPOINTING: During PPO learn(), all chunk graphs
+                    # accumulate before loss.backward(). Without checkpointing, 14 chunks
+                    # × ~640 MB = 8.96 GB of saved activations. With checkpointing,
+                    # only the final output per chunk is stored; intermediates are
+                    # recomputed during backward. Peak memory ≈ 1 chunk's activations.
+                    out = gradient_checkpoint(
+                        self._process_single_chunk,
+                        chunk_nodes, edge_index, chunk_mask, chunk_ad, chunk_edge,
+                        use_reentrant=False
                     )
-                elif self.mode == 'ea':
-                    out, _ = self._forward_ea_fixed(
-                        chunk_bb_embeds, chunk_obs, chunk_mask, chunk_bs, state, info
-                    )
-                elif self.mode == 'mh':
-                    out, _ = self._forward_mh_fixed(
-                        chunk_bb_embeds, chunk_obs, chunk_mask, chunk_bs, state, info
+                else:
+                    # No-grad path (GAE): no graph accumulation, chunks freed immediately
+                    out = self._process_single_chunk(
+                        chunk_nodes, edge_index, chunk_mask, chunk_ad, chunk_edge
                     )
 
                 all_outputs.append(out)
@@ -729,7 +726,47 @@ class BillboardAllocatorGNN(nn.Module):
             return self._forward_sequential(billboard_embeds, observations, mask, batch_size, state, info)
         else:
             raise ValueError(f"Unsupported mode: {self.mode}")
-    
+
+    def _process_single_chunk(self, chunk_nodes: torch.Tensor, edge_index: torch.Tensor,
+                               chunk_mask: torch.Tensor, chunk_ad: torch.Tensor,
+                               chunk_edge: Optional[torch.Tensor]) -> torch.Tensor:
+        """Process a single chunk through GNN + actor. Used by gradient_checkpoint().
+
+        All arguments are tensors (required by torch.utils.checkpoint).
+        Returns flat logits/scores tensor for this chunk.
+        """
+        chunk_bs = chunk_nodes.shape[0]
+
+        # GNN encode
+        chunk_bb_embeds = self._batch_gnn_encode(chunk_nodes, edge_index)
+
+        # Per-chunk NaN/inf clamp
+        if torch.isnan(chunk_bb_embeds).any() or torch.isinf(chunk_bb_embeds).any():
+            chunk_bb_embeds = torch.nan_to_num(chunk_bb_embeds, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        # Build chunk observations dict
+        chunk_obs = {'ad_features': chunk_ad}
+        if chunk_edge is not None:
+            chunk_obs['edge_features'] = chunk_edge
+
+        # Actor forward
+        if self.mode == 'na':
+            out, _ = self._forward_na_fixed(
+                chunk_bb_embeds, chunk_obs, chunk_mask, chunk_bs, None, {}
+            )
+        elif self.mode == 'ea':
+            out, _ = self._forward_ea_fixed(
+                chunk_bb_embeds, chunk_obs, chunk_mask, chunk_bs, None, {}
+            )
+        elif self.mode == 'mh':
+            out, _ = self._forward_mh_fixed(
+                chunk_bb_embeds, chunk_obs, chunk_mask, chunk_bs, None, {}
+            )
+        else:
+            raise ValueError(f"Unsupported mode in chunk: {self.mode}")
+
+        return out
+
     def _forward_na_fixed(self, billboard_embeds: torch.Tensor, observations: Dict[str, torch.Tensor],
                          mask: torch.Tensor, batch_size: int, state: Optional[torch.Tensor],
                          info: Dict[str, Any]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -802,7 +839,12 @@ class BillboardAllocatorGNN(nn.Module):
                                   mask: torch.Tensor, batch_size: int) -> torch.Tensor:
         """Process a single chunk of EA forward pass.
 
-        Extracted from _forward_ea_fixed to enable chunked processing for large batches.
+        PER-AD LOOP: Instead of expanding all (max_ads × n_billboards) pairs at once
+        (which creates a massive tensor that OOMs on large billboard counts like LA=1483),
+        loop over ads individually — matching NA/MH's memory profile.
+
+        Memory per ad iteration: (batch, n_billboards, pair_dim) ≈ 3 MB for chunk=9, LA.
+        vs all-at-once: (batch, 20, n_billboards, pair_dim) ≈ 63 MB — 20× larger.
         """
         ad_features = observations['ad_features']  # (batch_size, max_ads, ad_feat_dim)
         ad_embeds = self.ad_encoder(ad_features.view(-1, ad_features.shape[-1]))
@@ -811,51 +853,56 @@ class BillboardAllocatorGNN(nn.Module):
         # Edge features for matching
         edge_features = observations.get('edge_features')  # (batch_size, max_ads, n_billboards, 3)
         if edge_features is None:
-            # Fallback for backwards compatibility
             edge_features = torch.zeros(
                 batch_size, self.max_ads, self.n_billboards, 3,
                 device=ad_embeds.device, dtype=ad_embeds.dtype
             )
 
-        ad_expanded = ad_embeds.unsqueeze(2).expand(-1, -1, self.n_billboards, -1)
-        billboard_expanded = billboard_embeds.unsqueeze(1).expand(-1, self.max_ads, -1, -1)
+        all_scores = []
+        for ad_idx in range(self.max_ads):
+            ad_embed = ad_embeds[:, ad_idx]  # (batch, hidden_dim)
+            ad_expanded = ad_embed.unsqueeze(1).expand(-1, self.n_billboards, -1)  # (batch, N, hidden)
 
-        if self.use_attention:
-            ad_query = ad_expanded.reshape(-1, self.n_billboards, ad_expanded.shape[-1])
-            billboard_kv = billboard_expanded.reshape(-1, self.n_billboards, billboard_expanded.shape[-1])
+            if self.use_attention:
+                ad_query = ad_embed.unsqueeze(1)  # (batch, 1, hidden_dim)
+                billboard_kv = self.ea_billboard_proj(billboard_embeds)  # (batch, N, hidden_dim)
+                attended = self.attention(ad_query, billboard_kv, billboard_kv)  # (batch, 1, hidden_dim)
+                pair_features = attended.expand(-1, self.n_billboards, -1)  # (batch, N, hidden_dim)
+            else:
+                # Concatenate ad embedding with billboard embeddings per-ad
+                pair_features = torch.cat([billboard_embeds, ad_expanded], dim=-1)  # (batch, N, bb_dim+hidden)
 
-            billboard_kv_proj = self.ea_billboard_proj(billboard_kv)
+            # Project edge features for this ad
+            ad_edge_features = edge_features[:, ad_idx]  # (batch, N, 3)
+            edge_proj = self.edge_feat_proj(ad_edge_features)  # (batch, N, 16)
+            pair_features = torch.cat([pair_features, edge_proj], dim=-1)  # (batch, N, pair_dim+16)
 
-            pair_features = self.attention(ad_query, billboard_kv_proj, billboard_kv_proj)
-            pair_features = pair_features.reshape(batch_size, self.max_ads, self.n_billboards, -1)
-        else:
-            # Simple concatenation fallback
-            pair_features = torch.cat([ad_expanded, billboard_expanded], dim=-1)
+            # Score each billboard for this ad
+            scores = self.pair_scorer(pair_features.reshape(-1, pair_features.shape[-1]))
+            scores = scores.view(batch_size, self.n_billboards)  # (batch, N)
 
-        # Project edge features
-        edge_features_proj = self.edge_feat_proj(edge_features)
-        pair_features = torch.cat([pair_features, edge_features_proj], dim=-1)
+            # Per-ad billboard mask
+            ad_mask = mask[:, ad_idx].bool()  # (batch, N)
+            scores[~ad_mask] = self.min_val
 
-        pair_flat = pair_features.reshape(-1, pair_features.shape[-1])
-        scores = self.pair_scorer(pair_flat).reshape(batch_size, self.max_ads * self.n_billboards)
+            # Handle ghost ad slots: deterministic distribution on billboard 0
+            # Ensures log_prob=0, entropy=0 for inactive billboard selections (RC6 fix)
+            fix_rows = ~ad_mask.any(dim=-1) | torch.isnan(scores).any(dim=-1)
+            if fix_rows.any():
+                deterministic_logits = torch.full_like(scores, self.min_val)
+                deterministic_logits[:, 0] = 0.0
+                scores = torch.where(
+                    fix_rows.unsqueeze(-1).expand_as(scores),
+                    deterministic_logits,
+                    scores
+                )
 
-        mask_flat = mask.reshape(batch_size, -1)
-        scores[~mask_flat] = self.min_val
+            all_scores.append(scores)
 
-        # Fix ghost ad slots: for each ad slot where ALL billboards are masked,
-        # create deterministic distribution (all mass on billboard 0) so log_prob=0, entropy=0
-        # This prevents phantom entropy/log_prob noise from inactive ad slots (RC6 fix)
-        per_ad_mask = mask.any(dim=-1)  # (batch, max_ads) — True if ad has any valid billboard
-        ghost_ad_mask = ~per_ad_mask  # (batch, max_ads) — True for ghost ad slots
-        if ghost_ad_mask.any():
-            for ad_idx in range(self.max_ads):
-                ghost_rows = ghost_ad_mask[:, ad_idx]  # (batch,) bool
-                if ghost_rows.any():
-                    offset = ad_idx * self.n_billboards
-                    # Billboard 0 gets all mass (logit=0), rest stay at min_val (-1e8)
-                    scores[ghost_rows, offset] = 0.0
+        all_scores = torch.cat(all_scores, dim=-1)  # (batch, max_ads * n_billboards)
+        all_scores = torch.nan_to_num(all_scores, nan=0.0)
 
-        return scores
+        return all_scores
 
     def _forward_mh_fixed(self, billboard_embeds: torch.Tensor, observations: Dict[str, torch.Tensor],
                          mask: torch.Tensor, batch_size: int, state: Optional[torch.Tensor],
